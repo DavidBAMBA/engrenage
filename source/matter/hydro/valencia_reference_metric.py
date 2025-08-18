@@ -14,78 +14,8 @@ class ValenciaReferenceMetric:
     def __init__(self):
         self.name = "valencia_reference_metric"
         self.version = "montero_2013"
-        
-    def compute_rhs(self, D, Sr, tau, rho0, vr, pressure, W, h,
-                   d1_D, d1_Sr, d1_tau, r, bssn_vars, bssn_d1, background,
-                   spacetime_mode, eos, reconstructor=None, riemann_solver=None):
-        """
-        Compute RHS for the Valencia evolution equations with reference metric.
-        
-        Evolution equations (Montero et al. 2013):
-        ∂_t q + D̂_j f^j = s
-        where q = e^(6φ)√(γ̄/γ̂) (D, S_i, τ)
-        
-        Args:
-            D, Sr, tau: Conservative variables
-            rho0, vr, pressure, W, h: Primitive variables
-            d1_D, d1_Sr, d1_tau: First derivatives of conservative vars
-            r: Radial coordinate array
-            bssn_vars: BSSN variables object
-            bssn_d1: BSSN first derivatives
-            background: Reference metric background
-            spacetime_mode: "fixed_minkowski" or "dynamic"
-            eos: Equation of state object
-            reconstructor: Reconstruction method (optional)
-            riemann_solver: Riemann solver (optional)
-            
-        Returns:
-            dDdt, dSrdt, dtaudt: Time derivatives
-        """
-        
-        N = len(r)
-        
-        # Extract geometry
-        geometry = self._extract_geometry(r, bssn_vars, spacetime_mode, background)
-        
-        # Compute fluxes
-        if riemann_solver is not None and reconstructor is not None:
-            fluxes = self._compute_interface_fluxes(
-                D, Sr, tau, rho0, vr, pressure, W, h,
-                geometry, r, eos, reconstructor, riemann_solver
-            )
-            
-            # Compute covariant divergence
-            dDdt = self._covariant_divergence_D(fluxes['D'], geometry, background)
-            dSrdt_flux = self._covariant_divergence_Sr(fluxes['Sr'], geometry, background)
-            dtaudt = self._covariant_divergence_tau(fluxes['tau'], geometry, background)
-        else:
-            # Cell-centered fluxes
-            fluxes = self._compute_cell_fluxes(
-                D, Sr, tau, rho0, vr, pressure, W, h, geometry
-            )
-            
-            dDdt = self._continuity_rhs(fluxes['D'], geometry, background)
-            dSrdt_flux = self._momentum_flux_rhs(fluxes['Sr'], geometry, background)
-            dtaudt = self._energy_rhs(fluxes['tau'], geometry, background)
-        
-        # Compute source terms
-        sources = self._compute_sources(
-            D, Sr, tau, rho0, vr, pressure, W, h,
-            geometry, bssn_vars, bssn_d1, spacetime_mode, background
-        )
-        
-        # Combine flux divergence and sources
-        dDdt = dDdt
-        dSrdt = dSrdt_flux + sources['Sr']
-        dtaudt = dtaudt + sources['tau']
-        
-        # Apply boundary conditions
-        dDdt, dSrdt, dtaudt = self._apply_boundary_conditions(
-            dDdt, dSrdt, dtaudt, r
-        )
-        
-        return dDdt, dSrdt, dtaudt
-    
+
+
     def _extract_geometry(self, r, bssn_vars, spacetime_mode, background):
         """
         Extract all geometric quantities needed for Valencia evolution.
@@ -177,107 +107,157 @@ class ValenciaReferenceMetric:
         
         return fluxes
     
+    def compute_rhs(self, D, Sr, tau, rho0, vr, pressure, W, h,
+                    d1_D, d1_Sr, d1_tau, r, bssn_vars, bssn_d1, background,
+                    spacetime_mode, eos, grid, reconstructor=None, riemann_solver=None):
+            """
+            Compute RHS for the Valencia evolution equations with reference metric.
+            
+            NOTA: La firma de la función ahora incluye 'grid' para el cálculo consistente de derivadas.
+            """
+            
+            N = len(r)
+            
+            # Extract geometry
+            geometry = self._extract_geometry(r, bssn_vars, spacetime_mode, background)
+            
+            # Compute fluxes
+            if riemann_solver is not None and reconstructor is not None:
+                fluxes = self._compute_interface_fluxes(
+                    D, Sr, tau, rho0, vr, pressure, W, h,
+                    geometry, r, eos, reconstructor, riemann_solver
+                )
+                
+                # Compute covariant divergence
+                dDdt = self._covariant_divergence_D(fluxes['D'], geometry, background, grid)
+                dSrdt_flux = self._covariant_divergence_Sr(fluxes['Sr'], geometry, background, grid)
+                dtaudt = self._covariant_divergence_tau(fluxes['tau'], geometry, background, grid)
+            else:
+                # Cell-centered fluxes
+                fluxes = self._compute_cell_fluxes(
+                    D, Sr, tau, rho0, vr, pressure, W, h, geometry
+                )
+                
+                dDdt = self._continuity_rhs(fluxes['D'], geometry, background, grid)
+                dSrdt_flux = self._momentum_flux_rhs(fluxes['Sr'], geometry, background, grid)
+                dtaudt = self._energy_rhs(fluxes['tau'], geometry, background, grid)
+            
+            # Compute source terms
+            sources = self._compute_sources(
+                D, Sr, tau, rho0, vr, pressure, W, h,
+                geometry, bssn_vars, bssn_d1, spacetime_mode, background
+            )
+            
+            # Combine flux divergence and sources
+            dDdt = dDdt
+            dSrdt = dSrdt_flux + sources['Sr']
+            dtaudt = dtaudt + sources['tau']
+            
+            # Apply boundary conditions
+            dDdt, dSrdt, dtaudt = self._apply_boundary_conditions(
+                dDdt, dSrdt, dtaudt, r
+            )
+            
+            return dDdt, dSrdt, dtaudt
 
-    def _continuity_rhs(self, flux_D, geometry, background):
+    def _continuity_rhs(self, flux_D, geometry, background, grid):
+        """
+        Calcula la parte derecha de la ecuación de continuidad usando el sistema de derivadas de engrenage.
+        """
         r = geometry["r"]
         N = len(r)
         
-        # Usar el sistema de derivadas de Grid de Engrenage
-        if hasattr(self, 'grid'):
-            # Crear estado temporal para usar el sistema de derivadas de Grid
-            flux_state = np.zeros((1, N))
-            flux_state[0] = flux_D
-            d_flux_dr = self.grid.get_first_derivative(flux_state, [0])[0]
-            dDdt = -d_flux_dr
-        else:
-            # Fallback si no hay acceso a Grid
-            dr = r[1:] - r[:-1]
-            dDdt = np.zeros(N)
-            dDdt[1:-1] = -(flux_D[2:] - flux_D[:-2]) / (r[2:] - r[:-2])
-            dDdt[0] = -(flux_D[1] - flux_D[0]) / (r[1] - r[0])
-            dDdt[-1] = -(flux_D[-1] - flux_D[-2]) / (r[-1] - r[-2])
+        # Crear un estado temporal para usar el sistema de derivadas del grid
+        flux_state = np.zeros((1, N))
+        flux_state[0] = flux_D
+        d_flux_dr = grid.get_first_derivative(flux_state, [0])[0]
+        
+        dDdt = -d_flux_dr
         
         # Término geométrico
         r_safe = np.maximum(r, 1e-10)
         dDdt -= 2.0 * flux_D / r_safe
         
-        # Regularización en el origen
-        if r[0] < 1e-10:
+        # Regularización en el origen (usando L'Hôpital)
+        if r[0] < 1e-10 and N > 1:
+            # Esta aproximación es consistente con la divergencia regularizada
             dDdt[0] = -3.0 * (flux_D[1] - flux_D[0]) / (r[1] - r[0])
         
         return dDdt
 
 
-    def _momentum_flux_rhs(self, flux_Sr, geometry, background):
+    def _momentum_flux_rhs(self, flux_Sr, geometry, background, grid):
         """
-        ∂_t(e^{6φ} √(γ̄/γ̂) S_r) + ∂_r(f_S)_r^r
-        = (f_S)_k^r Γ̂^k_{r r} - (f_S)_r^k Γ̂^j_{k j}.
-        In spherical symmetry with only radial flux: Γ̂^k_{r r}=0 and Γ̂^j_{k j}=2/r,
-        so the geometric source reduces to  -(f_S)_r^r * (2/r).
+        Calcula la divergencia del flujo de momento usando el sistema de derivadas de engrenage.
         """
         r = geometry["r"]
         N = len(r)
-        if N < 2:
-            return np.zeros(N)
 
-        # r-aware divergence of flux
-        dSrdt = -np.gradient(flux_Sr, r, edge_order=2)
+        # Crear un estado temporal para usar el sistema de derivadas del grid
+        flux_state = np.zeros((1, N))
+        flux_state[0] = flux_Sr
+        d_flux_dr = grid.get_first_derivative(flux_state, [0])[0]
 
-        # Reference-metric source: -(f_S)_r^r * (2/r)
+        dSrdt = -d_flux_dr
+
+        # Fuente de la métrica de referencia: -(f_S)_r^r * (2/r)
         r_safe = np.maximum(r, 1e-10)
         dSrdt -= 2.0 * flux_Sr / r_safe
 
-        # Symmetry at the origin (Sr should vanish at r=0 in spherical symmetry)
+        # Simetría en el origen (Sr y su flujo deben anularse en r=0)
         if r[0] < 1e-10:
             dSrdt[0] = 0.0
 
         return dSrdt
 
 
-    def _energy_rhs(self, flux_tau, geometry, background):
+    def _energy_rhs(self, flux_tau, geometry, background, grid):
         """
-        ∂_t(e^{6φ} √(γ̄/γ̂) τ) + ∂_r(f_τ)^r = -(f_τ)^r Γ̂^k_{rk},   with Γ̂^k_{rk} = 2/r.
+        Calcula la divergencia del flujo de energía usando el sistema de derivadas de engrenage.
         """
         r = geometry["r"]
         N = len(r)
-        if N < 2:
-            return np.zeros(N)
 
-        # r-aware divergence of flux
-        dtaudt = -np.gradient(flux_tau, r, edge_order=2)
+        # Crear un estado temporal para usar el sistema de derivadas del grid
+        flux_state = np.zeros((1, N))
+        flux_state[0] = flux_tau
+        d_flux_dr = grid.get_first_derivative(flux_state, [0])[0]
 
-        # Reference-metric source: -(f_τ)^r * (2/r)
+        dtaudt = -d_flux_dr
+
+        # Fuente de la métrica de referencia: -(f_τ)^r * (2/r)
         r_safe = np.maximum(r, 1e-10)
         dtaudt -= 2.0 * flux_tau / r_safe
 
-        # Regularize the origin (L'Hôpital/Taylor)
-        if r[0] < 1e-10:
+        # Regularización en el origen (usando L'Hôpital)
+        if r[0] < 1e-10 and N > 1:
             dtaudt[0] = -3.0 * (flux_tau[1] - flux_tau[0]) / (r[1] - r[0])
 
         return dtaudt
 
 
-    def _covariant_divergence_D(self, flux_D, geometry, background):
+    def _covariant_divergence_D(self, flux_D, geometry, background, grid):
         """
         Compute covariant divergence D̂_j f^j for density flux.
         This is a wrapper that calls the appropriate RHS computation.
         """
-        return self._continuity_rhs(flux_D, geometry, background)
+        return self._continuity_rhs(flux_D, geometry, background, grid)
     
-    def _covariant_divergence_Sr(self, flux_Sr, geometry, background):
+    def _covariant_divergence_Sr(self, flux_Sr, geometry, background, grid):
         """
         Compute covariant divergence D̂_j f^j for momentum flux.
         This is a wrapper that calls the appropriate RHS computation.
         """
-        return self._momentum_flux_rhs(flux_Sr, geometry, background)
+        return self._momentum_flux_rhs(flux_Sr, geometry, background, grid)
     
-    def _covariant_divergence_tau(self, flux_tau, geometry, background):
+    def _covariant_divergence_tau(self, flux_tau, geometry, background, grid):
         """
         Compute covariant divergence D̂_j f^j for energy flux.
         This is a wrapper that calls the appropriate RHS computation.
         """
-        return self._energy_rhs(flux_tau, geometry, background)
-    
+        return self._energy_rhs(flux_tau, geometry, background, grid)
+
+
     def _compute_interface_fluxes(self, D, Sr, tau, rho0, vr, pressure, W, h,
                                 geometry, r, eos, reconstructor, riemann_solver):
         N = len(r)

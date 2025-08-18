@@ -144,21 +144,10 @@ class RelativisticFluid:
             self.rho0, self.vr, self.pressure, self.W, self.h,        # Primitive variables
             self.d1_D, self.d1_Sr, self.d1_tau,                       # Derivatives
             r, bssn_vars, bssn_d1, background,                        # Geometry
-            self.spacetime_mode, self.eos,                            # Configuration
+            self.spacetime_mode, self.eos,
+            self.grid,                            # Configuration
             self.reconstructor, self.riemann_solver                   # Pass numerical methods
         )
-        
-        # Add advection terms if shift is present
-        """ if hasattr(bssn_vars, 'shift_U') and self.advec_D is not None:
-            dDdt += np.einsum('xi,xi->x', 
-                            background.inverse_scaling_vector * bssn_vars.shift_U, 
-                            self.advec_D)
-            dSrdt += np.einsum('xi,xi->x', 
-                            background.inverse_scaling_vector * bssn_vars.shift_U, 
-                            self.advec_Sr)
-            dtaudt += np.einsum('xi,xi->x', 
-                            background.inverse_scaling_vector * bssn_vars.shift_U, 
-                            self.advec_tau) """
         
         return np.array([dDdt, dSrdt, dtaudt])
     
@@ -179,26 +168,6 @@ class RelativisticFluid:
         self.d1_Sr[:,i_x1] = d1_state[self.idx_Sr]
         self.d1_tau[:,i_x1] = d1_state[self.idx_tau]
         
-        # Advection derivatives for shift terms
-        if hasattr(bssn_vars, 'shift_U') and np.any(bssn_vars.shift_U):
-            # Create direction array for Grid.get_advection
-            direction = bssn_vars.shift_U[:,i_x1] >= 0
-            
-            advec_state = grid.get_advection(state_vector, direction, self.indices)
-            
-            self.advec_D = np.zeros([N, SPACEDIM])
-            self.advec_Sr = np.zeros([N, SPACEDIM])
-            self.advec_tau = np.zeros([N, SPACEDIM])
-            
-            self.advec_D[:,i_x1] = advec_state[self.idx_D]
-            self.advec_Sr[:,i_x1] = advec_state[self.idx_Sr]
-            self.advec_tau[:,i_x1] = advec_state[self.idx_tau]
-        else:
-            # No shift, so no advection
-            self.advec_D = np.zeros([N, SPACEDIM])
-            self.advec_Sr = np.zeros([N, SPACEDIM])
-            self.advec_tau = np.zeros([N, SPACEDIM])
-
 
     def _conservative_to_primitive(self, bssn_vars, grid):
         """Convert conservative to primitive variables using robust con2prim."""
