@@ -1,10 +1,11 @@
 # valencia_reference_metric.py (FULL reference-metric approach, 1D esférico)
 
 import numpy as np
-from ...bssn.tensoralgebra import get_bar_gamma_LL
-from ...backgrounds.sphericalbackground import i_r
-from ...core.spacing import NUM_GHOSTS
-from .cons2prim import prim_to_cons  # función centralizada para U=(D,S_r,τ)
+
+from source.bssn.tensoralgebra import get_bar_gamma_LL
+from source.backgrounds.sphericalbackground import i_r
+from source.core.spacing import NUM_GHOSTS
+from source.matter.hydro.cons2prim import prim_to_cons  # función centralizada para U=(D,S_r,τ)
 
 
 

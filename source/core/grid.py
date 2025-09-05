@@ -31,7 +31,9 @@ class Grid:
     def fill_boundaries(self, state, indices=None):
         
         # Default to all indices if none were specified
-        if (indices == None) :
+        #if (indices == None) :#CAMBIOOOOO
+        if indices is None:
+
             indices = self.ALL_INDICES
         
         self.fill_inner_boundary(state, indices)
@@ -45,7 +47,9 @@ class Grid:
         """
 
         # Default to all indices if none were specified
-        if (indices == None) :
+        #if (indices == None) : #CAMBIOOO
+        if indices is None:
+
             indices = self.ALL_INDICES
         
         if self.extent == SpacingExtent.HALF:
@@ -77,7 +81,8 @@ class Grid:
         # on last point before ghost points.
 
         # Default to all indices if none were specified
-        if (indices == None) :
+        #if (indices == None) :  #CAMBIOOOO
+        if indices is None: 
             indices = self.ALL_INDICES        
         
         idx = -NUM_GHOSTS - 1

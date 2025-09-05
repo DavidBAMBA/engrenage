@@ -9,27 +9,25 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
-from ...core.spacing import NUM_GHOSTS 
-from ...backgrounds.sphericalbackground import i_r  
-from ...bssn.tensoralgebra import get_bar_gamma_LL  
-# =========================
-# Hydro modules 
-# =========================
-from .eos import IdealGasEOS
-from .reconstruction import MinmodReconstruction
-from .riemann import HLLERiemannSolver
-from .cons2prim import cons_to_prim, prim_to_cons
-from .valencia_reference_metric import ValenciaReferenceMetric
-from ...bssn.tensoralgebra import get_bar_gamma_LL
-from ...backgrounds.sphericalbackground import i_r
-from ...core.spacing import NUM_GHOSTS
+# --- imports absolutos coherentes ---
+from source.core.spacing import NUM_GHOSTS
+from source.backgrounds.sphericalbackground import i_r
+from source.bssn.tensoralgebra import get_bar_gamma_LL
 
-""" class Grid:
+from source.matter.hydro.eos import IdealGasEOS
+from source.matter.hydro.reconstruction import MinmodReconstruction
+from source.matter.hydro.riemann import HLLERiemannSolver
+from source.matter.hydro.cons2prim import cons_to_prim, prim_to_cons
+from source.matter.hydro.valencia_reference_metric import ValenciaReferenceMetric
+from source.bssn.tensoralgebra import SPACEDIM
+
+
+class Grid:
     def __init__(self, dx):
         self.dx = float(dx)
 
 class _DummyBSSNVars:
-    Placeholders no usados en Minkowski fijo.
+    #Placeholders no usados en Minkowski fijo.
     def __init__(self, N):
         import numpy as np
         self.lapse   = np.ones(N)
@@ -42,9 +40,9 @@ class _DummyBSSND1:
         self.lapse   = np.zeros((N,3))
         self.shift_U = np.zeros((N,3,3))
         self.phi     = np.zeros((N,3))
- """
-""" def build_grid(n_interior=256, r_min=1.0e-3, r_max=1.0, ng=NUM_GHOSTS):
-    Centros de celda uniformes + ghosts extrapolados linealmente.
+
+def build_grid(n_interior=256, r_min=1.0e-3, r_max=1.0, ng=NUM_GHOSTS):
+    #Centros de celda uniformes + ghosts extrapolados linealmente.
     Nin = int(n_interior)
     r_in = np.linspace(r_min, r_max, Nin)
     dx = (r_max - r_min) / (Nin - 1)
@@ -53,7 +51,7 @@ class _DummyBSSND1:
     right_ghosts = r_in[-1] + dx*np.arange(1,ng+1)
     r_full = np.concatenate([left_ghosts, r_in, right_ghosts])
     return r_full, Grid(dx), Nin
- """
+
 def fill_ghosts_primitives(rho, v, p, ng=NUM_GHOSTS):
     """Paridades correctas en r≈0: rho/p pares; v impar. Outflow en borde derecho."""
     N = len(rho)

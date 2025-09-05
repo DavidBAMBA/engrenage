@@ -10,20 +10,20 @@ from scipy.integrate import solve_ivp
 from tqdm import tqdm
 
 # Importaciones de Engrenage
-from core.grid import Grid
-from core.spacing import LinearSpacing, SpacingExtent  
-from core.statevector import StateVector
-from core.rhsevolution import get_rhs
-from backgrounds.sphericalbackground import FlatSphericalBackground
-from bssn.bssnstatevariables import *
-from bssn.bssnvars import BSSNVars
+from source.core.grid import Grid
+from source.core.spacing import LinearSpacing, SpacingExtent  
+from source.core.statevector import StateVector
+from source.core.rhsevolution import get_rhs
+from source.backgrounds.sphericalbackground import FlatSphericalBackground
+from source.bssn.bssnstatevariables import *
+from source.bssn.bssnvars import BSSNVars
 
 # Importaciones de Hidrodinámica
-from matter.hydro.relativistic_fluid import RelativisticFluid
-from matter.hydro.eos import IdealGasEOS
-from matter.hydro.reconstruction import MinmodReconstruction
-from matter.hydro.riemann import HLLERiemannSolver
-from matter.hydro.cons2prim import cons_to_prim, prim_to_cons
+from source.matter.hydro.relativistic_fluid import RelativisticFluid
+from source.matter.hydro.eos import IdealGasEOS
+from source.matter.hydro.reconstruction import MinmodReconstruction
+from source.matter.hydro.riemann import HLLERiemannSolver
+from source.matter.hydro.cons2prim import cons_to_prim, prim_to_cons
 
 def setup_tolman_oppenheimer_volkoff_initial_data(r, M_central=1.0, R_star=0.8, 
                                                   rho_central=1.0, eos=None):
@@ -63,7 +63,9 @@ def setup_tolman_oppenheimer_volkoff_initial_data(r, M_central=1.0, R_star=0.8,
     
     # BSSN: métrica inicial aproximada para el fluido
     # Usamos aproximación de campo débil: φ ~ -M/(8πr)
-    total_mass = np.trapz(4*np.pi * r**2 * rho0, r)
+    #total_mass = np.trapz(4*np.pi * r**2 * rho0, r)
+    total_mass = np.trapezoid(4*np.pi * r**2 * rho0, r)
+
     phi_init = np.zeros(N)
     
     # Solo aplicar corrección gravitacional donde hay materia significativa
