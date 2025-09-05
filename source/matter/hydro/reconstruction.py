@@ -59,8 +59,12 @@ class MinmodReconstruction:
         N = u.size
         if N < 2:
             # Degenerate case: just copy values
-            uL = np.repeat(u[0], 2)
-            uR = np.repeat(u[0], 2)
+            if N == 1:
+                uL = np.array([u[0], u[0]], dtype=float)
+                uR = np.array([u[0], u[0]], dtype=float)
+            else:
+                uL = np.array([u[0], u[1]], dtype=float)
+                uR = np.array([u[0], u[1]], dtype=float)
             return uL, uR
 
         dxL, dxR = self._one_sided_deltas(N, dx, x)
@@ -69,19 +73,22 @@ class MinmodReconstruction:
         u_L = np.empty(N + 1, dtype=float)
         u_R = np.empty(N + 1, dtype=float)
 
-        # Fill interior using limited slopes
-        # slopes defined for i = 1..N-2
+        # Fill interior using limited slopes (i = 1..N-2)
         a = (u[1:-1] - u[:-2]) / dxL[1:-1]   # backward slope at i
         b = (u[2:]   - u[1:-1]) / dxR[1:-1]  # forward  slope at i
         s = self._apply_limiter(a, b)        # limited slope s_i
 
-        # Right state at i-1/2 from cell i (i = 1..N-2)
-        u_R[1:-1] = u[1:-1] - 0.5 * s * dxL[1:-1]
-        # Left state at i+1/2 from cell i (i = 1..N-2)
-        u_L[2:-1] = u[1:-1] + 0.5 * s * dxR[1:-1]
+        # Right state at i-1/2 from cell i (i = 1..N-2) -> interfaces 1..N-2
+        u_R[1:N-1] = u[1:-1] - 0.5 * s * dxL[1:-1]
+        # Left state at i+1/2 from cell i (i = 1..N-2)  -> interfaces 2..N-1
+        u_L[2:N]   = u[1:-1] + 0.5 * s * dxR[1:-1]
 
+        # Near-boundary interior interfaces (ensure they are initialized)
+        # Piecewise-constant at the first interior interface and last interior interface
+        u_L[1]     = u[0]      # left state at interface 1 from cell 0
+        u_R[N-1]   = u[-1]     # right state at interface N-1 from cell N-1
 
-        # Boundary treatment
+        # Boundary treatment for the domain edges (interfaces 0 and N)
         self._fill_boundaries(u, u_L, u_R, boundary_type)
 
         return u_L, u_R
@@ -94,9 +101,20 @@ class MinmodReconstruction:
           left:  (D_L,  Sr_L,  tau_L)
           right: (D_R,  Sr_R,  tau_R)
         """
-        DL, DR = self.reconstruct(D, dx=dx, x=x, boundary_type=boundary_type)
-        SL, SR = self.reconstruct(Sr, dx=dx, x=x, boundary_type=boundary_type)
-        TL, TR = self.reconstruct(tau, dx=dx, x=x, boundary_type=boundary_type)
+        if boundary_type == "reflecting":
+            # Build with outflow, then enforce reflecting parity at the INNER boundary (left).
+            DL, DR = self.reconstruct(D, dx=dx, x=x, boundary_type="outflow")
+            SL, SR = self.reconstruct(Sr, dx=dx, x=x, boundary_type="outflow")
+            TL, TR = self.reconstruct(tau, dx=dx, x=x, boundary_type="outflow")
+            # Parities at r≈0: D, tau even; Sr odd
+            DL[0], DR[0] = D[0],  D[0]
+            SL[0], SR[0] = -Sr[0], Sr[0]
+            TL[0], TR[0] = tau[0], tau[0]
+        else:
+            DL, DR = self.reconstruct(D,   dx=dx, x=x, boundary_type=boundary_type)
+            SL, SR = self.reconstruct(Sr,  dx=dx, x=x, boundary_type=boundary_type)
+            TL, TR = self.reconstruct(tau, dx=dx, x=x, boundary_type=boundary_type)
+
         return (DL, SL, TL), (DR, SR, TR)
 
     def reconstruct_primitive_variables(self, rho0, vr, pressure, dx=None, x=None, boundary_type="outflow"):
@@ -107,9 +125,20 @@ class MinmodReconstruction:
           left:  (rho0_L, vr_L, p_L)
           right: (rho0_R, vr_R, p_R)
         """
-        rL, rR = self.reconstruct(rho0, dx=dx, x=x, boundary_type=boundary_type)
-        vL, vR = self.reconstruct(vr,   dx=dx, x=x, boundary_type=boundary_type)
-        pL, pR = self.reconstruct(pressure, dx=dx, x=x, boundary_type=boundary_type)
+        if boundary_type == "reflecting":
+            # Build with outflow, then enforce reflecting parity at the INNER boundary (left).
+            rL, rR = self.reconstruct(rho0,    dx=dx, x=x, boundary_type="outflow")
+            vL, vR = self.reconstruct(vr,      dx=dx, x=x, boundary_type="outflow")
+            pL, pR = self.reconstruct(pressure, dx=dx, x=x, boundary_type="outflow")
+            # Parities at r≈0: rho0, p even; v^r odd
+            rL[0], rR[0] = rho0[0],  rho0[0]
+            vL[0], vR[0] = -vr[0],   vr[0]
+            pL[0], pR[0] = pressure[0], pressure[0]
+        else:
+            rL, rR = self.reconstruct(rho0,    dx=dx, x=x, boundary_type=boundary_type)
+            vL, vR = self.reconstruct(vr,      dx=dx, x=x, boundary_type=boundary_type)
+            pL, pR = self.reconstruct(pressure, dx=dx, x=x, boundary_type=boundary_type)
+
         return (rL, vL, pL), (rR, vR, pR)
 
     def apply_physical_limiters(self, left_tuple, right_tuple,
@@ -117,23 +146,23 @@ class MinmodReconstruction:
                                 gamma_rr=None):
         rho0_L, vr_L, p_L = left_tuple
         rho0_R, vr_R, p_R = right_tuple
-        
+
         # Límites de densidad y presión
         rho0_L = np.maximum(rho0_L, atmosphere_rho)
         rho0_R = np.maximum(rho0_R, atmosphere_rho)
         p_L = np.maximum(p_L, p_floor)
         p_R = np.maximum(p_R, p_floor)
-        
+
         # Límite de velocidad considerando la métrica
         if gamma_rr is not None:
-            # v² = γ_rr (v^r)² < v_max²
+            # v² = γ_rr (v^r)² < v_max²  -> |v^r| < v_max / sqrt(γ_rr)
             v_limit = v_max / np.sqrt(np.maximum(gamma_rr, 1.0))
             vr_L = np.clip(vr_L, -v_limit, v_limit)
             vr_R = np.clip(vr_R, -v_limit, v_limit)
         else:
             vr_L = np.clip(vr_L, -v_max, v_max)
             vr_R = np.clip(vr_R, -v_max, v_max)
-        
+
         return (rho0_L, vr_L, p_L), (rho0_R, vr_R, p_R)
 
     def check_monotonicity(self, u, u_L, u_R):
@@ -143,14 +172,14 @@ class MinmodReconstruction:
         u = np.asarray(u, dtype=float)
         N = u.size
         vio = 0
-        for i in range(1, N-1):
-            umin = np.min([u[i-1], u[i], u[i+1]])
-            umax = np.max([u[i-1], u[i], u[i+1]])
+        for i in range(1, N - 1):
+            umin = np.min([u[i - 1], u[i], u[i + 1]])
+            umax = np.max([u[i - 1], u[i], u[i + 1]])
             # interface i  : right from cell i
             if u_R[i] < umin or u_R[i] > umax:
                 vio += 1
             # interface i+1: left  from cell i
-            if u_L[i+1] < umin or u_L[i+1] > umax:
+            if u_L[i + 1] < umin or u_L[i + 1] > umax:
                 vio += 1
         return vio
 
@@ -213,7 +242,6 @@ class MinmodReconstruction:
         c = np.asarray(c)
         same_sign = (a * b > 0.0) & (a * c > 0.0)
         s = np.sign(a)
-        # pick minimum magnitude among |a|,|b|,|c|
         m = np.minimum(np.abs(a), np.minimum(np.abs(b), np.abs(c)))
         return np.where(same_sign, s * m, 0.0)
 
@@ -234,10 +262,10 @@ class MinmodReconstruction:
                 raise ValueError("x must have same length as u")
             dxL = np.empty(N, dtype=float)
             dxR = np.empty(N, dtype=float)
-            dxL[0] = x[1] - x[0]
-            dxR[-1] = x[-1] - x[-2]
-            dxL[1:] = x[1:] - x[:-1]
-            dxR[:-1] = x[1:] - x[:-1]
+            dxL[0]  = x[1]   - x[0]
+            dxR[-1] = x[-1]  - x[-2]
+            dxL[1:] = x[1:]  - x[:-1]
+            dxR[:-1]= x[1:]  - x[:-1]
         else:
             if dx is None:
                 raise ValueError("Either dx (scalar) or x (array) must be provided")
@@ -254,6 +282,11 @@ class MinmodReconstruction:
         """
         Populate the first/last interfaces according to boundary_type.
         Interface indices: 0 .. N
+
+        Notes:
+          • "reflecting" here copies even parity at both ends. For odd-parity fields
+            (e.g., v^r or S_r at r≈0) the sign flip is enforced in the specialized
+            reconstruct_* methods where the variable identity is known.
         """
         N = u.size
 
@@ -265,16 +298,14 @@ class MinmodReconstruction:
             u_R[N] = u[-1]
 
         elif boundary_type == "reflecting":
-            # Mirror about boundaries: left/right states flip sign only if the
-            # quantity is odd. For generic scalar u we just copy (even).
-            # Specific handling (e.g., velocity) should be done per-variable upstream.
+            # Even reflection by default (odd handled per-variable upstream)
             u_L[0] = u[0]
             u_R[0] = u[0]
             u_L[N] = u[-1]
             u_R[N] = u[-1]
 
         elif boundary_type == "periodic":
-            # Wrap-around: interface 0 uses (left from last, right from first)
+            # Wrap-around
             u_L[0] = u[-1]
             u_R[0] = u[0]
             u_L[N] = u[-1]

@@ -13,8 +13,8 @@ class HLLERiemannSolver:
         F^r_D   = D * (v^r - beta^r/alpha)
         F^r_S_r = S_r * (v^r - beta^r/alpha) + p
         F^r_tau = (tau + p) * (v^r - beta^r/alpha)
-    The caller (e.g., the reference-metric Valencia class) may multiply by
-    α e^{6φ} √(γ̄/γ̂) as needed.
+    The caller (e.g., the reference-metric Valencia class) should multiply by
+    α e^{6φ} √(γ̄/γ̂) if using the full reference-metric densitization.
 
     Wave speeds follow Banyuls et al. (1997) in 1D:
         λ± = [ α ( v^r (1 - c_s^2) ± c_s sqrt( (1 - v^2) γ^{rr} ) ) / (1 - v^2 c_s^2) ] - β^r
@@ -33,8 +33,8 @@ class HLLERiemannSolver:
 
         # Stats
         self.total_calls = 0
-        self.superluminal_detections = 0
-        self.negative_pressure_fixes = 0
+        self.superluminal_detections = 0  # kept for compatibility (not used actively)
+        self.negative_pressure_fixes = 0  # incremented if validate_input_states is used
 
         # Tunables
         self._eps_floor = 0.0
@@ -51,12 +51,12 @@ class HLLERiemannSolver:
         Solve a single-interface Riemann problem with HLLE.
 
         Inputs (scalars):
-          UL, UR     : (D, S_r, tau) for left/right conservative states
+          UL, UR      : (D, S_r, tau) for left/right conservative states
           primL, primR: (rho0, v^r, p) for left/right primitive states
-          gamma_rr   : spatial metric γ_rr at the interface
-          alpha      : lapse α at the interface
-          beta_r     : radial shift β_r at the interface
-          eos        : EOS object with eps_from_rho_p(rho0,p) and enthalpy(rho0,p,eps)
+          gamma_rr    : spatial metric γ_rr at the interface
+          alpha       : lapse α at the interface
+          beta_r      : radial shift β_r at the interface
+          eos         : EOS object with eps_from_rho_p(rho0,p) and enthalpy(rho0,p,eps)
 
         Returns:
           F_hlle (np.ndarray shape (3,)): non-densitized HLLE flux vector.
@@ -78,15 +78,12 @@ class HLLERiemannSolver:
         alpha = float(max(alpha, 1e-30))
         beta_r = float(beta_r)
 
-        # Enthalpies
+        # Specific internal energy and enthalpy
         epsL = max(eos.eps_from_rho_p(rho0L, pL), self._eps_floor)
         epsR = max(eos.eps_from_rho_p(rho0R, pR), self._eps_floor)
-        hL = eos.enthalpy(rho0L, pL, epsL)
-        hR = eos.enthalpy(rho0R, pR, epsR)
-
-        # Lorentz factors (Eulerian)
-        WL = 1.0 / np.sqrt(max(1.0 - gamma_rr * vrL * vrL, 1e-30))
-        WR = 1.0 / np.sqrt(max(1.0 - gamma_rr * vrR * vrR, 1e-30))
+        # (h may be used by alternative flux formulations; kept for clarity)
+        # hL = eos.enthalpy(rho0L, pL, epsL)
+        # hR = eos.enthalpy(rho0R, pR, epsR)
 
         # Wave speed estimates (Banyuls 1D)
         lamL_min, lamL_max = self._wave_speeds_banyuls(vrL, rho0L, pL, epsL, gamma_rr, alpha, beta_r, eos)
@@ -95,12 +92,8 @@ class HLLERiemannSolver:
         lam_minus = min(lamL_min, lamR_min)
         lam_plus  = max(lamL_max, lamR_max)
 
-        # Entropy/superluminal guard
+        # Entropy fix near sonic points
         lam_minus, lam_plus = self._entropy_fix(lam_minus, lam_plus)
-        if abs(lam_minus) > alpha + 1e-9 or abs(lam_plus) > alpha + 1e-9:
-            self.superluminal_detections += 1
-            lam_minus = np.clip(lam_minus, -alpha, alpha)
-            lam_plus  = np.clip(lam_plus,  -alpha, alpha)
 
         # Physical (non-densitized) fluxes for L/R states
         FL = self._physical_flux(np.array([DL, SrL, tauL]), (rho0L, vrL, pL), alpha, beta_r)
@@ -116,7 +109,7 @@ class HLLERiemannSolver:
             if denom == 0.0:
                 # Degenerate; average
                 return 0.5 * (FL + FR)
-            Udiff = np.array([DR - DL, SrR - SrL, tauR - tauL])
+            Udiff = np.array([DR - DL, SrR - SrL, tauR - tauL])  # UR - UL
             return (lam_plus * FL - lam_minus * FR + lam_plus * lam_minus * Udiff) / denom
 
     def solve_batch(self, UL_batch, UR_batch, primL_batch, primR_batch,
@@ -222,7 +215,7 @@ class HLLERiemannSolver:
         Non-densitized physical flux vector for Valencia variables.
         """
         D, Sr, tau = U
-        rho0, vr, p = prim
+        _, vr, p = prim
 
         vtil = vr - beta_r / alpha  # transport velocity
         fD   = D * vtil
@@ -265,12 +258,16 @@ class HLLERiemannSolver:
 
     def _entropy_fix(self, lam_minus, lam_plus, delta=1e-8):
         """
-        Simple Harten-Hyman style entropy fix: enforce minimal magnitude near sonic points.
+        Simple Harten-Hyman style entropy fix: enforce a minimal magnitude
+        near sonic points and maintain correct ordering.
         """
-        if abs(lam_minus) < delta:
-            lam_minus = -delta if lam_minus < 0.0 else -delta
-        if abs(lam_plus) < delta:
-            lam_plus = delta if lam_plus > 0.0 else delta
+        # Push the negative branch at least to -delta and the positive branch to +delta
+        lam_minus = min(lam_minus, -abs(delta))
+        lam_plus  = max(lam_plus,  +abs(delta))
+
+        # Ensure ordering
+        if lam_minus > lam_plus:
+            lam_minus, lam_plus = lam_plus, lam_minus
         return lam_minus, lam_plus
 
 
@@ -322,11 +319,11 @@ def _test_riemann():
     WL = 1.0
     WR = 1.0
 
-    DL = rho0L * WL
+    DL  = rho0L * WL
     SrL = rho0L * hL * WL * WL * vrL
     tauL = rho0L * hL * WL * WL - pL - DL
 
-    DR = rho0R * WR
+    DR  = rho0R * WR
     SrR = rho0R * hR * WR * WR * vrR
     tauR = rho0R * hR * WR * WR - pR - DR
 

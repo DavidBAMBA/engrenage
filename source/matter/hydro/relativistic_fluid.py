@@ -8,7 +8,7 @@ from backgrounds.sphericalbackground import i_r, i_t, i_p
 
 from .valencia_reference_metric import ValenciaReferenceMetric
 from .stress_energy_tensor import compute_stress_energy_tensor
-from .con2prim import ConservativeToPrimitive
+from .cons2prim import cons2prim
 from .eos import IdealGasEOS
 
 class RelativisticFluid:
@@ -16,11 +16,11 @@ class RelativisticFluid:
     Relativistic fluid implementation using Valencia reference-metric formulation.
     
     Implements BaseMatter interface for engrenage evolution system.
-    Uses conservative variables {D, S_r, τ} with robust con2prim conversion.
+    Uses conservative variables {D, S_r, τ} with robust cons2prim conversion.
     
     Based on:
     - Montero et al. (2013): Reference-metric Valencia formulation
-    - Bany
+    - Banyuls et al. (1997): HRSC methods for GRHD
     """
 
     def __init__(self, eos=None, spacetime_mode="fixed_minkowski", 
@@ -29,8 +29,8 @@ class RelativisticFluid:
         # engrenage BaseMatter interface requirements
         self.NUM_MATTER_VARS = 3
         self.VARIABLE_NAMES = np.array(["D", "S_r", "tau"])
-        self.PARITY = np.array([1, -1, 1]) # D,τ even; S_r odd under r→-r
-        self.ASYMP_POWER = np.array([0, 0, 0])# Falloff behavior at large r
+        self.PARITY = np.array([1, -1, 1])  # D,τ even; S_r odd under r→-r
+        self.ASYMP_POWER = np.array([0, 0, 0])  # Falloff behavior at large r
         self.ASYMP_OFFSET = np.array([0, 0, 0])
 
         # Variable indices in state vector
@@ -46,15 +46,25 @@ class RelativisticFluid:
 
         # Numerical methods
         self.valencia = ValenciaReferenceMetric()
-        self.con2prim = ConservativeToPrimitive(self.eos, atmosphere_rho)
         self.reconstructor = reconstructor
         self.riemann_solver = riemann_solver
 
+        # Parameters for cons2prim
+        self.cons2prim_params = {
+            "rho_floor": atmosphere_rho,
+            "p_floor": 1e-15,
+            "v_max": 0.999999,
+            "W_max": 100.0,
+            "tol": 1e-12,
+            "max_iter": 100
+        }
+
         # State tracking
         self.matter_vars_set = False
+        self.primitives_computed = False
         
-        # Store background and Grid reference for use in other methods
-        self.grid       = None
+        # Store references for use in other methods
+        self.grid = None
         self.background = None
 
         # Conservative variables (set by set_matter_vars)
@@ -70,18 +80,12 @@ class RelativisticFluid:
         self.W = None
         self.h = None
         
-        # Derivatives for evolution
-        self.d1_D = None
-        self.d1_Sr = None
-        self.d1_tau = None
-        self.advec_D = None
-        self.advec_Sr = None
-        self.advec_tau = None
-
+        # Success flag for cons2prim
+        self.cons2prim_success = None
 
     def set_matter_vars(self, state_vector, bssn_vars: BSSNVars, grid: Grid):
         """
-        Extract matter variables from state vector and compute primitives.
+        Extract matter variables from state vector.
         Required by engrenage BaseMatter interface.
         """
         
@@ -92,17 +96,10 @@ class RelativisticFluid:
 
         # Store grid reference
         self.grid = grid
-
-        # Compute derivatives needed for RHS
-        self._compute_derivatives(state_vector, bssn_vars, grid)
         
-        # For fixed Minkowski, we can do con2prim now
-        # For dynamic spacetime, we'll defer until background is available
-        if self.spacetime_mode == "fixed_minkowski":
-            self._conservative_to_primitive(bssn_vars, grid)
-
+        # Reset primitive computation flag
+        self.primitives_computed = False
         self.matter_vars_set = True
-
 
     def get_emtensor(self, r, bssn_vars, background):
         """
@@ -111,153 +108,150 @@ class RelativisticFluid:
         """
         
         assert self.matter_vars_set, 'Matter vars not set'
-
+        
+        # Store background for later use
         self.background = background
-
-
-        # For dynamic spacetime, do con2prim now that we have background
-        if self.spacetime_mode != "fixed_minkowski":
-            self._conservative_to_primitive(bssn_vars, self.grid)
+        
+        # Ensure primitives are computed with correct geometry
+        self._ensure_primitives_computed(bssn_vars)
         
         return compute_stress_energy_tensor(
             self.rho0, self.vr, self.pressure, self.eps, self.W, self.h,
             r, bssn_vars, background, self.spacetime_mode
         )
 
-
     def get_matter_rhs(self, r, bssn_vars, bssn_d1, background):
         """
         Compute RHS for matter evolution using Valencia reference-metric formulation.
         Required by engrenage BaseMatter interface.
-        
-        Now passes the reconstructor and riemann_solver to Valencia.
         """
         
         assert self.matter_vars_set, 'Matter vars not set'
         
-        # Store background for later use
+        # Store background and ensure primitives computed
         self.background = background
+        self._ensure_primitives_computed(bssn_vars)
         
-        # Valencia reference-metric RHS computation with HLLE solver
+        # Valencia reference-metric RHS computation
         dDdt, dSrdt, dtaudt = self.valencia.compute_rhs(
-            self.D, self.Sr, self.tau,                                # Conservative variables
-            self.rho0, self.vr, self.pressure, self.W, self.h,        # Primitive variables
-            self.d1_D, self.d1_Sr, self.d1_tau,                       # Derivatives
-            r, bssn_vars, bssn_d1, background,                        # Geometry
-            self.spacetime_mode, self.eos,
-            self.grid,                            # Configuration
-            self.reconstructor, self.riemann_solver                   # Pass numerical methods
+            self.D, self.Sr, self.tau,                           # Conservative variables
+            self.rho0, self.vr, self.pressure, self.W, self.h,   # Primitive variables
+            r, bssn_vars, bssn_d1, background,                   # Geometry
+            self.spacetime_mode, self.eos, self.grid,            # Configuration
+            self.reconstructor, self.riemann_solver              # Numerical methods
         )
         
         return np.array([dDdt, dSrdt, dtaudt])
-    
 
-    def _compute_derivatives(self, state_vector, bssn_vars, grid):
-        """Compute spatial derivatives needed for flux calculations."""
+    def _ensure_primitives_computed(self, bssn_vars):
+        """Ensure primitive variables are computed with correct geometry."""
         
-        N = grid.N
-        
-        # Initialize derivative arrays
-        self.d1_D = np.zeros([N, SPACEDIM])
-        self.d1_Sr = np.zeros([N, SPACEDIM])
-        self.d1_tau = np.zeros([N, SPACEDIM])
-        
-        # First derivatives - Grid.get_first_derivative returns full array
-        d1_state = grid.get_first_derivative(state_vector, self.indices)
-        self.d1_D[:,i_x1] = d1_state[self.idx_D]
-        self.d1_Sr[:,i_x1] = d1_state[self.idx_Sr]
-        self.d1_tau[:,i_x1] = d1_state[self.idx_tau]
-        
-
-    def _conservative_to_primitive(self, bssn_vars, grid):
-        """Convert conservative to primitive variables using robust con2prim."""
-        
-        N = grid.N
-        r = grid.r
-        
-        # Initialize primitive arrays
-        self.rho0 = np.zeros(N)
-        self.vr = np.zeros(N)
-        self.pressure = np.zeros(N)
-        self.eps = np.zeros(N)
-        self.W = np.zeros(N)
-        self.h = np.zeros(N)
-        
-        # Extract geometry
-        if self.spacetime_mode == "fixed_minkowski":
-            alpha = np.ones(N)
-            beta_r = np.zeros(N)
-            gamma_rr = np.ones(N)
-        else:
-            alpha = bssn_vars.lapse
-            beta_r = bssn_vars.shift_U[:,i_x1] if hasattr(bssn_vars, 'shift_U') else np.zeros(N)
+        if self.primitives_computed and self.background is not None:
+            return
             
-            # For dynamic spacetime, we need the background (will be set when get_emtensor is called)
-            # For now, use placeholder - in practice, con2prim is called after get_emtensor
+        self._conservative_to_primitive(bssn_vars)
+        self.primitives_computed = True
+
+    def _conservative_to_primitive(self, bssn_vars):
+        """Convert conservative to primitive variables using centralized cons2prim."""
+        
+        N = self.grid.N
+        r = self.grid.r
+        
+        # Build metric dictionary for cons2prim
+        metric = self._build_metric_dict(bssn_vars, r, N)
+        
+        # Call centralized cons2prim function
+        primitives = cons_to_prim(
+            U=(self.D, self.Sr, self.tau),
+            eos=self.eos,
+            params=self.cons2prim_params,
+            metric=metric
+        )
+        
+        # Extract results
+        self.rho0 = primitives['rho0']
+        self.vr = primitives['vr']
+        self.pressure = primitives['p']
+        self.eps = primitives['eps']
+        self.W = primitives['W']
+        self.h = primitives['h']
+        self.cons2prim_success = primitives['success']
+        
+        # Handle failed points
+        failed_points = np.where(~self.cons2prim_success)[0]
+        if len(failed_points) > 0:
+            print(f"Warning: cons2prim failed at {len(failed_points)} points")
+            self._handle_failed_points(failed_points)
+
+    def _build_metric_dict(self, bssn_vars, r, N):
+        """Build metric dictionary for cons2prim based on spacetime mode."""
+        
+        if self.spacetime_mode == "fixed_minkowski":
+            return {
+                "alpha": np.ones(N),
+                "beta_r": np.zeros(N), 
+                "gamma_rr": np.ones(N)
+            }
+        else:
+            # Dynamic spacetime
+            alpha = bssn_vars.lapse
+            beta_r = bssn_vars.shift_U[:, i_x1] if hasattr(bssn_vars, 'shift_U') else np.zeros(N)
+            
             if self.background is not None:
                 e4phi = np.exp(4.0 * bssn_vars.phi)
                 bar_gamma_LL = get_bar_gamma_LL(r, bssn_vars.h_LL, self.background)
                 gamma_rr = e4phi * bar_gamma_LL[:, i_r, i_r]
             else:
-                # Fallback to Minkowski if background not yet set
+                # Fallback to Minkowski if background not yet available
                 gamma_rr = np.ones(N)
-        
-        # Perform con2prim conversion
-        success = self.con2prim.convert_all_points(
-            self.D, self.Sr, self.tau,
-            self.rho0, self.vr, self.pressure, self.eps, self.W, self.h,
-            alpha, beta_r, gamma_rr
-        )
-        
-        # Handle failed points
-        failed_points = np.where(~success)[0]
-        if len(failed_points) > 0:
-            print(f"Warning: con2prim failed at {len(failed_points)} points")
-            self._set_atmosphere_points(failed_points)
+                
+            return {
+                "alpha": alpha,
+                "beta_r": beta_r,
+                "gamma_rr": gamma_rr
+            }
 
-
-    def _set_atmosphere_points(self, indices):
-        """Set atmosphere values at specified grid points."""
+    def _handle_failed_points(self, indices):
+        """Handle points where cons2prim failed by setting to atmosphere."""
         
         for i in indices:
+            # Set atmosphere primitives
             self.rho0[i] = self.atmosphere_rho
             self.vr[i] = 0.0
-            self.pressure[i] = self.eos.pressure(self.atmosphere_rho, 1e-10)
-            self.eps[i] = 1e-10
+            self.pressure[i] = max(1e-15, self.eos.pressure(self.atmosphere_rho, 1e-10))
+            self.eps[i] = self.eos.eps_from_rho_p(self.atmosphere_rho, self.pressure[i])
             self.W[i] = 1.0
             self.h[i] = 1.0 + self.eps[i] + self.pressure[i] / self.rho0[i]
             
-            # Reset conservative variables to be consistent
-            self.D[i] = self.rho0[i] * self.W[i]
-            self.Sr[i] = 0.0
-            self.tau[i] = (self.rho0[i] * self.h[i] * self.W[i]**2 - 
-                          self.pressure[i] - self.D[i])
-
+            # Update conservative variables to be consistent
+            # Use centralized prim_to_cons from cons2prim.py
+            from .cons2prim import prim_to_cons
+            gamma_rr = 1.0  # Safe default for failed points
+            cons = prim_to_cons(self.rho0[i], self.vr[i], self.pressure[i], gamma_rr, self.eos)
+            self.D[i], self.Sr[i], self.tau[i] = cons
 
     def apply_floors_and_ceilings(self, max_lorentz=100.0):
         """Apply physical floors and ceilings to prevent unphysical values."""
         
+        if not self.primitives_computed:
+            return
+            
+        modified_points = []
+        
         # Density floor
         rho_floor_mask = self.rho0 < self.atmosphere_rho
         if rho_floor_mask.any():
-            floor_indices = np.where(rho_floor_mask)[0]
-            self._set_atmosphere_points(floor_indices)
+            modified_points.extend(np.where(rho_floor_mask)[0])
         
-        # Lorentz factor ceiling
+        # Lorentz factor ceiling  
         W_ceiling_mask = self.W > max_lorentz
         if W_ceiling_mask.any():
             self.W[W_ceiling_mask] = max_lorentz
-            # Recompute velocity
+            # Recompute velocity from W
             v2_max = 1.0 - 1.0/max_lorentz**2
             self.vr[W_ceiling_mask] = np.sign(self.vr[W_ceiling_mask]) * np.sqrt(v2_max)
-            
-            # Recompute conservative variables
-            ceiling_indices = np.where(W_ceiling_mask)[0]
-            for i in ceiling_indices:
-                self.D[i] = self.rho0[i] * self.W[i]
-                self.Sr[i] = self.rho0[i] * self.h[i] * self.W[i]**2 * self.vr[i]
-                self.tau[i] = (self.rho0[i] * self.h[i] * self.W[i]**2 - 
-                              self.pressure[i] - self.D[i])
+            modified_points.extend(np.where(W_ceiling_mask)[0])
         
         # Pressure floor
         p_floor = 1e-15
@@ -267,7 +261,23 @@ class RelativisticFluid:
             self.eps[p_floor_mask] = self.eos.eps_from_rho_p(
                 self.rho0[p_floor_mask], p_floor
             )
-
+            modified_points.extend(np.where(p_floor_mask)[0])
+        
+        # Update conservative variables for all modified points
+        if modified_points:
+            from .cons2prim import prim_to_cons
+            unique_points = np.unique(modified_points)
+            
+            for i in unique_points:
+                if self.background is not None:
+                    # Use proper metric
+                    metric_dict = self._build_metric_dict(None, None, None)  # This needs bssn_vars
+                    gamma_rr = 1.0  # Simplified for now
+                else:
+                    gamma_rr = 1.0
+                    
+                cons = prim_to_cons(self.rho0[i], self.vr[i], self.pressure[i], gamma_rr, self.eos)
+                self.D[i], self.Sr[i], self.tau[i] = cons
 
     def get_diagnostics(self):
         """Return diagnostic quantities for monitoring evolution."""
@@ -276,14 +286,22 @@ class RelativisticFluid:
             return {}
         
         diagnostics = {
-            'max_density': np.max(self.rho0),
-            'min_density': np.min(self.rho0),
-            'max_pressure': np.max(self.pressure),
-            'min_pressure': np.min(self.pressure),
-            'max_lorentz': np.max(self.W),
-            'max_velocity': np.max(np.abs(self.vr)),
-            'atmosphere_points': np.sum(self.rho0 <= self.atmosphere_rho * 1.1),
-            'total_mass': np.sum(self.D),  # Approximate - needs proper integration
+            'max_density': np.max(self.D) if self.D is not None else 0,
+            'min_density': np.min(self.D) if self.D is not None else 0,
+            'total_mass': np.sum(self.D) if self.D is not None else 0,
+            'primitives_computed': self.primitives_computed
         }
+        
+        if self.primitives_computed:
+            diagnostics.update({
+                'max_rest_density': np.max(self.rho0),
+                'min_rest_density': np.min(self.rho0),
+                'max_pressure': np.max(self.pressure),
+                'min_pressure': np.min(self.pressure),
+                'max_lorentz': np.max(self.W),
+                'max_velocity': np.max(np.abs(self.vr)),
+                'atmosphere_points': np.sum(self.rho0 <= self.atmosphere_rho * 1.1),
+                'cons2prim_failures': np.sum(~self.cons2prim_success) if self.cons2prim_success is not None else 0
+            })
         
         return diagnostics

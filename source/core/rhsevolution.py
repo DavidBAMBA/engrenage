@@ -123,7 +123,8 @@ def get_rhs(t_i, current_state: np.ndarray, grid: Grid, background, matter, prog
     # Convert the tensorial forms back into the state variables, not yet flattened
     bssn_rhs_state = bssn_rhs.set_bssn_state_vars()
     
-    if (matter_rhs != None) :
+    #if (matter_rhs != None) : #CAMBIOOOOOOOO
+    if matter_rhs is not None:
         rhs_state = np.concatenate([bssn_rhs_state, matter_rhs])
     else :
         rhs_state = bssn_rhs_state

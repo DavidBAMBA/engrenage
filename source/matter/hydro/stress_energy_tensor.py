@@ -1,6 +1,7 @@
 import numpy as np
 from bssn.tensoralgebra import *
-from bssn.tensoralgebra import i_x1, i_x2, i_x3, SPACEDIM
+from bssn.tensoralgebra import SPACEDIM
+from core.grid import i_x1, i_x2, i_x3
 from bssn.bssnstatevariables import NUM_BSSN_VARS
 
 def compute_stress_energy_tensor(rho0, vr, pressure, eps, W, h, r, bssn_vars, background, spacetime_mode):

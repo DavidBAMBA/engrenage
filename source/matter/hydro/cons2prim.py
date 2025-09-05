@@ -1,3 +1,5 @@
+# cons2prim.py
+
 import numpy as np
 
 # Optional SciPy for robust Brent root-finding
@@ -15,7 +17,7 @@ def _default_params():
         "v_max": 0.999999,       # cap on |v| in units of c
         "W_max": 1.0e3,          # cap on Lorentz factor
         "tol": 1e-12,            # relative tolerance for root solve
-        "max_iter": 100,         # iterations per point
+        "max_iter": 500,         # iterations per point
         "bracket_expand": 10.0,  # multiplicative expansion of p_high while bracketing
         "bracket_steps": 20,     # max expansions
         "newton_pert": 1e-3,     # relative perturbation for numeric df/dp
@@ -95,12 +97,13 @@ def _state_from_p(D, Sr, tau, p, gamma_rr, eos, params):
     if Q <= 0.0:
         return False, 0, 0, 0, 1, 1, np.inf
 
-    # v^r from momentum: S_r = Q * v_r, and v_r = gamma_rr * v^r
-    denom = Q * max(gamma_rr, 1e-30)
-    vr = Sr / denom
+    g = float(max(gamma_rr, 1e-30))
+
+    # v^r from momentum: S_r = Q * v_r, and v_r = gamma_rr * v^r  ⇒  v^r = S_r / (Q * gamma_rr)
+    vr = Sr / (Q * g)
 
     # v^2 and W
-    v2 = gamma_rr * vr * vr
+    v2 = g * vr * vr
     if not (0.0 <= v2 < 1.0):
         return False, 0, 0, 0, 1, 1, np.inf
 
@@ -110,7 +113,7 @@ def _state_from_p(D, Sr, tau, p, gamma_rr, eos, params):
 
     # rho0
     rho0 = D / max(W, 1e-30)
-    if rho0 <= 0.0:
+    if rho0 <= 0.0 or not np.isfinite(rho0):
         return False, 0, 0, 0, 1, 1, np.inf
 
     # EOS: epsilon and enthalpy
@@ -122,12 +125,12 @@ def _state_from_p(D, Sr, tau, p, gamma_rr, eos, params):
             gamma = float(eos.gamma)
             eps = p / ((gamma - 1.0) * rho0)
         else:
-            raise
-    if eps < 0.0:
+            return False, 0, 0, 0, 1, 1, np.inf
+    if not np.isfinite(eps) or eps < 0.0:
         return False, 0, 0, 0, 1, 1, np.inf
 
     h = 1.0 + eps + p / max(rho0, 1e-30)
-    if h <= 1.0:
+    if not np.isfinite(h) or h <= 1.0:
         return False, 0, 0, 0, 1, 1, np.inf
 
     # Residual
@@ -142,7 +145,7 @@ def _deriv_df_dp(D, Sr, tau, p, gamma_rr, eos, params, rho0, vr, eps, W, h):
     dp = max(params["newton_pert"] * max(abs(p), 1.0), 1e-12)
     p2 = p + dp
     ok2, *_rest2, f2 = _state_from_p(D, Sr, tau, p2, gamma_rr, eos, params)
-    ok1, *_rest1, f1 = _state_from_p(D, Sr, tau, p, gamma_rr, eos, params)
+    ok1, *_rest1, f1 = _state_from_p(D, Sr, tau, p,  gamma_rr, eos, params)
     if not (ok1 and ok2):
         # fallback to small symmetric difference if possible
         p0 = max(p - dp, params["p_floor"])
@@ -176,7 +179,7 @@ def _bracket_pressure(D, Sr, tau, gamma_rr, eos, params):
     # Expand p_hi until sign changes or we hit limit
     steps = 0
     while steps < params["bracket_steps"] and (not ok_lo or not ok_hi or f_lo * f_hi > 0.0):
-        # If either state invalid, adjust bound upward
+        # If either state invalid or no sign change, adjust bound upward
         p_hi = max(p_hi * params["bracket_expand"], p_hi + 1.0)
         ok_hi, *_rest_hi, f_hi = _state_from_p(D, Sr, tau, p_hi, g, eos, params)
         steps += 1
@@ -200,7 +203,7 @@ def _solve_pressure(D, Sr, tau, gamma_rr, eos, params):
     ok_br, p_lo, p_hi, f_lo, f_hi = _bracket_pressure(D, Sr, tau, gamma_rr, eos, params)
 
     # Attempt Brent (SciPy)
-    if ok_br and _HAVE_SCIPY:
+    """ if ok_br and _HAVE_SCIPY:
         try:
             root = brentq(lambda p: _state_from_p(D, Sr, tau, p, gamma_rr, eos, params)[-1],
                           p_lo, p_hi, xtol=max(1e-14, params["tol"]), rtol=params["tol"], maxiter=params["max_iter"])
@@ -208,7 +211,7 @@ def _solve_pressure(D, Sr, tau, gamma_rr, eos, params):
             if ok:
                 return True, rho0, vr, root, eps, W, h
         except Exception:
-            pass
+            pass """
 
     # Manual bisection
     if ok_br:
@@ -218,13 +221,10 @@ def _solve_pressure(D, Sr, tau, gamma_rr, eos, params):
             c = 0.5 * (a + b)
             okc, rho0_c, vr_c, eps_c, W_c, h_c, fc = _state_from_p(D, Sr, tau, c, gamma_rr, eos, params)
             if not okc:
-                # If mid invalid, push c upward
-                a = c
-                fa = fc
+                a, fa = c, fc
                 continue
             if abs(fc) <= params["tol"] * max(1.0, abs(c)):
                 return True, rho0_c, vr_c, c, eps_c, W_c, h_c
-            # Decide side
             if fa * fc <= 0.0:
                 b, fb = c, fc
             else:
@@ -235,7 +235,6 @@ def _solve_pressure(D, Sr, tau, gamma_rr, eos, params):
     for _ in range(params["max_iter"]):
         ok, rho0, vr, eps, W, h, f = _state_from_p(D, Sr, tau, p, gamma_rr, eos, params)
         if not ok:
-            # Nudge upward
             p = max(params["p_floor"], p * 1.5 + 1e-12)
             continue
         if abs(f) <= params["tol"] * max(1.0, abs(p)):
@@ -244,32 +243,31 @@ def _solve_pressure(D, Sr, tau, gamma_rr, eos, params):
         if df is None or df == 0.0 or not np.isfinite(df):
             p = max(params["p_floor"], p * 1.5 + 1e-12)
             continue
-        # Newton step with safeguard
         p_new = p - f / df
-        # keep within physical limits
         if not np.isfinite(p_new) or p_new <= 0.0:
             p_new = max(params["p_floor"], 0.5 * p)
-        # damp
         p = 0.5 * p + 0.5 * p_new
 
     # Floors (atmosphere)
     rho0 = params["rho_floor"]
     vr = 0.0
     p = params["p_floor"]
-    eps = getattr(eos, "eps_from_rho_p", lambda r, p: 1e-10)(rho0, p)
+    try:
+        eps = eos.eps_from_rho_p(rho0, p)
+    except Exception:
+        eps = 1e-10
     W = 1.0
     h = 1.0 + eps + p / rho0
     return False, rho0, vr, p, eps, W, h
 
 
-def cons2prim(U, eos, params=None, metric=None):
+def cons_to_prim(U, eos, params=None, metric=None):
     """
-    Public API:
-      primitives = cons2prim(U, eos, params=None, metric=None)
+      primitives = cons_to_prim(U, eos, params=None, metric=None)
 
     Inputs:
       - U: dict with arrays {'D','Sr','tau'} or tuple/list (D,Sr,tau) or array with last dim=3
-      - eos: an EOS object exposing at least eps_from_rho_p(rho0, p) and optionally gamma (for fallback)
+      - eos: an EOS object exposing at least eps_from_rho_p(rho0, p)
       - params: dict of solver parameters (floors, tolerances, max_iter, etc.). Missing entries use defaults.
       - metric: dict or tuple (alpha, beta_r, gamma_rr). Default: Minkowski.
 
@@ -286,20 +284,13 @@ def cons2prim(U, eos, params=None, metric=None):
     alpha, beta_r, gamma_rr = _ensure_metric(metric, N)
 
     # Allocate outputs
-    rho0 = np.zeros(N)
-    vr = np.zeros(N)
-    p = np.zeros(N)
-    eps = np.zeros(N)
-    W = np.ones(N)
-    h = np.ones(N)
+    rho0, vr, p, eps, W, h = (np.zeros(N) for _ in range(6))
     success = np.zeros(N, dtype=bool)
 
-    # Loop over points (robust and simple for now)
+    # Loop over points
     for i in range(N):
-        # Near-vacuum early exit
-        if not np.isfinite(D[i]) or not np.isfinite(Sr[i]) or not np.isfinite(tau[i]):
-            ok = False
-        elif D[i] < cfg["rho_floor"] or (D[i] <= 0.0) or (tau[i] < -D[i]):
+        if (not np.isfinite(D[i]) or not np.isfinite(Sr[i]) or not np.isfinite(tau[i])
+            or D[i] < cfg["rho_floor"] or (tau[i] < -D[i])):
             ok = False
         else:
             ok, rho0_i, vr_i, p_i, eps_i, W_i, h_i = _solve_pressure(
@@ -307,44 +298,50 @@ def cons2prim(U, eos, params=None, metric=None):
             )
 
         if not ok:
-            # atmosphere
-            rho0_i = cfg["rho_floor"]
-            vr_i = 0.0
-            p_i = cfg["p_floor"]
-            eps_i = getattr(eos, "eps_from_rho_p", lambda r, p: 1e-10)(rho0_i, p_i)
-            W_i = 1.0
-            h_i = 1.0 + eps_i + p_i / rho0_i
+            rho0_i, vr_i, p_i = cfg["rho_floor"], 0.0, cfg["p_floor"]
+            try:
+                eps_i = eos.eps_from_rho_p(rho0_i, p_i)
+            except Exception:
+                eps_i = 1e-10
+            W_i, h_i = 1.0, 1.0 + eps_i + p_i / rho0_i
         else:
-            # Velocity caps
+            # Enforce |v| < v_max
             v2 = gamma_rr[i] * (vr_i ** 2)
-            if v2 >= cfg["v_max"]**2:
-                vr_i = np.sign(vr_i) * cfg["v_max"] / np.sqrt(max(gamma_rr[i],1e-30))
-                W_i = 1.0 / np.sqrt(1.0 - cfg["v_max"]**2)
-            if W_i > cfg["W_max"]:
-                W_i = cfg["W_max"]
-                v2_cap = 1.0 - 1.0 / (W_i * W_i)
-                vr_i = np.sign(vr_i) * np.sqrt(max(v2_cap,0.0) / max(gamma_rr[i],1e-30))
+            vmax2 = cfg["v_max"] ** 2
+            if v2 >= vmax2:
+                vr_i = np.sign(vr_i) * cfg["v_max"] / np.sqrt(max(gamma_rr[i], 1e-30))
 
         rho0[i], vr[i], p[i], eps[i], W[i], h[i], success[i] = rho0_i, vr_i, p_i, eps_i, W_i, h_i, ok
 
-    return {
-        "rho0": rho0,
-        "vr": vr,
-        "p": p,
-        "eps": eps,
-        "W": W,
-        "h": h,
-        "success": success,
-    }
+    return {"rho0": rho0, "vr": vr, "p": p, "eps": eps, "W": W, "h": h, "success": success}
 
 
-# ---------------------------------------------------------------------------
-# Back-compat thin wrapper so existing code using ConservativeToPrimitive still works
-# ---------------------------------------------------------------------------
+def prim_to_cons(rho0, vr, pressure, gamma_rr, eos):
+    """
+    Convert primitive (rho0, v^r, p) to conservative (D, S_r, tau) in 1D with metric γ_rr.
+    Returns scalars (D, S_r, tau).
+    """
+    g = float(max(gamma_rr, 1e-30))
+    v2 = g * float(vr) * float(vr)
+    v2 = float(np.clip(v2, 0.0, 1.0 - 1e-12))
+    W  = 1.0 / np.sqrt(1.0 - v2)
 
+    # EOS: eps, enthalpy
+    eps = eos.eps_from_rho_p(float(rho0), float(pressure))
+    h   = 1.0 + eps + float(pressure) / max(float(rho0), 1e-30)
+
+    D   = float(rho0) * W
+    Sr  = float(rho0) * h * W * W * float(vr) * g  # S_r = ρ h W^2 v_r ; v_r = γ_rr v^r
+    tau = float(rho0) * h * W * W - float(pressure) - D
+    return D, Sr, tau
+
+
+# ===========================================================================
+# ============ CLASE ORIGINAL MANTENIDA PARA COMPATIBILIDAD =================
+# ===========================================================================
 class ConservativeToPrimitive:
     """
-    Thin OO wrapper that mirrors the previous class API but delegates to cons2prim().
+    Thin OO wrapper that mirrors the previous class API.
     """
 
     def __init__(self, eos, atmosphere_rho=1e-13, max_iterations=50, tolerance=1e-12):
@@ -356,31 +353,33 @@ class ConservativeToPrimitive:
         self.params["tol"] = tolerance
         self.total_calls = 0
         self.failed_conversions = 0
-        self.average_iterations = 0.0  # not tracked in functional variant
+        self.average_iterations = 0.0
 
     def convert_all_points(self, D, Sr, tau,
                            rho0_out, vr_out, p_out, eps_out, W_out, h_out,
                            alpha, beta_r, gamma_rr):
-        # Use the new functional API
-        out = cons2prim((D, Sr, tau), self.eos,
-                        params=self.params,
-                        metric=(alpha, beta_r, gamma_rr))
+        # Delega a la nueva API funcional
+        out = cons_to_prim((D, Sr, tau), self.eos,
+                           params=self.params,
+                           metric=(alpha, beta_r, gamma_rr))
         rho0_out[:] = out["rho0"]
         vr_out[:] = out["vr"]
         p_out[:] = out["p"]
         eps_out[:] = out["eps"]
         W_out[:] = out["W"]
         h_out[:] = out["h"]
-        self.total_calls += 1
-        self.failed_conversions += int(np.sum(~out["success"]))
+        self.total_calls += len(D)
+        self.failed_conversions += np.sum(~out["success"])
         return out["success"]
 
     def primitive_to_conservative(self, rho0, vr, pressure, eps, W, h,
                                   alpha, beta_r, gamma_rr):
-        v2 = gamma_rr * vr**2
-        Wc = 1.0 / np.sqrt(1.0 - v2)
+        # Mantenemos este método dentro de la clase para compatibilidad
+        g = gamma_rr
+        v2 = g * vr**2
+        Wc = 1.0 / np.sqrt(1.0 - np.clip(v2, 0.0, 0.9999999))
         D = rho0 * Wc
-        Sr = rho0 * h * Wc**2 * vr
+        Sr = rho0 * h * Wc**2 * vr * g  # S_r = rho h W^2 v_r
         tau = rho0 * h * Wc**2 - pressure - D
         return D, Sr, tau
 
