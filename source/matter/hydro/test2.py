@@ -1,307 +1,332 @@
 #!/usr/bin/env python
 """
-Herramientas de diagnóstico para identificar bugs específicos
-en la implementación de hidrodinámica relativista.
+Ejemplo de evolución acoplada completa: BSSN + Hidrodinámica Relativista
+Caso: Colapso gravitacional de fluido relativista
 """
 
 import numpy as np
 import matplotlib.pyplot as plt
-import sys
-sys.path.insert(0, 'source')
+from scipy.integrate import solve_ivp
+from tqdm import tqdm
 
+# Importaciones de Engrenage
+from core.grid import Grid
+from core.spacing import LinearSpacing, SpacingExtent  
+from core.statevector import StateVector
+from core.rhsevolution import get_rhs
+from backgrounds.sphericalbackground import FlatSphericalBackground
+from bssn.bssnstatevariables import *
+from bssn.bssnvars import BSSNVars
+
+# Importaciones de Hidrodinámica
+from matter.hydro.relativistic_fluid import RelativisticFluid
 from matter.hydro.eos import IdealGasEOS
 from matter.hydro.reconstruction import MinmodReconstruction
 from matter.hydro.riemann import HLLERiemannSolver
-from source.matter.hydro.cons2prim import cons2prim
-from matter.hydro.valencia_reference_metric import ValenciaReferenceMetric
+from matter.hydro.cons2prim import cons_to_prim, prim_to_cons
 
-# =============================================================================
-# DIAGNÓSTICO 1: VERIFICAR VELOCIDADES CARACTERÍSTICAS
-# =============================================================================
-def diagnose_characteristic_speeds():
-    """Verificar que las velocidades características son físicas."""
-    print("\n" + "="*60)
-    print("DIAGNÓSTICO: Velocidades Características")
-    print("="*60)
+def setup_tolman_oppenheimer_volkoff_initial_data(r, M_central=1.0, R_star=0.8, 
+                                                  rho_central=1.0, eos=None):
+    """
+    Condiciones iniciales aproximadas tipo TOV (Tolman-Oppenheimer-Volkoff)
+    para un fluido en equilibrio hidrostático.
     
-    eos = IdealGasEOS(gamma=1.4)
+    Esto es una aproximación simple; para casos reales se resolvería 
+    la ecuación TOV completa.
+    """
+    N = len(r)
     
-    # Casos de prueba
-    test_cases = [
-        # (rho0, vr, p, nombre)
-        (1.0, 0.0, 1.0, "Reposo"),
-        (1.0, 0.5, 1.0, "Subsónico"),
-        (1.0, 0.9, 1.0, "Relativista"),
-        (0.1, 0.0, 0.01, "Baja densidad"),
-        (10.0, 0.0, 100.0, "Alta presión"),
-    ]
+    # Perfil de densidad tipo gaussiano/exponencial
+    sigma = R_star / 3.0
+    rho0 = rho_central * np.exp(-(r/sigma)**2)
+    rho0 = np.maximum(rho0, 1e-13)  # atmosphere floor
     
-    for rho0, vr, p, name in test_cases:
-        eps = eos.eps_from_rho_p(rho0, p)
-        h = 1.0 + eps + p/rho0
-        cs2 = eos.sound_speed_squared(rho0, p, eps)
-        cs = np.sqrt(cs2)
-        
-        # Velocidades características en Minkowski
-        v2 = vr**2
-        denom = 1.0 - v2*cs2
-        
-        if denom > 0:
-            lambda_plus = (vr + cs*np.sqrt(1-v2)) / denom
-            lambda_minus = (vr - cs*np.sqrt(1-v2)) / denom
-        else:
-            lambda_plus = lambda_minus = np.nan
-        
-        print(f"\n{name}:")
-        print(f"  ρ₀={rho0:.2f}, v={vr:.2f}, p={p:.2f}")
-        print(f"  cs={cs:.3f}, cs²={cs2:.3f}")
-        print(f"  λ₊={lambda_plus:.3f}, λ₋={lambda_minus:.3f}")
-        
-        # Verificaciones
-        if np.isnan(lambda_plus) or np.isnan(lambda_minus):
-            print("  ⚠️ ADVERTENCIA: Velocidades no físicas")
-        elif abs(lambda_plus) > 1.0 or abs(lambda_minus) > 1.0:
-            print("  ⚠️ ADVERTENCIA: Velocidades superlumínicas")
-        else:
-            print("  ✓ OK")
-
-# =============================================================================
-# DIAGNÓSTICO 2: ESTABILIDAD DE cons2prim
-# =============================================================================
-def diagnose_cons2prim_stability():
-    """Probar cons2prim en casos extremos."""
-    print("\n" + "="*60)
-    print("DIAGNÓSTICO: Estabilidad de cons2prim")
-    print("="*60)
+    # Presión en equilibrio hidrostático (aproximación)
+    # p ~ rho^Γ para politropa
+    gamma = eos.gamma if hasattr(eos, 'gamma') else 2.0
+    p_central = 0.1 * rho_central**(gamma)
+    pressure = p_central * (rho0/rho_central)**(gamma)
+    pressure = np.maximum(pressure, 1e-15)
     
-    eos = IdealGasEOS(gamma=1.4)
+    # Velocidad inicial (reposo)
+    vr = np.zeros(N)
     
-    # Casos extremos
-    extreme_cases = [
-        # (D, Sr, tau, descripción)
-        (1e-10, 0.0, 1e-10, "Casi vacío"),
-        (1000.0, 0.0, 10000.0, "Alta densidad"),
-        (1.0, 0.99, 10.0, "Alto momento"),
-        (1.0, 1e-10, 0.1, "Bajo momento"),
-        (1.0, 0.0, -0.5, "tau negativo (no físico)"),
-    ]
+    # Variables derivadas
+    eps = eos.eps_from_rho_p(rho0, pressure)
+    h = 1.0 + eps + pressure/rho0
+    W = 1.0 / np.sqrt(1.0 - vr**2)
     
-    for D, Sr, tau, desc in extreme_cases:
-        print(f"\n{desc}: D={D:.2e}, Sr={Sr:.2e}, tau={tau:.2e}")
-        
-        try:
-            result = cons2prim(
-                ([D], [Sr], [tau]), eos,
-                metric=(np.ones(1), np.zeros(1), np.ones(1))
-            )
-            
-            if result['success'][0]:
-                print(f"  ✓ Convergió")
-                print(f"    ρ₀={result['rho0'][0]:.2e}")
-                print(f"    vr={result['vr'][0]:.3f}")
-                print(f"    p={result['p'][0]:.2e}")
-                print(f"    W={result['W'][0]:.3f}")
-                
-                # Verificar consistencia
-                W = result['W'][0]
-                h = result['h'][0]
-                rho0 = result['rho0'][0]
-                vr = result['vr'][0]
-                p = result['p'][0]
-                
-                D_check = rho0 * W
-                Sr_check = rho0 * h * W**2 * vr
-                tau_check = rho0 * h * W**2 - p - D_check
-                
-                D_error = abs(D_check - D) / (abs(D) + 1e-10)
-                Sr_error = abs(Sr_check - Sr) / (abs(Sr) + 1e-10)
-                tau_error = abs(tau_check - tau) / (abs(tau) + 1e-10)
-                
-                if max(D_error, Sr_error, tau_error) > 1e-6:
-                    print(f"  ⚠️ Error de consistencia: D={D_error:.2e}, Sr={Sr_error:.2e}, tau={tau_error:.2e}")
-            else:
-                print(f"  ✗ No convergió - aplicó atmósfera")
-                
-        except Exception as e:
-            print(f"  ✗ Excepción: {e}")
-
-# =============================================================================
-# DIAGNÓSTICO 3: FLUJOS NUMÉRICOS
-# =============================================================================
-def diagnose_numerical_fluxes():
-    """Verificar consistencia de flujos numéricos."""
-    print("\n" + "="*60)
-    print("DIAGNÓSTICO: Flujos Numéricos HLLE")
-    print("="*60)
-    
-    eos = IdealGasEOS(gamma=1.4)
-    solver = HLLERiemannSolver()
-    
-    # Test 1: Estados idénticos -> flujo debe ser F = U * v
-    print("\nTest 1: Estados idénticos")
-    rho0 = 1.0
-    vr = 0.2
-    p = 0.1
-    
-    eps = eos.eps_from_rho_p(rho0, p)
-    h = 1.0 + eps + p/rho0
-    W = 1.0 / np.sqrt(1 - vr**2)
-    
+    # Conservadas
     D = rho0 * W
-    Sr = rho0 * h * W**2 * vr
-    tau = rho0 * h * W**2 - p - D
+    Sr = rho0 * h * W**2 * vr  # = 0 inicialmente
+    tau = rho0 * h * W**2 - pressure - D
     
-    U = (D, Sr, tau)
-    prim = (rho0, vr, p)
+    # BSSN: métrica inicial aproximada para el fluido
+    # Usamos aproximación de campo débil: φ ~ -M/(8πr)
+    total_mass = np.trapz(4*np.pi * r**2 * rho0, r)
+    phi_init = np.zeros(N)
     
-    F = solver.solve(U, U, prim, prim, 1.0, 1.0, 0.0, eos)
+    # Solo aplicar corrección gravitacional donde hay materia significativa
+    matter_mask = rho0 > 10 * 1e-13
+    if np.any(matter_mask):
+        # Aproximación de campo débil
+        r_matter = r[matter_mask]
+        M_enclosed = np.cumsum(4*np.pi * r_matter**2 * rho0[matter_mask]) * (r_matter[1] - r_matter[0])
+        phi_correction = -0.1 * M_enclosed / (8*np.pi * np.maximum(r_matter, 1e-10))
+        phi_init[matter_mask] = phi_correction
     
-    # Flujo esperado
-    F_expected = np.array([D*vr, Sr*vr + p, (tau+p)*vr])
+    # Otras variables BSSN iniciales (aproximación métrica plana)
+    h_LL_init = np.zeros((N, 3, 3))  # desviación de métrica plana
+    K_init = np.zeros(N)             # curvatura extrínseca inicial
+    a_LL_init = np.zeros((N, 3, 3))  # parte traceless de curvatura extrínseca
+    lambda_U_init = np.zeros((N, 3)) # conexión
+    shift_U_init = np.zeros((N, 3))  # shift (gauge)
+    b_U_init = np.zeros((N, 3))      # derivada temporal de shift
+    lapse_init = np.ones(N)          # lapse (gauge)
     
-    error = np.abs(F - F_expected)
-    print(f"  Flujo calculado: [{F[0]:.3e}, {F[1]:.3e}, {F[2]:.3e}]")
-    print(f"  Flujo esperado:  [{F_expected[0]:.3e}, {F_expected[1]:.3e}, {F_expected[2]:.3e}]")
-    print(f"  Error: {np.max(error):.2e}")
-    print(f"  {'✓ OK' if np.max(error) < 1e-10 else '✗ FALLA'}")
+    return {
+        # Hidrodinámica
+        'D': D, 'Sr': Sr, 'tau': tau,
+        'rho0': rho0, 'vr': vr, 'pressure': pressure,
+        'eps': eps, 'h': h, 'W': W,
+        # BSSN
+        'phi': phi_init,
+        'h_LL': h_LL_init,
+        'K': K_init,
+        'a_LL': a_LL_init,
+        'lambda_U': lambda_U_init,
+        'shift_U': shift_U_init,
+        'b_U': b_U_init,
+        'lapse': lapse_init
+    }
+
+def create_coupled_initial_state(grid, hydro_fluid, initial_data):
+    """
+    Crea el vector de estado inicial completo combinando BSSN + hidrodinámica.
+    """
+    N = grid.num_points
+    state = np.zeros((grid.NUM_VARS, N))
     
-    # Test 2: Discontinuidad estacionaria
-    print("\nTest 2: Discontinuidad estacionaria (v=0)")
-    rhoL, vrL, pL = 1.0, 0.0, 1.0
-    rhoR, vrR, pR = 0.125, 0.0, 0.1
+    # BSSN variables
+    state[idx_phi, :] = initial_data['phi']
+    state[idx_hrr, :] = initial_data['h_LL'][:, 0, 0]  # h_rr
+    state[idx_htt, :] = initial_data['h_LL'][:, 1, 1]  # h_θθ  
+    state[idx_hpp, :] = initial_data['h_LL'][:, 2, 2]  # h_φφ
+    state[idx_K, :] = initial_data['K']
+    state[idx_arr, :] = initial_data['a_LL'][:, 0, 0]  # a_rr
+    state[idx_att, :] = initial_data['a_LL'][:, 1, 1]  # a_θθ
+    state[idx_app, :] = initial_data['a_LL'][:, 2, 2]  # a_φφ
+    state[idx_lambdar, :] = initial_data['lambda_U'][:, 0]  # λ^r
+    state[idx_shiftr, :] = initial_data['shift_U'][:, 0]    # β^r
+    state[idx_br, :] = initial_data['b_U'][:, 0]            # b^r
+    state[idx_lapse, :] = initial_data['lapse']             # α
     
-    epsL = eos.eps_from_rho_p(rhoL, pL)
-    epsR = eos.eps_from_rho_p(rhoR, pR)
-    hL = 1.0 + epsL + pL/rhoL
-    hR = 1.0 + epsR + pR/rhoR
+    # Hydro variables
+    state[hydro_fluid.idx_D, :] = initial_data['D']
+    state[hydro_fluid.idx_Sr, :] = initial_data['Sr'] 
+    state[hydro_fluid.idx_tau, :] = initial_data['tau']
     
-    DL = rhoL
-    DR = rhoR
-    SrL = SrR = 0.0
-    tauL = rhoL * hL - pL - DL
-    tauR = rhoR * hR - pR - DR
+    return state
+
+def run_coupled_evolution():
+    """
+    Ejecuta una simulación completa de evolución acoplada BSSN + hidrodinámica.
+    """
+    print("🚀 Evolución Acoplada: BSSN + Hidrodinámica Relativista")
+    print("="*60)
     
-    F = solver.solve(
-        (DL, SrL, tauL), (DR, SrR, tauR),
-        (rhoL, vrL, pL), (rhoR, vrR, pR),
-        1.0, 1.0, 0.0, eos
+    # Parámetros de simulación
+    N = 128               # resolución
+    r_max = 2.0          # dominio espacial  
+    t_final = 0.5        # tiempo final
+    
+    # Parámetros físicos del fluido
+    M_central = 0.5      # masa característica
+    R_star = 0.8         # radio característica de la estrella
+    rho_central = 2.0    # densidad central
+    gamma_eos = 2.0      # índice adiabático
+    
+    print(f"Parámetros: N={N}, r_max={r_max}, M={M_central}, R*={R_star}")
+    
+    # Setup del grid
+    spacing = LinearSpacing(N, r_max, SpacingExtent.HALF)
+    
+    # Setup de la materia (hidrodinámica)
+    eos = IdealGasEOS(gamma=gamma_eos)
+    hydro_fluid = RelativisticFluid(
+        eos=eos,
+        spacetime_mode="dynamic",  # ← Acoplamiento completo
+        atmosphere_rho=1e-13,
+        reconstructor=MinmodReconstruction(limiter_type="minmod"),
+        riemann_solver=HLLERiemannSolver()
     )
     
-    print(f"  Flujo: [{F[0]:.3e}, {F[1]:.3e}, {F[2]:.3e}]")
-    print(f"  F_Sr (momentum) = {F[1]:.3f} (debe ser entre {pR:.3f} y {pL:.3f})")
+    # State vector y grid
+    state_vec = StateVector(hydro_fluid)
+    grid = Grid(spacing, state_vec)
+    r = grid.r
+    background = FlatSphericalBackground(r)
     
-    if pR <= F[1] <= pL:
-        print("  ✓ OK - Flujo de momento en rango físico")
-    else:
-        print("  ✗ FALLA - Flujo fuera de rango")
-
-# =============================================================================
-# DIAGNÓSTICO 4: TÉRMINOS GEOMÉTRICOS
-# =============================================================================
-def diagnose_geometric_terms():
-    """Verificar términos geométricos en coordenadas esféricas."""
-    print("\n" + "="*60)
-    print("DIAGNÓSTICO: Términos Geométricos Esféricos")
-    print("="*60)
+    print(f"Variables totales: {grid.NUM_VARS} (BSSN: {NUM_BSSN_VARS}, Hydro: {hydro_fluid.NUM_MATTER_VARS})")
     
-    N = 50
-    r = np.linspace(0.1, 1.0, N)
+    # Condiciones iniciales
+    print("Generando condiciones iniciales...")
+    initial_data = setup_tolman_oppenheimer_volkoff_initial_data(
+        r, M_central=M_central, R_star=R_star, 
+        rho_central=rho_central, eos=eos
+    )
     
-    # Estado de prueba
-    rho0 = np.ones(N)
-    vr = 0.1 * np.ones(N)
-    pressure = 0.1 * np.ones(N)
+    # Estado inicial completo
+    state = create_coupled_initial_state(grid, hydro_fluid, initial_data)
     
-    print("\nTérmino fuente de momento: 2p/r")
-    source_Sr = 2.0 * pressure / r
+    # Aplicar boundary conditions
+    grid.fill_boundaries(state)
     
-    print(f"  En r=0.1: {source_Sr[0]:.3f}")
-    print(f"  En r=0.5: {source_Sr[N//2]:.3f}")
-    print(f"  En r=1.0: {source_Sr[-1]:.3f}")
+    # Diagnósticos iniciales
+    print("Estado inicial:")
+    print(f"  Masa total (hidro): {np.sum(initial_data['D']):.4f}")
+    print(f"  Densidad máxima: {np.max(initial_data['rho0']):.4f}")
+    print(f"  Presión máxima: {np.max(initial_data['pressure']):.4f}")
+    print(f"  φ mínimo: {np.min(initial_data['phi']):.6f}")
     
-    # Verificar regularización en r→0
-    print("\nRegularización cerca del origen:")
-    r_small = np.array([1e-5, 1e-4, 1e-3, 1e-2, 0.1])
-    p_test = 0.1
+    # Setup para evolución
+    progress_bar = tqdm(total=100, desc="Evolucionando")
+    time_state = [0.0, t_final/100]  # para progress bar
     
-    for r_val in r_small:
-        # Término directo
-        direct = 2.0 * p_test / r_val
+    def rhs_wrapper(t, y):
+        return get_rhs(t, y, grid, background, hydro_fluid, progress_bar, time_state)
+    
+    # Evolución temporal
+    print(f"Evolucionando hasta t = {t_final}...")
+    
+    try:
+        solution = solve_ivp(
+            rhs_wrapper,
+            [0, t_final],
+            state.flatten(),
+            method='RK45',
+            rtol=1e-7,
+            atol=1e-10,
+            t_eval=np.linspace(0, t_final, 21),  # 21 puntos de salida
+            max_step=0.001  # paso pequeño para estabilidad
+        )
         
-        # Término regularizado (L'Hôpital)
-        if r_val < 1e-10:
-            regularized = 0  # dp/dr en r=0 para p constante
-        else:
-            regularized = direct
+        progress_bar.close()
         
-        print(f"  r={r_val:.1e}: directo={direct:.1e}, regularizado={regularized:.1e}")
+        if not solution.success:
+            print(f"❌ Error en integración: {solution.message}")
+            return None
+            
+    except Exception as e:
+        progress_bar.close()
+        print(f"❌ Error durante evolución: {e}")
+        return None
+    
+    print("✅ Evolución completada exitosamente!")
+    
+    # Análisis y visualización
+    print("Generando análisis...")
+    analyze_and_plot_results(solution, grid, hydro_fluid, eos, r, t_final)
+    
+    return solution
 
-# =============================================================================
-# DIAGNÓSTICO 5: COMPARACIÓN CON SOLUCIÓN ANALÍTICA
-# =============================================================================
-def diagnose_analytical_comparison():
-    """Comparar con soluciones analíticas conocidas."""
-    print("\n" + "="*60)
-    print("DIAGNÓSTICO: Comparación con Soluciones Analíticas")
-    print("="*60)
+def analyze_and_plot_results(solution, grid, hydro_fluid, eos, r, t_final):
+    """
+    Analiza los resultados y genera gráficos de la evolución acoplada.
+    """
+    times = solution.t
+    n_times = len(times)
     
-    # Test: Onda sonora linealizada
-    print("\nOnda sonora linealizada (pequeña amplitud):")
+    # Extraer evolución de cantidades clave
+    central_density = np.zeros(n_times)
+    total_mass = np.zeros(n_times)
+    central_lapse = np.zeros(n_times)
+    central_phi = np.zeros(n_times)
+    max_curvature = np.zeros(n_times)
     
-    N = 100
-    r = np.linspace(0.1, 1.0, N)
+    for i, t in enumerate(times):
+        state_i = solution.y[:, i].reshape(grid.NUM_VARS, -1)
+        
+        # Hidrodinámica
+        D_i = state_i[hydro_fluid.idx_D]
+        Sr_i = state_i[hydro_fluid.idx_Sr]
+        tau_i = state_i[hydro_fluid.idx_tau]
+        
+        # Convertir a primitivas para análisis
+        prims_i = cons_to_prim((D_i, Sr_i, tau_i), eos)
+        
+        central_density[i] = prims_i['rho0'][0]  # densidad central
+        total_mass[i] = np.trapz(4*np.pi * r**2 * D_i, r)
+        
+        # BSSN
+        central_lapse[i] = state_i[idx_lapse][0]
+        central_phi[i] = state_i[idx_phi][0]
+        K_i = state_i[idx_K]
+        max_curvature[i] = np.max(np.abs(K_i))
     
-    # Perturbación sinusoidal pequeña
-    epsilon = 0.01
-    k = 2 * np.pi  # Número de onda
+    # Plot evolución temporal
+    fig, axes = plt.subplots(2, 3, figsize=(15, 10))
     
-    rho0 = 1.0 + epsilon * np.sin(k * r)
-    p0 = 0.1
-    pressure = p0 * (rho0 / 1.0) ** 1.4  # Adiabático
+    axes[0,0].plot(times, central_density, 'b-', lw=2)
+    axes[0,0].set_xlabel('t'); axes[0,0].set_ylabel('ρ₀ central')
+    axes[0,0].set_title('Densidad Central'); axes[0,0].grid(True, alpha=0.3)
     
-    eos = IdealGasEOS(gamma=1.4)
-    cs2 = eos.sound_speed_squared(1.0, p0, eos.eps_from_rho_p(1.0, p0))
-    cs = np.sqrt(cs2)
+    axes[0,1].plot(times, total_mass, 'g-', lw=2)
+    axes[0,1].set_xlabel('t'); axes[0,1].set_ylabel('Masa Total')
+    axes[0,1].set_title('Conservación de Masa'); axes[0,1].grid(True, alpha=0.3)
     
-    # Velocidad esperada (relación linealizada)
-    vr_expected = epsilon * cs * np.sin(k * r)
+    axes[0,2].plot(times, central_lapse, 'r-', lw=2)
+    axes[0,2].set_xlabel('t'); axes[0,2].set_ylabel('α central')
+    axes[0,2].set_title('Lapse Central'); axes[0,2].grid(True, alpha=0.3)
     
-    print(f"  Velocidad del sonido: cs = {cs:.3f}")
-    print(f"  Amplitud de densidad: ε = {epsilon}")
-    print(f"  Amplitud de velocidad esperada: ε*cs = {epsilon*cs:.3f}")
+    axes[1,0].plot(times, central_phi, 'm-', lw=2)
+    axes[1,0].set_xlabel('t'); axes[1,0].set_ylabel('φ central')
+    axes[1,0].set_title('Factor Conformal Central'); axes[1,0].grid(True, alpha=0.3)
     
-    # Verificar relación
-    rho_pert = rho0 - 1.0
-    v_to_rho_ratio = np.max(np.abs(vr_expected)) / np.max(np.abs(rho_pert))
+    axes[1,1].plot(times, max_curvature, 'c-', lw=2)
+    axes[1,1].set_xlabel('t'); axes[1,1].set_ylabel('|K|_max')
+    axes[1,1].set_title('Curvatura Máxima'); axes[1,1].grid(True, alpha=0.3)
     
-    print(f"  Razón |v|/|δρ| = {v_to_rho_ratio:.3f} (debe ser ≈ {cs:.3f})")
+    # Estado final espacial
+    final_state = solution.y[:, -1].reshape(grid.NUM_VARS, -1)
+    final_prims = cons_to_prim(
+        (final_state[hydro_fluid.idx_D], 
+         final_state[hydro_fluid.idx_Sr], 
+         final_state[hydro_fluid.idx_tau]), eos
+    )
     
-    if abs(v_to_rho_ratio - cs) / cs < 0.1:
-        print("  ✓ OK - Consistente con teoría lineal")
+    axes[1,2].plot(r, final_prims['rho0'], 'b-', label='ρ₀', lw=2)
+    axes[1,2].plot(r, final_state[idx_lapse], 'r-', label='α', lw=2)
+    axes[1,2].plot(r, np.exp(final_state[idx_phi]), 'g-', label='e^φ', lw=2)
+    axes[1,2].set_xlabel('r'); axes[1,2].set_ylabel('Valor')
+    axes[1,2].set_title(f'Perfiles Finales (t={t_final})'); axes[1,2].grid(True, alpha=0.3)
+    axes[1,2].legend(); axes[1,2].set_yscale('log')
+    
+    plt.suptitle('Evolución Acoplada BSSN + Hidrodinámica', fontsize=14)
+    plt.tight_layout()
+    plt.savefig('coupled_evolution_results.png', dpi=150, bbox_inches='tight')
+    plt.show()
+    
+    # Resumen numérico
+    print(f"\n📊 Resumen de Evolución (t=0 → t={t_final}):")
+    print(f"  Densidad central: {central_density[0]:.4f} → {central_density[-1]:.4f}")
+    print(f"  Conservación masa: Δm/m = {abs(total_mass[-1] - total_mass[0])/total_mass[0]:.2e}")
+    print(f"  Lapse central: {central_lapse[0]:.4f} → {central_lapse[-1]:.4f}")
+    print(f"  φ central: {central_phi[0]:.6f} → {central_phi[-1]:.6f}")
+    print(f"  Curvatura máxima final: {max_curvature[-1]:.4f}")
+    
+    # Verificar si el colapso está progresando
+    if central_lapse[-1] < 0.8 * central_lapse[0]:
+        print("  🌌 Indicios de colapso gravitacional!")
     else:
-        print("  ⚠️ Desviación de teoría lineal")
+        print("  ⚖️  Evolución estable (no colapso significativo)")
 
-# =============================================================================
-# MAIN - EJECUTAR DIAGNÓSTICOS
-# =============================================================================
 if __name__ == "__main__":
-    print("="*60)
-    print("DIAGNÓSTICOS DETALLADOS - HIDRODINÁMICA RELATIVISTA")
-    print("="*60)
+    # Ejecutar simulación acoplada
+    solution = run_coupled_evolution()
     
-    # Ejecutar todos los diagnósticos
-    diagnose_characteristic_speeds()
-    diagnose_cons2prim_stability()
-    diagnose_numerical_fluxes()
-    diagnose_geometric_terms()
-    diagnose_analytical_comparison()
-    
-    print("\n" + "="*60)
-    print("DIAGNÓSTICOS COMPLETADOS")
-    print("="*60)
-    print("\nRevisa los resultados arriba para identificar posibles problemas.")
-    print("\nSugerencias de debugging:")
-    print("1. Si cons2prim falla: revisar floors y casos extremos")
-    print("2. Si flujos incorrectos: verificar cálculo de velocidades características")
-    print("3. Si inestabilidad en r→0: revisar regularización de términos 1/r")
-    print("4. Si no conserva: verificar términos geométricos y condiciones de frontera")
+    if solution is not None:
+        print("🎉 Simulación completa exitosa!")
+        print("📈 Resultados guardados en 'coupled_evolution_results.png'")
+    else:
+        print("❌ Simulación falló")
