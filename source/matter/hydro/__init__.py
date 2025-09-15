@@ -11,15 +11,14 @@ tools like `python -m source.matter.hydro.test` don't fail on transitive deps.
 from importlib import import_module
 
 __all__ = [
-    'RelativisticFluid',
+    'PerfectFluid',
     'ValenciaReferenceMetric',
     'IdealGasEOS',
     'PolytropicEOS',
     'ConservativeToPrimitive',   # may be absent; exposed lazily if present
-    'compute_stress_energy_tensor',
     'HLLERiemannSolver',
     'MinmodReconstruction',
-    'create_relativistic_fluid',
+    'create_perfect_fluid',
     'EOS_TYPES',
     'RECONSTRUCTION_TYPES',
     'RIEMANN_SOLVERS',
@@ -27,8 +26,8 @@ __all__ = [
 
 # -------- Lazy attribute loading (PEP 562) --------
 def __getattr__(name):
-    if name == 'RelativisticFluid':
-        return import_module('.relativistic_fluid', __name__).RelativisticFluid
+    if name == 'PerfectFluid':
+        return import_module('.perfect_fluid', __name__).PerfectFluid
     if name == 'ValenciaReferenceMetric':
         return import_module('.valencia_reference_metric', __name__).ValenciaReferenceMetric
     if name == 'IdealGasEOS':
@@ -39,8 +38,6 @@ def __getattr__(name):
         return import_module('.riemann', __name__).HLLERiemannSolver
     if name == 'MinmodReconstruction':
         return import_module('.reconstruction', __name__).MinmodReconstruction
-    if name == 'compute_stress_energy_tensor':
-        return import_module('.stress_energy_tensor', __name__).compute_stress_energy_tensor
     if name == 'ConservativeToPrimitive':
         # Opcional: si existe una clase así, exponla; si no, no rompas.
         mod = import_module('.cons2prim', __name__)
@@ -54,7 +51,7 @@ def __getattr__(name):
     if name == 'RIEMANN_SOLVERS':
         r = import_module('.riemann', __name__)
         return {'hlle': r.HLLERiemannSolver}
-    if name == 'create_relativistic_fluid':
+    if name == 'create_perfect_fluid':
         # Devuelve la factory como función cerrada para que los imports sean internos
         def _factory(gamma=1.4, spacetime_mode="fixed_minkowski",
                     atmosphere_rho=1e-13, reconstruction="minmod",
@@ -62,7 +59,7 @@ def __getattr__(name):
             eos_mod  = import_module('.eos', __name__)
             rec_mod  = import_module('.reconstruction', __name__)
             rie_mod  = import_module('.riemann', __name__)
-            rf_mod   = import_module('.relativistic_fluid', __name__)
+            pf_mod   = import_module('.perfect_fluid', __name__)
 
             # EOS
             if reconstruction != "minmod":
@@ -74,7 +71,7 @@ def __getattr__(name):
             reconstructor = rec_mod.MinmodReconstruction()
             riemann = rie_mod.HLLERiemannSolver()
 
-            fluid = rf_mod.RelativisticFluid(
+            fluid = pf_mod.PerfectFluid(
                 eos=eos,
                 spacetime_mode=spacetime_mode,
                 atmosphere_rho=atmosphere_rho,

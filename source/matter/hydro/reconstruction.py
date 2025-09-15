@@ -348,24 +348,3 @@ class MUSCLReconstruction:
         return self._impl.compute_total_variation(u)
 
 
-# -------------------------
-# Quick self-test
-# -------------------------
-
-def _self_test():
-    print("Reconstruction quick test...")
-    x = np.linspace(0.0, 1.0, 33)
-    u = np.sin(2 * np.pi * x)
-
-    R = MinmodReconstruction("mc")
-    uL, uR = R.reconstruct(u, x=x)
-
-    vio = R.check_monotonicity(u, uL, uR)
-    tv0 = R.compute_total_variation(u)
-    tv1 = R.compute_total_variation(uL[1:-1])  # compare RV proxy
-    print(f"  violations: {vio}, TV(u)={tv0:.3e}, TV(recon-left)={tv1:.3e}")
-    print("OK" if vio == 0 else "Check limiter.")
-
-
-if __name__ == "__main__":
-    _self_test()

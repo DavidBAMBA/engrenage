@@ -9,6 +9,10 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
+# Add source path
+sys.path.append(os.path.join(os.path.dirname(__file__), '..', '..', '..'))
+sys.path.append(os.path.join(os.path.dirname(__file__), '..', '..'))
+
 # --- imports absolutos coherentes ---
 from source.core.spacing import NUM_GHOSTS
 from source.backgrounds.sphericalbackground import i_r
@@ -24,7 +28,8 @@ from source.bssn.tensoralgebra import SPACEDIM
 
 class Grid:
     def __init__(self, dx):
-        self.dx = float(dx)
+        self.dr = float(dx)
+        
 
 class _DummyBSSNVars:
     #Placeholders no usados en Minkowski fijo.
@@ -45,12 +50,12 @@ def build_grid(n_interior=256, r_min=1.0e-3, r_max=1.0, ng=NUM_GHOSTS):
     #Centros de celda uniformes + ghosts extrapolados linealmente.
     Nin = int(n_interior)
     r_in = np.linspace(r_min, r_max, Nin)
-    dx = (r_max - r_min) / (Nin - 1)
+    dr = (r_max - r_min) / (Nin - 1)
     # Extiende a la izquierda (ghosts) y derecha por extrapolación
-    left_ghosts  = r_in[0]  - dx*np.arange(ng,0,-1)
-    right_ghosts = r_in[-1] + dx*np.arange(1,ng+1)
+    left_ghosts  = r_in[0]  - dr*np.arange(ng,0,-1)
+    right_ghosts = r_in[-1] + dr*np.arange(1,ng+1)
     r_full = np.concatenate([left_ghosts, r_in, right_ghosts])
-    return r_full, Grid(dx), Nin
+    return r_full, Grid(dr), Nin
 
 def fill_ghosts_primitives(rho, v, p, ng=NUM_GHOSTS):
     """Paridades correctas en r≈0: rho/p pares; v impar. Outflow en borde derecho."""
@@ -100,7 +105,7 @@ def rk3_step(valencia, D, Sr, tau, rho0, v, p, r, grid, eos, recon, rsolve, cfl=
     """Una etapa RK3 Shu–Osher usando compute_rhs (full approach)."""
     # dt CFL
     amax = max_signal_speed(rho0, v, p, eos)
-    dt = cfl * grid.dx / amax
+    dt = cfl * grid.dr / amax
 
     # Dummy BSSN (no usado en Minkowski, pero la firma lo pide)
     bssn_vars = _DummyBSSNVars(len(r))
@@ -151,8 +156,8 @@ def volume_integrals(D, tau, r, grid):
     rin = r[ng:-ng]
     Din = D[ng:-ng]
     taun = tau[ng:-ng]
-    mass  = 4*np.pi * np.sum(Din   * rin*rin) * grid.dx
-    energ = 4*np.pi * np.sum(taun+Din) * grid.dx
+    mass  = 4*np.pi * np.sum(Din   * rin*rin) * grid.dr
+    energ = 4*np.pi * np.sum(taun+Din) * grid.dr
     return mass, energ
 
 # =========================
@@ -276,8 +281,8 @@ def test_riemann_sod():
 
     plt.suptitle(f"Sod radial — estado final (t ≈ {t:.3f}, pasos={steps})")
     plt.tight_layout()
-    plt.savefig("sod_final.png", dpi=150, bbox_inches="tight")
-    print("Gráfico guardado como 'sod_final.png'")
+    plt.savefig("sod_final2.png", dpi=150, bbox_inches="tight")
+    print("Gráfico guardado como 'sod_final2.png'")
 
     ok = (variation > 0.1) and contact
     print("✓ PASA" if ok else "✗ FALLA")
@@ -361,13 +366,13 @@ def tes_blast_wave(case='weak',
 
         fig, ax = plt.subplots(2, 2, figsize=(12, 8))
         ax[0,0].plot(rin, rho0[ng:-ng], 'r-', lw=2); ax[0,0].set_xlabel("r"); ax[0,0].set_ylabel("ρ₀"); ax[0,0].grid(True, alpha=0.3)
-        ax[0,1].plot(rin, p[ng:-ng],    'r-', lw=2); ax[0,1].set_xlabel("r"); ax[0,1].set_ylabel("p"); ax[0,1].set_yscale("log"); ax[0,1].grid(True, alpha=0.3)
+        ax[0,1].plot(rin, p[ng:-ng],    'r-', lw=2); ax[0,1].set_xlabel("r"); ax[0,1].set_ylabel("p"); ax[0,1].grid(True, alpha=0.3)
         ax[1,0].plot(rin, v[ng:-ng],    'r-', lw=2); ax[1,0].set_xlabel("r"); ax[1,0].set_ylabel("v^r"); ax[1,0].grid(True, alpha=0.3)
         ax[1,1].plot(rin, W[ng:-ng],    'r-', lw=2); ax[1,1].set_xlabel("r"); ax[1,1].set_ylabel("W"); ax[1,1].grid(True, alpha=0.3)
         fig.suptitle(f"Spherical blast ({case}) — Γ={gamma}, r0={r0:.3f}, t≈{t:.3f}, pasos={steps}")
         fig.tight_layout()
         if savefig:
-            fname = f"blast_final_{case}.png"
+            fname = f"blast_final_{case}2.png"
             plt.savefig(fname, dpi=150, bbox_inches="tight")
             print(f"Gráfico guardado como '{fname}'")
         else:
