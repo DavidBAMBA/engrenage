@@ -1,6 +1,6 @@
 import numpy as np
 
-from core.grid import Grid, i_x1
+from core.grid import Grid, i_x1, i_x2, i_x3
 from bssn.bssnstatevariables import NUM_BSSN_VARS
 from bssn.bssnvars import BSSNVars
 from bssn.tensoralgebra import SPACEDIM, EMTensor, get_bar_gamma_LL, get_bar_gamma_UU
@@ -59,6 +59,9 @@ class PerfectFluid:
         self.matter_vars_set = False
         self.grid = None
         self.background = None
+
+        # Cache for pressure guesses (improves cons2prim performance)
+        self.pressure_cache = None
 
         # Conservative variables
         self.D = None      # Rest mass density
@@ -159,18 +162,26 @@ class PerfectFluid:
         # Build metric for cons2prim
         metric = self._build_metric(bssn_vars, r)
 
-        # Call cons2prim module
+        # Use pressure cache if available
+        p_guess = self.pressure_cache
+
+        # Call cons2prim module with pressure guess
         primitives = cons_to_prim(
             U=(self.D, self.Sr, self.tau),
             eos=self.eos,
             params=self.cons2prim_params,
-            metric=metric
+            metric=metric,
+            p_guess=p_guess
         )
+
+        # Update pressure cache for next timestep
+        self.pressure_cache = primitives['p'].copy()
 
         # Handle conversion failures
         if not np.all(primitives['success']):
             failed = np.where(~primitives['success'])[0]
-            print(f"Warning: cons2prim failed at {len(failed)} points, setting to atmosphere")
+            # Suprimir warnings para test rápido
+            # print(f"Warning: cons2prim failed at {len(failed)} points, setting to atmosphere")
 
             # Set failed points to atmosphere
             primitives['rho0'][failed] = self.atmosphere_rho

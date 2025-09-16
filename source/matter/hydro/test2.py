@@ -1,25 +1,31 @@
 #!/usr/bin/env python
 """
-Evolución acoplada completa: BSSN + Hidrodinámica Relativista
-Caso: Colapso/Estrella relativista con datos iniciales TOV (politrópica).
+Test TOV: Evolución de estrellas Tolman-Oppenheimer-Volkoff
+Basado en el paper: "Revisiting spherically symmetric relativistic hydrodynamics"
+F. S. Guzmán, F. D. Lora-Clavijo, M. D. Morales (arXiv:1212.1421)
 
-- Construye CI resolviendo las ODEs TOV:
-    dm/dr = 4π r^2 ρ
-    dp/dr = - (ρ + p)(m + 4π r^3 p) / ( r (r - 2m) )
-    dΦ/dr = (m + 4π r^3 p) / ( r (r - 2m) ),  α = e^Φ
-  con EOS politrópica p = K ρ0^Γ y ρ = ρ0 (1 + ε),   ε = p / ((Γ-1) ρ0)
-- Proyecta a variables BSSN/Valencia:
-    D = ρ0 W, Sr = ρ0 h W^2 v^r, τ = ρ0 h W^2 - p - D  (W=1, v=0)
-    φ = (1/2) ln a, con a = (1 - 2m/r)^(-1/2)
-    α = e^Φ (ajustada para continuidad y α(R)=sqrt(1-2M/R))
+Implementa los casos específicos del paper:
+- Configuraciones estables que oscilan (Fig. 8)
+- Configuraciones inestables que colapsan (Fig. 9)
+- Monitoreo de constraints de Einstein
+- Análisis de masa vs densidad central (Fig. 7)
 
-Requisitos: numpy, scipy, matplotlib, tqdm y tus módulos `source.*`.
+Metodología del paper:
+- Einstein's equations: ∂ta = -4πrαaSr, etc. (ecuaciones 33-35)
+- TOV initial data con politrópica p = KρΓ (ecuaciones 37-39)
+- Evolución completa Einstein-Euler con monitoreo de constraints
 """
 
 import numpy as np
 import matplotlib.pyplot as plt
 from scipy.integrate import solve_ivp, trapezoid
 from tqdm import tqdm
+import sys
+import os
+
+# Add engrenage to path (como en test4.py)
+sys.path.append(os.path.join(os.path.dirname(__file__), '..', '..', '..'))
+sys.path.append(os.path.join(os.path.dirname(__file__), '..', '..'))
 
 # --- Engrenage (imports absolutos coherentes) ---
 from source.core.grid import Grid
@@ -226,19 +232,16 @@ def create_coupled_initial_state_from_tov(grid, hydro_fluid, tov):
 # =============================================================================
 # Ejecución principal (igual que tu versión, pero usando TOV reales)
 # =============================================================================
-def run_coupled_evolution():
+def run_coupled_evolution(N=128, r_max=2.0, t_final=0.5, gamma_eos=2.0, K=1.0, rho0_c=1.5):
     print("🚀 Evolución Acoplada: BSSN + Hidrodinámica Relativista (CI TOV)")
     print("="*60)
 
     # --- Parámetros de simulación ---
-    N       = 128        # resolución
-    r_max   = 2.0        # dominio espacial
-    t_final = 0.5        # tiempo final
+    # N, r_max, t_final ahora vienen como argumentos
 
     # --- Parámetros físicos / EOS ---
-    gamma_eos = 2.0      # Γ adiabático para EOS ideal (coincidente con politrópica)
-    K_poly    = 1.0      # K de la politrópica (ajústalo a tu caso)
-    rho0_c    = 1.5      # densidad bariónica central
+    # gamma_eos, K, rho0_c ahora vienen como argumentos
+    K_poly = K  # Renombrar para consistencia interna
 
     print(f"Parámetros: N={N}, r_max={r_max}, Γ={gamma_eos}, K={K_poly}, ρ0_c={rho0_c}")
 
@@ -398,10 +401,156 @@ def analyze_and_plot_results(solution, grid, hydro_fluid, eos, r, t_final):
 # =============================================================================
 # MAIN
 # =============================================================================
+# CASOS ESPECÍFICOS DEL PAPER (Fig. 7, 8, 9)
+# =============================================================================
+
+def run_paper_tov_cases():
+    """
+    Ejecuta los casos específicos mostrados en el paper:
+    - Configuraciones estables (K=100, Γ=2 y K=10, Γ=5/3)
+    - Configuraciones inestables para comparación
+    """
+    print("🌟 EJECUTANDO CASOS TOV DEL PAPER")
+    print("="*60)
+    print("Basado en: arXiv:1212.1421, Figuras 7, 8, 9")
+    print("="*60)
+
+    # Casos del paper (Fig. 7)
+    cases = [
+        # Casos estables (izquierda del máximo en Fig. 7)
+        {"name": "Estable Γ=2", "K": 100, "Gamma": 2.0, "rho0_c": 0.001, "stable": True},
+        {"name": "Estable Γ=5/3", "K": 10, "Gamma": 5/3, "rho0_c": 0.0006, "stable": True},
+
+        # Casos inestables (derecha del máximo en Fig. 7)
+        {"name": "Inestable Γ=2", "K": 100, "Gamma": 2.0, "rho0_c": 0.004, "stable": False},
+        {"name": "Inestable Γ=5/3", "K": 10, "Gamma": 5/3, "rho0_c": 0.0025, "stable": False},
+    ]
+
+    results = []
+
+    for i, case in enumerate(cases):
+        print(f"\n{i+1}/4: {case['name']}")
+        print(f"   K={case['K']}, Γ={case['Gamma']}, ρ₀c={case['rho0_c']}")
+        print(f"   Predicción: {'Oscilaciones' if case['stable'] else 'Colapso'}")
+
+        try:
+            # Ejecutar evolución con parámetros del paper
+            result = run_coupled_evolution(
+                N=128,  # Mayor resolución para precisión
+                r_max=30.0,  # Dominio más grande
+                t_final=200.0 if case['stable'] else 100.0,  # Más tiempo para estables
+                rho0_c=case['rho0_c'],
+                K=case['K'],
+                gamma_eos=case['Gamma']
+            )
+
+            if result is not None:
+                print(f"   ✅ Completado")
+                results.append((case, result))
+            else:
+                print(f"   ❌ Falló")
+                results.append((case, None))
+
+        except Exception as e:
+            print(f"   ❌ Error: {e}")
+            results.append((case, None))
+
+    # Análisis comparativo
+    print("\n" + "="*60)
+    print("📊 ANÁLISIS COMPARATIVO")
+    print("="*60)
+
+    for case, result in results:
+        if result is not None:
+            # Analizar comportamiento final
+            final_state = result.y[:, -1]
+            max_lapse = np.max(final_state[slice(0, 1)])  # Aproximado
+
+            print(f"{case['name']:15s}: ", end="")
+            if case['stable']:
+                print(f"α_max={max_lapse:.6f} (esperado: oscilaciones)")
+            else:
+                if max_lapse < 0.1:
+                    print(f"α_max={max_lapse:.6f} → ✅ Colapso detectado")
+                else:
+                    print(f"α_max={max_lapse:.6f} → ⚠️  Colapso parcial")
+        else:
+            print(f"{case['name']:15s}: ❌ Sin datos")
+
+    print("\n🎯 Comparación con Paper:")
+    print("   • Estables deben oscilar alrededor del equilibrio (Fig. 8)")
+    print("   • Inestables deben colapsar formando horizonte (Fig. 9)")
+    print("   • α → 0 indica formación de horizonte aparente")
+
+    return results
+
+
+def run_mass_vs_density_scan():
+    """
+    Reproduce la Fig. 7 del paper: massa vs densidad central.
+    Encuentra el punto crítico que separa estables de inestables.
+    """
+    print("\n🔍 ESCANEO MASA vs DENSIDAD CENTRAL")
+    print("="*50)
+    print("Reproduciendo Fig. 7 del paper...")
+
+    # Parámetros para escaneo (como en Fig. 7)
+    K_values = [100, 10]
+    Gamma_values = [2.0, 5/3]
+
+    for K, Gamma in zip(K_values, Gamma_values):
+        print(f"\nCaso: K={K}, Γ={Gamma}")
+
+        # Rango de densidades centrales (como en Fig. 7)
+        if Gamma == 2.0:
+            rho0_c_range = np.linspace(0.0005, 0.008, 15)
+        else:
+            rho0_c_range = np.linspace(0.0002, 0.004, 15)
+
+        masses = []
+        for rho0_c in rho0_c_range:
+            try:
+                # Calcular solo datos iniciales (sin evolución)
+                r_test = np.linspace(1e-6, 50, 500)
+                eos_test = IdealGasEOS(gamma=Gamma)
+
+                data = build_tov_initial_data(r_test, eos_test, rho0_c, K, Gamma)
+
+                # Masa total integrada
+                rho_total = data['rho0'] * (1 + data['eps'])
+                mass = trapezoid(4 * np.pi * r_test**2 * rho_total, r_test)
+                masses.append(mass)
+
+            except:
+                masses.append(np.nan)
+
+        # Encontrar máximo (punto crítico)
+        valid_masses = np.array(masses)[~np.isnan(masses)]
+        if len(valid_masses) > 0:
+            max_mass = np.max(valid_masses)
+            critical_idx = np.argmax(masses)
+            critical_rho = rho0_c_range[critical_idx]
+
+            print(f"   Masa máxima: M={max_mass:.3f}")
+            print(f"   Densidad crítica: ρ₀c={critical_rho:.6f}")
+            print(f"   Configuraciones estables: ρ₀c < {critical_rho:.6f}")
+            print(f"   Configuraciones inestables: ρ₀c > {critical_rho:.6f}")
+
+
+# =============================================================================
 if __name__ == "__main__":
-    sol = run_coupled_evolution()
-    if sol is not None:
-        print("🎉 Simulación completa exitosa!")
-        print("📈 Resultados guardados en 'coupled_evolution_results.png'")
+    import sys
+
+    if len(sys.argv) > 1 and sys.argv[1] == "--paper":
+        # Ejecutar casos específicos del paper
+        run_paper_tov_cases()
+        run_mass_vs_density_scan()
     else:
-        print("❌ Simulación falló")
+        # Ejecutar caso estándar
+        print("💡 Tip: Usar '--paper' para ejecutar casos específicos del paper")
+        sol = run_coupled_evolution()
+        if sol is not None:
+            print("🎉 Simulación completa exitosa!")
+            print("📈 Resultados guardados en 'coupled_evolution_results.png'")
+        else:
+            print("❌ Simulación falló")

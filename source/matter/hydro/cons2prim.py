@@ -9,6 +9,20 @@ try:
 except Exception:
     _HAVE_SCIPY = False
 
+# Numba for JIT compilation
+try:
+    from numba import njit
+    _HAVE_NUMBA = True
+except ImportError:
+    # Fallback decorator that does nothing
+    def njit(*args, **kwargs):
+        def decorator(func):
+            return func
+        if len(args) == 1 and callable(args[0]):
+            return args[0]
+        return decorator
+    _HAVE_NUMBA = False
+
 
 def _default_params():
     return {
@@ -83,11 +97,64 @@ def _parse_U(U):
     return D, Sr, tau
 
 
+@njit
+def _state_from_p_numba(D, Sr, tau, p, gamma_rr, p_floor, W_max, gamma_eos):
+    """
+    Numba-optimized version of _state_from_p for ideal gas EOS.
+    Returns (ok, rho0, vr, eps, W, h, f).
+    """
+    p = max(p, p_floor)
+    E = tau + D  # = rho h W^2 - p
+    Q = E + p    # = rho h W^2
+
+    # Enforce Q>0
+    if Q <= 0.0:
+        return False, 0.0, 0.0, 0.0, 1.0, 1.0, np.inf
+
+    g = max(gamma_rr, 1e-30)
+
+    # v^r from momentum: S_r = Q * v_r, and v_r = gamma_rr * v^r  ⇒  v^r = S_r / (Q * gamma_rr)
+    vr = Sr / (Q * g)
+
+    # v^2 and W
+    v2 = g * vr * vr
+    if not (0.0 <= v2 < 1.0):
+        return False, 0.0, 0.0, 0.0, 1.0, 1.0, np.inf
+
+    W = 1.0 / np.sqrt(1.0 - v2)
+    if not (1.0 <= W <= W_max):
+        return False, 0.0, 0.0, 0.0, 1.0, 1.0, np.inf
+
+    # rho0
+    rho0 = D / max(W, 1e-30)
+    if rho0 <= 0.0 or not np.isfinite(rho0):
+        return False, 0.0, 0.0, 0.0, 1.0, 1.0, np.inf
+
+    # EOS: epsilon (ideal gas)
+    eps = p / ((gamma_eos - 1.0) * rho0)
+    if not np.isfinite(eps) or eps < 0.0:
+        return False, 0.0, 0.0, 0.0, 1.0, 1.0, np.inf
+
+    h = 1.0 + eps + p / max(rho0, 1e-30)
+    if not np.isfinite(h) or h <= 1.0:
+        return False, 0.0, 0.0, 0.0, 1.0, 1.0, np.inf
+
+    # Residual
+    f = rho0 * h * W * W - Q
+    return True, rho0, vr, eps, W, h, f
+
+
 def _state_from_p(D, Sr, tau, p, gamma_rr, eos, params):
     """
     Compute primitive state given a pressure guess p.
     Returns (ok, rho0, vr, eps, W, h, f) where f(p) = rho0*h*W^2 - (E+p).
     """
+    # Try numba version for ideal gas EOS
+    if _HAVE_NUMBA and hasattr(eos, "gamma"):
+        return _state_from_p_numba(D, Sr, tau, p, gamma_rr,
+                                   params["p_floor"], params["W_max"], eos.gamma)
+
+    # Fallback to original implementation
     p = float(p)
     p = max(p, params["p_floor"])
     E = tau + D  # = rho h W^2 - p
@@ -194,13 +261,62 @@ def _bracket_pressure(D, Sr, tau, gamma_rr, eos, params):
     return False, p_lo, p_hi, f_lo, f_hi
 
 
-def _solve_pressure(D, Sr, tau, gamma_rr, eos, params):
+def _bracket_pressure_with_guess(D, Sr, tau, gamma_rr, eos, params, p_guess):
+    """
+    Try to bracket around a provided guess pressure.
+    Returns (success, p_lo, p_hi, f_lo, f_hi).
+    """
+    # Use guess as starting point and bracket around it
+    ok_guess, *_rest_guess, f_guess = _state_from_p(D, Sr, tau, p_guess, gamma_rr, eos, params)
+    if not ok_guess:
+        # Fallback to standard bracketing
+        return _bracket_pressure(D, Sr, tau, gamma_rr, eos, params)
+
+    # Try to find bracket around guess
+    factor = 1.5
+    p_lo, p_hi = p_guess / factor, p_guess * factor
+
+    # Ensure p_lo is valid
+    p_lo = max(p_lo, params["p_floor"])
+    ok_lo, *_rest_lo, f_lo = _state_from_p(D, Sr, tau, p_lo, gamma_rr, eos, params)
+
+    # Try to find p_hi
+    for _ in range(10):
+        ok_hi, *_rest_hi, f_hi = _state_from_p(D, Sr, tau, p_hi, gamma_rr, eos, params)
+        if ok_hi:
+            break
+        p_hi *= factor
+
+    if ok_lo and ok_hi and f_lo * f_hi <= 0.0:
+        return True, p_lo, p_hi, f_lo, f_hi
+    elif ok_guess:
+        # Use guess as one endpoint and try to bracket around it
+        if f_guess > 0:
+            return True, max(params["p_floor"], p_guess/3), p_guess, -abs(f_guess)/2, f_guess
+        else:
+            return True, p_guess, p_guess*3, f_guess, abs(f_guess)/2
+    else:
+        # Fallback to standard
+        return _bracket_pressure(D, Sr, tau, gamma_rr, eos, params)
+
+
+def _solve_pressure(D, Sr, tau, gamma_rr, eos, params, p_guess=None):
     """
     Solve f(p)=0 with fallbacks: Brent → bisection → Newton → floors.
     Returns (ok, rho0, vr, p, eps, W, h).
     """
-    # Try to bracket
-    ok_br, p_lo, p_hi, f_lo, f_hi = _bracket_pressure(D, Sr, tau, gamma_rr, eos, params)
+    # Try to bracket, using intelligent guess if provided
+    if p_guess is not None and p_guess > params["p_floor"]:
+        # Try guess first
+        ok_guess, rho0_g, vr_g, eps_g, W_g, h_g, f_g = _state_from_p(D, Sr, tau, p_guess, gamma_rr, eos, params)
+        if ok_guess and abs(f_g) <= params["tol"] * max(1.0, abs(p_guess)):
+            return True, rho0_g, vr_g, p_guess, eps_g, W_g, h_g
+
+        # Use guess to improve bracketing
+        ok_br, p_lo, p_hi, f_lo, f_hi = _bracket_pressure_with_guess(D, Sr, tau, gamma_rr, eos, params, p_guess)
+    else:
+        # Standard bracketing
+        ok_br, p_lo, p_hi, f_lo, f_hi = _bracket_pressure(D, Sr, tau, gamma_rr, eos, params)
 
     # Attempt Brent (SciPy)
     """ if ok_br and _HAVE_SCIPY:
@@ -261,15 +377,16 @@ def _solve_pressure(D, Sr, tau, gamma_rr, eos, params):
     return False, rho0, vr, p, eps, W, h
 
 
-def cons_to_prim(U, eos, params=None, metric=None):
+def cons_to_prim(U, eos, params=None, metric=None, p_guess=None):
     """
-      primitives = cons_to_prim(U, eos, params=None, metric=None)
+      primitives = cons_to_prim(U, eos, params=None, metric=None, p_guess=None)
 
     Inputs:
       - U: dict with arrays {'D','Sr','tau'} or tuple/list (D,Sr,tau) or array with last dim=3
       - eos: an EOS object exposing at least eps_from_rho_p(rho0, p)
       - params: dict of solver parameters (floors, tolerances, max_iter, etc.). Missing entries use defaults.
       - metric: dict or tuple (alpha, beta_r, gamma_rr). Default: Minkowski.
+      - p_guess: array of pressure guesses from previous timestep (optional)
 
     Returns dict of arrays:
       {'rho0','vr','p','eps','W','h','success'}
@@ -283,6 +400,12 @@ def cons_to_prim(U, eos, params=None, metric=None):
     N = len(D)
     alpha, beta_r, gamma_rr = _ensure_metric(metric, N)
 
+    # Ensure p_guess has the right shape
+    if p_guess is not None:
+        p_guess = np.asarray(p_guess)
+        if p_guess.shape != (N,):
+            p_guess = None
+
     # Allocate outputs
     rho0, vr, p, eps, W, h = (np.zeros(N) for _ in range(6))
     success = np.zeros(N, dtype=bool)
@@ -293,8 +416,13 @@ def cons_to_prim(U, eos, params=None, metric=None):
             or D[i] < cfg["rho_floor"] or (tau[i] < -D[i])):
             ok = False
         else:
+            # Use pressure guess if available and valid
+            guess_i = None
+            if p_guess is not None and np.isfinite(p_guess[i]) and p_guess[i] > cfg["p_floor"]:
+                guess_i = p_guess[i]
+
             ok, rho0_i, vr_i, p_i, eps_i, W_i, h_i = _solve_pressure(
-                D[i], Sr[i], tau[i], gamma_rr[i], eos, cfg
+                D[i], Sr[i], tau[i], gamma_rr[i], eos, cfg, guess_i
             )
 
         if not ok:

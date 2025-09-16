@@ -34,8 +34,14 @@ class ValenciaReferenceMetric:
         vía las fuentes J·S_phys.
         """
         N = len(r)
-        #dr = float(grid.derivs.dx)  # CORRECCIÓN: usar grid.derivs.dx que es escalar
-        dr = float(grid.dr)
+        # Compatibilidad con diferentes tipos de Grid
+        if hasattr(grid, 'derivs') and hasattr(grid.derivs, 'dx'):
+            dr = float(grid.derivs.dx)  # Grid completo (engrenage)
+        elif hasattr(grid, 'dr'):
+            dr = float(grid.dr)  # Grid simple (test.py)
+        else:
+            # Fallback: calcular dr de r
+            dr = float(r[1] - r[0]) if len(r) > 1 else 1.0
 
         # 1) BCs en CONSERVADAS (no pisar arrays originales)
         D = D.copy()
@@ -51,12 +57,12 @@ class ValenciaReferenceMetric:
             rho0, vr, pressure, g, r, eos, reconstructor, riemann_solver
         )
 
-        # 4) Divergencia covariante para cada ecuación (vector en D y τ)
+        # 4) Divergencia covariante (versión conservativa original)
         rhs_D = np.zeros(N)
         rhs_Sr = np.zeros(N)
         rhs_tau = np.zeros(N)
 
-        sgc = g['sqrt_g_hat_cell']   # √ĝ en centros (= |r|^2)
+        sgc = g['sqrt_g_hat_cell']   # √ĝ en centros (= r^2)
         for i in range(NUM_GHOSTS, N - NUM_GHOSTS):
             inv_vol = 1.0 / (sgc[i] * dr + 1e-30)
             rhs_D[i] = -(flux_hat['D'][i] - flux_hat['D'][i-1]) * inv_vol
@@ -106,6 +112,8 @@ class ValenciaReferenceMetric:
             g['gamma_rr'] = g['e6phi'] * bar_gamma_LL[:, i_r, i_r]
 
         # √ĝ en centros / caras (en 1D esf.: √ĝ = r^2)
+        # Para coordenadas esféricas 1D, la métrica de referencia es ĝ_rr = 1, ĝ_θθ = r^2, ĝ_φφ = r^2 sin^2θ
+        # En 1D (solo r), det(ĝ) = r^4 sin^2θ ≈ r^4, entonces √ĝ = r^2
         r_c = np.asarray(r, dtype=float)
         r_f = 0.5 * (r_c[:-1] + r_c[1:])
         r_f_abs = np.maximum(np.abs(r_f), 1e-30)
@@ -115,7 +123,13 @@ class ValenciaReferenceMetric:
         g['sqrt_g_hat_face'] = r_f_abs**2
 
         # Densitización J ≈ e^{6φ} (cuando γ̄ y ĝ comparten det en 1D)
-        J_cell = g['e6phi']
+        # Para Minkowski fijo: J = 1
+        # Para métrica dinámica: J = e^{6φ} (aproximación válida en 1D esférico)
+        if spacetime_mode != "fixed_minkowski":
+            J_cell = g['e6phi']
+        else:
+            J_cell = np.ones(N)
+
         g['J_cell'] = J_cell
         g['J_face'] = 0.5 * (J_cell[:-1] + J_cell[1:])
 
@@ -177,9 +191,12 @@ class ValenciaReferenceMetric:
     def _compute_sources_full(self, pressure, g, bssn_vars, bssn_d1,
                               rho0, h, W, vr, spacetime_mode, r):
         """
-        Implementa fuentes físicas densitizadas con J. 
-        En Minkowski fijo solo hoop stress +2p/r en Sr.
-        En métrica dinámica incluye términos de acoplamiento gravitacional.
+        Implementa fuentes físicas densitizadas según ec. (34) del paper 1309.7808v2:
+        (sS)^i = α J/√γ̂ [T^ab(∇a nb δ^i_b + ∇b na δ^i_a) + (1/2) T^ab ∇^i γab]
+
+        En coordenadas esféricas incluye:
+        - Hoop stress: 2p/r (de Γ̂^θ_rθ = Γ̂^φ_rφ = 1/r)
+        - Acoplamientos gravitacionales con lapse, shift y métrica
         """
         N = len(r)
         J_cell = g['J_cell']
@@ -189,7 +206,8 @@ class ValenciaReferenceMetric:
             r_safe = np.maximum(np.abs(np.asarray(r, dtype=float)), 1e-30)
             src_Sr_phys = 2.0 * pressure / r_safe   # Γ̂^θ_{rθ} = Γ̂^φ_{rφ} = 1/r  ⇒  +2p/r
             src_tau_phys = np.zeros(N)               # no hay fuentes geométricas en τ con Cowling
-            return J_cell * src_Sr_phys, J_cell * src_tau_phys
+            # En Minkowski fijo, J_cell = 1, así que no afecta
+            return src_Sr_phys, src_tau_phys
 
         # --- caso métrica dinámica: términos completos de acoplamiento
         alpha = g['alpha']
@@ -238,6 +256,33 @@ class ValenciaReferenceMetric:
         src_tau_phys = alpha * K * (pressure - T00)
 
         return J_cell * src_Sr_phys, J_cell * src_tau_phys
+
+    def _compute_hat_christoffel_trace(self, r, background=None):
+        """
+        Calcula Γ̂^k_jk = ∂j ln √γ̂ para la métrica de referencia esférica.
+        En coordenadas esféricas: Γ̂^r_rr = 2/r, Γ̂^θ_θθ = cotθ, Γ̂^φ_φφ = cotθ
+        Para 1D esférico (solo r): Γ̂^r_rr = 2/r
+        """
+        # background no se usa en la versión 1D, pero se mantiene para consistencia de interfaz
+        _ = background  # suprimir warning
+        r_safe = np.maximum(np.abs(r), 1e-30)
+        return 2.0 / r_safe
+
+    def _validate_geometry(self, g, r, spacetime_mode):
+        """
+        Valida que las cantidades geométricas sean físicamente razonables.
+        """
+        # Verificar que las cantidades sean finitas y positivas donde corresponde
+        assert np.all(np.isfinite(g['alpha'])), "Lapse contains non-finite values"
+        assert np.all(g['alpha'] > 0), "Lapse must be positive"
+        assert np.all(np.isfinite(g['J_cell'])), "J factor contains non-finite values"
+        assert np.all(g['J_cell'] > 0), "J factor must be positive"
+
+        if spacetime_mode != "fixed_minkowski":
+            assert np.all(g['gamma_rr'] > 0), "Spatial metric component must be positive"
+            assert np.all(np.isfinite(g['gamma_rr'])), "Spatial metric contains non-finite values"
+
+        return True
 
     def _apply_ghost_cell_boundaries(self, D, Sr, tau, r):
         """
