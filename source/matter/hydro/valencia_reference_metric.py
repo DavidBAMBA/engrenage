@@ -2,7 +2,7 @@
 
 import numpy as np
 
-from source.bssn.tensoralgebra import get_bar_gamma_LL
+from source.bssn.tensoralgebra import get_bar_gamma_LL, get_det_bar_gamma
 from source.backgrounds.sphericalbackground import i_r
 from source.core.spacing import NUM_GHOSTS
 from source.matter.hydro.cons2prim import prim_to_cons
@@ -57,17 +57,44 @@ class ValenciaReferenceMetric:
             rho0, vr, pressure, g, r, eos, reconstructor, riemann_solver
         )
 
-        # 4) Divergencia covariante (versión conservativa original)
+        # 4) Divergencia covariante
         rhs_D = np.zeros(N)
         rhs_Sr = np.zeros(N)
         rhs_tau = np.zeros(N)
 
         sgc = g['sqrt_g_hat_cell']   # √ĝ en centros (= r^2)
+
+        # Opción: divergencias covariantes completas según ec. (21) del paper
+        use_covariant_divergences = (spacetime_mode != "fixed_minkowski")
+
+        if use_covariant_divergences:
+            # Γ̂^k_jk = ∂_j ln √ĝ usando infraestructura de Engrenage
+            # Para √ĝ = r^2: ∂_r ln(r^2) = 2/r
+            hat_christoffel_trace = (background.d1_det_hat_gamma[:, i_r] /
+                                   (background.det_hat_gamma + 1e-30))
+
         for i in range(NUM_GHOSTS, N - NUM_GHOSTS):
             inv_vol = 1.0 / (sgc[i] * dr + 1e-30)
-            rhs_D[i] = -(flux_hat['D'][i] - flux_hat['D'][i-1]) * inv_vol
-            rhs_Sr[i] = -(flux_hat['Sr'][i] - flux_hat['Sr'][i-1]) * inv_vol
-            rhs_tau[i] = -(flux_hat['tau'][i] - flux_hat['tau'][i-1]) * inv_vol
+
+            # Divergencia básica
+            div_flux_D = -(flux_hat['D'][i] - flux_hat['D'][i-1]) * inv_vol
+            div_flux_Sr = -(flux_hat['Sr'][i] - flux_hat['Sr'][i-1]) * inv_vol
+            div_flux_tau = -(flux_hat['tau'][i] - flux_hat['tau'][i-1]) * inv_vol
+
+            if use_covariant_divergences:
+                # Corrección covariante: -flux^j Γ̂^k_jk según ec. (21)
+                covariant_correction_D = -flux_hat['D'][i] * hat_christoffel_trace[i] / (sgc[i] + 1e-30)
+                covariant_correction_Sr = -flux_hat['Sr'][i] * hat_christoffel_trace[i] / (sgc[i] + 1e-30)
+                covariant_correction_tau = -flux_hat['tau'][i] * hat_christoffel_trace[i] / (sgc[i] + 1e-30)
+
+                rhs_D[i] = div_flux_D + covariant_correction_D
+                rhs_Sr[i] = div_flux_Sr + covariant_correction_Sr
+                rhs_tau[i] = div_flux_tau + covariant_correction_tau
+            else:
+                # Versión conservativa para Minkowski
+                rhs_D[i] = div_flux_D
+                rhs_Sr[i] = div_flux_Sr
+                rhs_tau[i] = div_flux_tau
 
         # 5) Fuentes J·S_phys
         src_Sr, src_tau = self._compute_sources_full(
@@ -79,6 +106,24 @@ class ValenciaReferenceMetric:
         # 6) BCs al RHS (paridades)
         rhs_D, rhs_Sr, rhs_tau = self._apply_rhs_boundary_conditions(rhs_D, rhs_Sr, rhs_tau, r)
         return rhs_D, rhs_Sr, rhs_tau
+
+    def get_implementation_info(self):
+        """
+        Información sobre la implementación integrada con Engrenage.
+        """
+        return {
+            'approach': 'Full Reference Metric Valencia (integrado con Engrenage)',
+            'paper': 'Montero et al. 2013 (arXiv:1309.7808v2)',
+            'integration_with_engrenage': {
+                'tensoralgebra': 'Usa get_det_bar_gamma(), get_bar_gamma_LL()',
+                'background': 'Usa hat_christoffel, det_hat_gamma precalculados',
+                'bssn_coupling': 'Integrado con derivadas BSSN existentes',
+                'factor_J': 'J = e^{6φ} √(γ̄/γ̂) usando funciones de Engrenage'
+            },
+            'coordinate_system': 'Spherical (1D radial)',
+            'reference_metric': 'γ̂_ij implementada en sphericalbackground.py',
+            'status': 'Implementación optimizada sin duplicación de código'
+        }
 
     def _extract_geometry(self, r, bssn_vars, spacetime_mode, background):
         """Extrae cantidades geométricas con verificación robusta de dimensiones."""
@@ -122,11 +167,14 @@ class ValenciaReferenceMetric:
         g['r_faces'] = r_f
         g['sqrt_g_hat_face'] = r_f_abs**2
 
-        # Densitización J ≈ e^{6φ} (cuando γ̄ y ĝ comparten det en 1D)
-        # Para Minkowski fijo: J = 1
-        # Para métrica dinámica: J = e^{6φ} (aproximación válida en 1D esférico)
+        # Factor de densitización J = e^{6φ} √(γ̄/γ̂) según paper 1309.7808v2 ec.(16)-(18)
+        # Usa funciones existentes de tensoralgebra.py y background
         if spacetime_mode != "fixed_minkowski":
-            J_cell = g['e6phi']
+            e6phi = g['e6phi']
+            det_bar_gamma = get_det_bar_gamma(r, bssn_vars.h_LL, background)
+            sqrt_bar_gamma = np.sqrt(np.abs(det_bar_gamma) + 1e-30)
+            sqrt_hat_gamma = np.sqrt(np.abs(background.det_hat_gamma) + 1e-30)
+            J_cell = e6phi * sqrt_bar_gamma / sqrt_hat_gamma
         else:
             J_cell = np.ones(N)
 

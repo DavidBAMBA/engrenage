@@ -3,7 +3,7 @@ import numpy as np
 from core.grid import Grid, i_x1, i_x2, i_x3
 from bssn.bssnstatevariables import NUM_BSSN_VARS
 from bssn.bssnvars import BSSNVars
-from bssn.tensoralgebra import SPACEDIM, EMTensor, get_bar_gamma_LL, get_bar_gamma_UU
+from bssn.tensoralgebra import SPACEDIM, EMTensor
 from backgrounds.sphericalbackground import i_r
 
 from .valencia_reference_metric import ValenciaReferenceMetric
@@ -18,6 +18,12 @@ class PerfectFluid:
     Follows the engrenage matter interface pattern used by ScalarMatter and NoMatter.
     Implements Valencia formulation for conservative evolution and provides
     stress-energy tensor for BSSN coupling.
+
+    ✨ ARCHITECTURE (Post-refactoring):
+    - Eliminates geometry extraction duplication
+    - Delegates all Valencia evolution to valencia_reference_metric.py
+    - Focuses solely on EMTensor computation and engrenage interface
+    - Uses valencia._extract_geometry() instead of duplicating logic
     """
 
     def __init__(self, eos=None, spacetime_mode="dynamic",
@@ -51,7 +57,7 @@ class PerfectFluid:
             "rho_floor": atmosphere_rho,
             "p_floor": 1e-15,
             "v_max": 0.999999,
-            "tol": 1e-12,
+            "tol": 1e-10,
             "max_iter": 100
         }
 
@@ -70,6 +76,8 @@ class PerfectFluid:
 
     def set_matter_vars(self, state_vector, bssn_vars: BSSNVars, grid: Grid):
         """Extract matter variables from state vector (engrenage interface)."""
+        # bssn_vars not needed here but kept for interface consistency
+        _ = bssn_vars  # suppress warning
 
         self.D = state_vector[self.idx_D].copy()
         self.Sr = state_vector[self.idx_Sr].copy()
@@ -99,8 +107,18 @@ class PerfectFluid:
         rho0, vr, p = primitives['rho0'], primitives['vr'], primitives['p']
         W, h = primitives['W'], primitives['h']
 
-        # Extract spacetime geometry
-        alpha, beta_r, gamma_LL, gamma_UU = self._extract_geometry(r, bssn_vars, background)
+        # Use geometry extraction from valencia (eliminate duplication)
+        g = self.valencia._extract_geometry(r, bssn_vars, self.spacetime_mode, background)
+        alpha, beta_r = g['alpha'], g['beta_r']
+
+        # Construct full spatial metric tensors for EMTensor computation
+        if self.spacetime_mode == "fixed_minkowski":
+            gamma_rr = np.ones(N)
+        else:
+            gamma_rr = g['gamma_rr']
+
+        # Build 3D metric tensors (needed for EMTensor computation)
+        gamma_LL, gamma_UU = self._build_3d_metrics(r, gamma_rr)
 
         # Four-velocity components
         ut = W / alpha                    # u^t = W/α
@@ -160,7 +178,13 @@ class PerfectFluid:
         """Convert conservative to primitive variables using cons2prim module."""
 
         # Build metric for cons2prim
-        metric = self._build_metric(bssn_vars, r)
+        # Use geometry from valencia (eliminate duplication)
+        g = self.valencia._extract_geometry(r, bssn_vars, self.spacetime_mode, self.background)
+        metric = {
+            "alpha": g['alpha'],
+            "beta_r": g['beta_r'],
+            "gamma_rr": g['gamma_rr'] if self.spacetime_mode != "fixed_minkowski" else np.ones(len(r))
+        }
 
         # Use pressure cache if available
         p_guess = self.pressure_cache
@@ -193,80 +217,24 @@ class PerfectFluid:
 
         return primitives
 
-    def _extract_geometry(self, r, bssn_vars, background):
-        """Extract spacetime geometry from BSSN variables."""
-
+    def _build_3d_metrics(self, r, gamma_rr):
+        """Build 3D metric tensors from radial component (eliminates geometry duplication)."""
         N = len(r)
 
-        if self.spacetime_mode == "fixed_minkowski":
-            # Static Minkowski metric in spherical coordinates
-            alpha = np.ones(N)
-            beta_r = np.zeros(N)
+        # Lower index metric γ_ij
+        gamma_LL = np.zeros([N, SPACEDIM, SPACEDIM])
+        gamma_LL[:, 0, 0] = gamma_rr       # γ_rr from valencia
+        gamma_LL[:, 1, 1] = gamma_rr * r**2   # γ_θθ = γ_rr * r²
+        gamma_LL[:, 2, 2] = gamma_rr * r**2   # γ_φφ = γ_rr * r²
 
-            # Spatial metric γ_ij and inverse γ^ij
-            gamma_LL = np.zeros([N, SPACEDIM, SPACEDIM])
-            gamma_LL[:, 0, 0] = 1.0        # γ_rr = 1
-            gamma_LL[:, 1, 1] = r**2       # γ_θθ = r²
-            gamma_LL[:, 2, 2] = r**2       # γ_φφ = r²
+        # Upper index metric γ^ij
+        gamma_UU = np.zeros([N, SPACEDIM, SPACEDIM])
+        gamma_UU[:, 0, 0] = 1.0 / gamma_rr    # γ^rr = 1/γ_rr
+        gamma_UU[:, 1, 1] = 1.0 / (gamma_rr * r**2)  # γ^θθ = 1/(γ_rr r²)
+        gamma_UU[:, 2, 2] = 1.0 / (gamma_rr * r**2)  # γ^φφ = 1/(γ_rr r²)
 
-            gamma_UU = np.zeros([N, SPACEDIM, SPACEDIM])
-            gamma_UU[:, 0, 0] = 1.0        # γ^rr = 1
-            gamma_UU[:, 1, 1] = 1.0/r**2   # γ^θθ = 1/r²
-            gamma_UU[:, 2, 2] = 1.0/r**2   # γ^φφ = 1/r²
+        return gamma_LL, gamma_UU
 
-        else:
-            # Dynamic spacetime from BSSN variables
-            alpha = bssn_vars.lapse
-            beta_r = bssn_vars.shift_U[:, i_x1] if hasattr(bssn_vars, 'shift_U') else np.zeros(N)
-
-            # Reconstruct spatial metric: γ_ij = e^{4φ} γ̄_ij
-            e4phi = np.exp(4.0 * bssn_vars.phi)
-            bar_gamma_LL = get_bar_gamma_LL(r, bssn_vars.h_LL, background)
-
-            gamma_LL = np.zeros([N, SPACEDIM, SPACEDIM])
-            for i in range(SPACEDIM):
-                for j in range(SPACEDIM):
-                    gamma_LL[:, i, j] = e4phi * bar_gamma_LL[:, i, j]
-
-            # Inverse spatial metric: γ^ij = e^{-4φ} γ̄^ij
-            bar_gamma_UU = get_bar_gamma_UU(r, bssn_vars.h_LL, background)
-            em4phi = np.exp(-4.0 * bssn_vars.phi)
-
-            gamma_UU = np.zeros([N, SPACEDIM, SPACEDIM])
-            for i in range(SPACEDIM):
-                for j in range(SPACEDIM):
-                    gamma_UU[:, i, j] = em4phi * bar_gamma_UU[:, i, j]
-
-        return alpha, beta_r, gamma_LL, gamma_UU
-
-    def _build_metric(self, bssn_vars, r):
-        """Build metric dictionary for cons2prim module."""
-
-        N = len(r)
-
-        if self.spacetime_mode == "fixed_minkowski":
-            return {
-                "alpha": np.ones(N),
-                "beta_r": np.zeros(N),
-                "gamma_rr": np.ones(N)
-            }
-        else:
-            # Dynamic spacetime
-            alpha = bssn_vars.lapse
-            beta_r = bssn_vars.shift_U[:, i_x1] if hasattr(bssn_vars, 'shift_U') else np.zeros(N)
-
-            if self.background is not None:
-                e4phi = np.exp(4.0 * bssn_vars.phi)
-                bar_gamma_LL = get_bar_gamma_LL(r, bssn_vars.h_LL, self.background)
-                gamma_rr = e4phi * bar_gamma_LL[:, i_r, i_r]
-            else:
-                gamma_rr = np.ones(N)
-
-            return {
-                "alpha": alpha,
-                "beta_r": beta_r,
-                "gamma_rr": gamma_rr
-            }
 
     def get_diagnostics(self):
         """Return basic fluid diagnostics."""
