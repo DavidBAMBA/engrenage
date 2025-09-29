@@ -164,36 +164,25 @@ class PolytropicEOS:
         rho0 = np.asarray(rho0, dtype=float)
         return 1.0 + self.gamma * self.K * rho0**(self.gamma_minus_1) / self.gamma_minus_1
 
-    def sound_speed_squared(self, rho0):
-        """c_s^2 = Γ P / (ρ₀ h) = Γ K ρ₀^(Γ-1) / h"""
+    def sound_speed_squared(self, rho0, pressure=None, eps=None):
+        """
+        c_s^2 = Γ P / (ρ₀ h) = Γ K ρ₀^(Γ-1) / h
+
+        Compatible interface: ignores pressure and eps since barotropic.
+        """
         rho0 = np.asarray(rho0, dtype=float)
         h = self.enthalpy(rho0)
         cs2 = self.gamma * self.K * rho0**(self.gamma_minus_1) / h
         return np.clip(cs2, 0.0, 1.0)
 
+    # Compatibility methods for interface consistency with IdealGasEOS
+    def enthalpy_from_rho_p(self, rho0, pressure):
+        """Alias for enthalpy - ignores pressure since barotropic."""
+        return self.enthalpy(rho0)
 
-class TabulatedEOS:
-    """
-    Placeholder for a tabulated EOS (e.g., nuclear matter).
-    Falls back to an ideal gas until tables are wired in.
-    """
-
-    def __init__(self, table_file: str | None = None):
-        self.name = "tabulated"
-        if table_file is not None:
-            self._load_table(table_file)
-        else:
-            self._fallback_eos = IdealGasEOS(gamma=1.4)
-
-    def _load_table(self, filename: str):
-        # TODO: implement interpolation setup from file
-        pass
-
-    def pressure(self, rho0, eps):
-        return self._fallback_eos.pressure(rho0, eps)
-
-    def eps_from_rho_p(self, rho0, pressure):
-        return self._fallback_eos.eps_from_rho_p(rho0, pressure)
+    def pressure_from_rho_eps(self, rho0, eps):
+        """P(ρ₀) - ignores eps since barotropic."""
+        return self.pressure(rho0)
 
 
 def create_eos(eos_type: str = "ideal", **kwargs):

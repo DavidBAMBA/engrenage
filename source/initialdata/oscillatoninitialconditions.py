@@ -7,10 +7,10 @@ See further details in https://github.com/GRChombo/engrenage/wiki/Running-the-os
 import numpy as np
 from scipy.interpolate import interp1d
 
-from bssn.tensoralgebra import *
-from core.grid import Grid
-from bssn.bssnstatevariables import *
-from backgrounds.sphericalbackground import *
+from source.bssn.tensoralgebra import *
+from source.core.grid import Grid
+from source.bssn.bssnstatevariables import *
+from source.backgrounds.sphericalbackground import *
 
 def get_initial_state(grid: Grid, background) :
 

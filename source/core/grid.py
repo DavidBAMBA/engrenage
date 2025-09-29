@@ -1,9 +1,9 @@
 import numpy as np
 
-from core.derivatives import Derivatives
-from core.spacing import Spacing, NUM_GHOSTS, SpacingExtent
-from core.statevector import *
-from bssn.bssnvars import *
+from source.core.derivatives import Derivatives
+from source.core.spacing import Spacing, NUM_GHOSTS, SpacingExtent
+from source.core.statevector import *
+from source.bssn.bssnvars import *
 
 # coordinates agnostic to coordinate system, assumes x1 is the simulated axis, others are symmetric
 i_x1 = 0 # the simulated direction (e.g. r in spherical polar, spherical symmetry)

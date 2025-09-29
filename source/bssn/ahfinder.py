@@ -6,8 +6,8 @@ from scipy.optimize import brentq
 from scipy.interpolate import interp1d
 
 # homemade code
-from core.grid import *
-from bssn.tensoralgebra import *
+from source.core.grid import *
+from source.bssn.tensoralgebra import *
 
 # The diagnostic function returns the expansion over the grid
 # it takes in the solution of the evolution, which is the state vector at every

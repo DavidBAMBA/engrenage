@@ -3,7 +3,7 @@
 # see also Baumgarte https://arxiv.org/abs/1211.6632 for the eqns with matter
 
 import numpy as np
-from bssn.tensoralgebra import *
+from source.bssn.tensoralgebra import *
 
 # phi is the (exponential) conformal factor, that is \gamma_ij = e^{4\phi) \bar gamma_ij
 def get_bssn_rhs(bssn_rhs, r, bssn_vars, d1, d2, background, emtensor) :

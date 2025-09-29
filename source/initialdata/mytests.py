@@ -5,10 +5,10 @@
 
 import numpy as np
 
-from core.grid import Grid
-from bssn.tensoralgebra import *
-from bssn.bssnstatevariables import *
-from backgrounds.sphericalbackground import *
+from source.core.grid import Grid
+from source.bssn.tensoralgebra import *
+from source.bssn.bssnstatevariables import *
+from source.backgrounds.sphericalbackground import *
 
 # This routine gives us something where phi = 0 initially but bar_R and lambda are non trivial
 def get_test_state_1(grid: Grid, background):

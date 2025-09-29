@@ -1,10 +1,10 @@
 import numpy as np
 
-from core.grid import Grid, i_x1, i_x2, i_x3
-from bssn.bssnstatevariables import NUM_BSSN_VARS
-from bssn.bssnvars import BSSNVars
-from bssn.tensoralgebra import SPACEDIM, EMTensor
-from backgrounds.sphericalbackground import i_r
+from source.core.grid import Grid, i_x1, i_x2, i_x3
+from source.bssn.bssnstatevariables import NUM_BSSN_VARS
+from source.bssn.bssnvars import BSSNVars
+from source.bssn.tensoralgebra import SPACEDIM, EMTensor
+from source.backgrounds.sphericalbackground import i_r
 
 from .valencia_reference_metric import ValenciaReferenceMetric
 from .cons2prim import cons_to_prim
@@ -19,11 +19,7 @@ class PerfectFluid:
     Implements Valencia formulation for conservative evolution and provides
     stress-energy tensor for BSSN coupling.
 
-    ✨ ARCHITECTURE (Post-refactoring):
-    - Eliminates geometry extraction duplication
-    - Delegates all Valencia evolution to valencia_reference_metric.py
-    - Focuses solely on EMTensor computation and engrenage interface
-    - Uses valencia._extract_geometry() instead of duplicating logic
+
     """
 
     def __init__(self, eos=None, spacetime_mode="dynamic",
@@ -86,67 +82,36 @@ class PerfectFluid:
         self.matter_vars_set = True
 
     def get_emtensor(self, r, bssn_vars, background):
-        """
-        Compute stress-energy tensor for BSSN source terms (engrenage interface).
-
-        Returns EMTensor with components:
-        - rho: Energy density T^tt
-        - Si: Momentum density T^ti
-        - Sij: Stress tensor T^ij
-        - S: Trace S = γ_ij T^ij
-        """
-
         assert self.matter_vars_set, 'Matter vars not set'
-        self.background = background
-
         N = len(r)
         emtensor = EMTensor(N)
 
-        # Convert to primitive variables
-        primitives = self._get_primitives(bssn_vars, r)
-        rho0, vr, p = primitives['rho0'], primitives['vr'], primitives['p']
-        W, h = primitives['W'], primitives['h']
+        # Primitivas
+        prim = self._get_primitives(bssn_vars, r)
+        rho0, vr, p, W, h = prim['rho0'], prim['vr'], prim['p'], prim['W'], prim['h']
 
-        # Use geometry extraction from valencia (eliminate duplication)
-        g = self.valencia._extract_geometry(r, bssn_vars, self.spacetime_mode, background)
-        alpha, beta_r = g['alpha'], g['beta_r']
+        # Geometría coherente con BSSN
+        from source.bssn.tensoralgebra import get_bar_gamma_LL
+        phi = np.asarray(bssn_vars.phi, dtype=float)
+        e4phi = np.exp(4.0*phi)
+        bar_gamma_LL = get_bar_gamma_LL(r, bssn_vars.h_LL, background)   # \bar γ_ij
+        gamma_LL = e4phi[:,None,None] * bar_gamma_LL                     # γ_ij
+        gamma_UU = np.linalg.inv(gamma_LL)                               # γ^{ij}
 
-        # Construct full spatial metric tensors for EMTensor computation
-        if self.spacetime_mode == "fixed_minkowski":
-            gamma_rr = np.ones(N)
-        else:
-            gamma_rr = g['gamma_rr']
+        # Energía: ρ = ρ0 h W^2 - p
+        emtensor.rho = rho0*h*W*W - p
 
-        # Build 3D metric tensors (needed for EMTensor computation)
-        gamma_LL, gamma_UU = self._build_3d_metrics(r, gamma_rr)
+        # Velocidades espacial abajo: v_i = γ_ij v^j (v^θ=v^φ=0)
+        vU = np.zeros((N, 3))
+        vU[:,0] = vr
+        vD = np.einsum('xij,xj->xi', gamma_LL, vU)
 
-        # Four-velocity components
-        ut = W / alpha                    # u^t = W/α
-        ur = W * vr                       # u^r = W v^r
+        # Momentum abajo y tensores de esfuerzo abajo
+        emtensor.Si  = rho0*h*W*W * vD                             # S_i
+        emtensor.Sij = rho0*h*W*W * np.einsum('xi,xj->xij', vD, vD) + p[:,None,None]*gamma_LL  # S_ij
 
-        # Energy density: ρ = T^μν n_μ n_ν = ρ₀ h W² - p
-        emtensor.rho = rho0 * h * W**2 - p
-        emtensor.rho = np.maximum(emtensor.rho, 0.0)  # Ensure positivity
-
-        # Momentum density: S_i = T^t_i
-        emtensor.Si = np.zeros([N, SPACEDIM])
-        # S_r = ρ₀ h u^t u^r + p g^tr
-        gamma_UU_rr = gamma_UU[:, 0, 0]
-        g_UU_tr = gamma_UU_rr * beta_r / alpha**2
-        emtensor.Si[:, i_x1] = rho0 * h * ut * ur + p * g_UU_tr
-        # S_θ = S_φ = 0 (spherical symmetry, no angular momentum)
-
-        # Stress tensor: T^ij = ρ₀ h u^i u^j + p γ^ij
-        emtensor.Sij = np.zeros([N, SPACEDIM, SPACEDIM])
-        emtensor.Sij[:, i_x1, i_x1] = rho0 * h * ur**2 + p * gamma_UU[:, 0, 0]  # T^rr
-        emtensor.Sij[:, i_x2, i_x2] = p * gamma_UU[:, 1, 1]                     # T^θθ
-        emtensor.Sij[:, i_x3, i_x3] = p * gamma_UU[:, 2, 2]                     # T^φφ
-
-        # Trace: S = γ_ij T^ij
-        emtensor.S = (gamma_LL[:, 0, 0] * emtensor.Sij[:, 0, 0] +
-                      gamma_LL[:, 1, 1] * emtensor.Sij[:, 1, 1] +
-                      gamma_LL[:, 2, 2] * emtensor.Sij[:, 2, 2])
-
+        # Traza S = γ^{ij} S_{ij}
+        emtensor.S   = np.einsum('xij,xij->x', gamma_UU, emtensor.Sij)
         return emtensor
 
     def get_matter_rhs(self, r, bssn_vars, bssn_d1, background):
@@ -155,14 +120,19 @@ class PerfectFluid:
 
         Returns array [dD/dt, dS_r/dt, dτ/dt] for state vector evolution.
         """
+        import time
+        start_matter = time.time()
 
         assert self.matter_vars_set, 'Matter vars not set'
         self.background = background
 
         # Convert to primitive variables
+        start_cons2prim = time.time()
         primitives = self._get_primitives(bssn_vars, r)
+        end_cons2prim = time.time()
 
         # Valencia evolution equations
+        start_valencia = time.time()
         dDdt, dSrdt, dtaudt = self.valencia.compute_rhs(
             self.D, self.Sr, self.tau,
             primitives['rho0'], primitives['vr'], primitives['p'],
@@ -171,6 +141,10 @@ class PerfectFluid:
             self.spacetime_mode, self.eos, self.grid,
             self.reconstructor, self.riemann_solver
         )
+        end_valencia = time.time()
+
+        end_matter = time.time()
+        # print(f"  MATTER BREAKDOWN: cons2prim={end_cons2prim-start_cons2prim:.4f}s, valencia={end_valencia-start_valencia:.4f}s, total={end_matter-start_matter:.4f}s")
 
         return np.array([dDdt, dSrdt, dtaudt])
 
@@ -217,34 +191,3 @@ class PerfectFluid:
 
         return primitives
 
-    def _build_3d_metrics(self, r, gamma_rr):
-        """Build 3D metric tensors from radial component (eliminates geometry duplication)."""
-        N = len(r)
-
-        # Lower index metric γ_ij
-        gamma_LL = np.zeros([N, SPACEDIM, SPACEDIM])
-        gamma_LL[:, 0, 0] = gamma_rr       # γ_rr from valencia
-        gamma_LL[:, 1, 1] = gamma_rr * r**2   # γ_θθ = γ_rr * r²
-        gamma_LL[:, 2, 2] = gamma_rr * r**2   # γ_φφ = γ_rr * r²
-
-        # Upper index metric γ^ij
-        gamma_UU = np.zeros([N, SPACEDIM, SPACEDIM])
-        gamma_UU[:, 0, 0] = 1.0 / gamma_rr    # γ^rr = 1/γ_rr
-        gamma_UU[:, 1, 1] = 1.0 / (gamma_rr * r**2)  # γ^θθ = 1/(γ_rr r²)
-        gamma_UU[:, 2, 2] = 1.0 / (gamma_rr * r**2)  # γ^φφ = 1/(γ_rr r²)
-
-        return gamma_LL, gamma_UU
-
-
-    def get_diagnostics(self):
-        """Return basic fluid diagnostics."""
-
-        if not self.matter_vars_set:
-            return {'status': 'vars_not_set'}
-
-        return {
-            'max_density': np.max(self.D),
-            'min_density': np.min(self.D),
-            'total_mass': np.sum(self.D),
-            'spacetime_mode': self.spacetime_mode
-        }

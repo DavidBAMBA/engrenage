@@ -1,6 +1,6 @@
 import numpy as np
 
-from bssn.tensoralgebra import SPACEDIM
+from source.bssn.tensoralgebra import SPACEDIM
 
 # Spherical symmetry for now
 sintheta = 1

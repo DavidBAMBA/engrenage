@@ -1,7 +1,7 @@
 import numpy as np
 
-from core.statevector import *
-from backgrounds.sphericalbackground import *
+from source.core.statevector import *
+from source.backgrounds.sphericalbackground import *
 
 # These classes just allow us to hold all the metric and derivative quantities in a nice packaged form
 # and map the non trivial components into full vector and tensor forms

@@ -1,145 +1,365 @@
-# valencia_reference_metric.py (FULL reference-metric approach, 1D esférico)
+# valencia_reference_metric.py (FULL reference-metric approach, 1D spherical)
 
 import numpy as np
 
-from source.bssn.tensoralgebra import get_bar_gamma_LL, get_det_bar_gamma
+from source.bssn.tensoralgebra import get_bar_gamma_LL, get_det_bar_gamma, get_bar_A_LL
 from source.backgrounds.sphericalbackground import i_r
 from source.core.spacing import NUM_GHOSTS
 from source.matter.hydro.cons2prim import prim_to_cons
+# Avoid circular import - import dynamically when needed
 
 
 class ValenciaReferenceMetric:
     """
-    Formulación de Valencia con MÉTRICA DE REFERENCIA (full approach) para 1D esférico.
-    Basado en Montero et al. (2013) arXiv:1309.7808 (enfoque "full").
+    Valencia formulation with REFERENCE METRIC (full approach) for 1D spherical coordinates.
+    Based on Montero et al. (2013) arXiv:1309.7808 (full approach).
 
-    Ecuación en forma conservativa con métrica de referencia (1D):
+    Conservative form equation with reference metric (1D):
         ∂_t( J U ) + (1/√ĝ) ∂_r [ √ĝ ( α J F^r_phys ) ] = J S_phys,
-    donde
+    where
         J   = e^{6φ} √( \barγ / ĝ ),
-        √ĝ  = √det(ĝ)   (en 1D esférico:  √ĝ = r^2),
-        F^r_phys  es el flujo *no densitizado* (con ṽ^r = v^r − β^r/α),
-        S_phys     son las fuentes físicas (geom./grav.) sin densitizar.
-
-    Nota: el solver de Riemann devuelve F^r_phys; aquí aplicamos α·J y el peso √ĝ.
+        √ĝ  = √det(ĝ)   (in 1D spherical:  √ĝ = r^2),
+        F^r_phys  is the non-densitized flux (with ṽ^r = v^r − β^r/α),
+        S_phys     are the physical sources (geometric/gravitational) without densitization.
     """
+
+    def compute_rhs2(self, D, Sr, tau, rho0, vr, pressure, W, h,
+                    r, bssn_vars, bssn_d1, background, spacetime_mode,
+                    eos, grid, reconstructor, riemann_solver):
+        """
+        ∂_t(J U) + 𝔻̂_r[(f)^r] = J S_phys, con la expansión numérica:
+        - D, τ : 𝔻̂_r v^r = (1/√ĝ) ∂_r (√ĝ v^r)
+        - S_r : 𝔻̂_r (f_S)^r{}_r = (1/√ĝ) ∂_r (√ĝ (f_S)^r{}_r) − (f_S)^k{}_j 𝛤̂^j{}_{rk}
+        En 1D esférico y simetría esférica, el término final reduce a + α J p · 𝛤̂^k{}_{rk} = + α J p · ∂_r ln√ĝ.
+        """
+
+        # Paso de malla
+        if hasattr(grid, 'derivs') and hasattr(grid.derivs, 'dx'):
+            dr = float(grid.derivs.dx)
+        elif hasattr(grid, 'dr'):
+            dr = float(grid.dr)
+        else:
+            dr = float(r[1] - r[0]) if len(r) > 1 else 1.0
+
+        # Conservadas + BC
+        D  = D.copy(); Sr = Sr.copy(); tau = tau.copy()
+        D, Sr, tau = self._apply_ghost_cell_boundaries(D, Sr, tau, r)
+
+        # Geometría y pesos de referencia
+        g = self._extract_geometry(r, bssn_vars, spacetime_mode, background)
+        N = len(r)
+        gh_cell = g['sqrt_g_hat_cell']   # √ĝ en centros
+        gh_face = g['sqrt_g_hat_face']   # √ĝ en caras
+
+        # Flujos F_phys en caras y densitización √ĝ·α·J
+        flux_hat = self._compute_interface_fluxes_full(
+            rho0, vr, pressure, g, r, eos, reconstructor, riemann_solver
+        )
+
+        # Divergencias básicas (vectoriales) para D y τ
+        rhs_D   = np.zeros(N)
+        rhs_Sr  = np.zeros(N)
+        rhs_tau = np.zeros(N)
+
+        div_D   = -(np.diff(flux_hat['D'  ])) / (gh_cell[1:-1] * dr + 1e-30)
+        div_tau = -(np.diff(flux_hat['tau'])) / (gh_cell[1:-1] * dr + 1e-30)
+
+        rhs_D [1:-1] = div_D
+        rhs_tau[1:-1]= div_tau
+
+        # Momento: (1/√ĝ)∂_r(√ĝ (f_S)^r{}_r)  +  corrección covariante de índice bajo  (ecuación (37))
+        div_Sr = -(np.diff(flux_hat['Sr'])) / (gh_cell[1:-1] * dr + 1e-30)
+        rhs_Sr[1:-1] = div_Sr
+
+        # Γ̂^k_{rk} = ∂_r ln √ĝ  (discreto compatible con el flujo con √ĝ)
+        Gamma_trace_r = (gh_face[1:] - gh_face[:-1]) / (gh_cell[1:-1] * dr + 1e-30)
+        # Corrección: + α J p · Γ̂^k_{rk}  (anula 2p/r para p=cte y deja ∂_r p)
+        rhs_Sr[1:-1] += (g['alpha'][1:-1] * g['J_cell'][1:-1]) * pressure[1:-1] * Gamma_trace_r
+
+        # Fuentes físicas (geométricas) de (34) y (47) – sólo S_r y τ
+        src_Sr, src_tau = self._compute_sources_full(
+            pressure, g, bssn_vars, bssn_d1,
+            rho0, h, W, vr, spacetime_mode, r, background
+        )
+        rhs_Sr  += src_Sr
+        rhs_tau += src_tau
+
+        # Pasar de ∂_t(JU) a ∂_tU
+        J = g['J_cell'] + 1e-30
+        rhs_D   = rhs_D   / J
+        rhs_Sr  = rhs_Sr  / J
+        rhs_tau = rhs_tau / J
+
+        # BCs del RHS
+        rhs_D, rhs_Sr, rhs_tau = self._apply_rhs_boundary_conditions(rhs_D, rhs_Sr, rhs_tau, r)
+        return rhs_D, rhs_Sr, rhs_tau
+
+
+    def _compute_sources_full2(self, pressure, g, bssn_vars, bssn_d1,
+                            rho0, h, W, vr, spacetime_mode, r, background):
+        """
+        Fuentes físicas para S_r y τ (devolvemos J·S_phys), consistentes con:
+        - Momento: ecuación (34)
+        - Energía: ecuación (47)
+        Nota: en Minkowski las fuentes físicas son 0. El término 2p/r ya lo aporta
+            la corrección covariante del flujo mixto (en compute_rhs), y se cancela
+            con p=cte como debe.
+        """
+        N       = len(r)
+        J_cell  = g['J_cell']
+        alpha   = g['alpha']
+        beta_u  = g['beta_r']        # β^r (contravariante)
+        gamma_rr= g['gamma_rr']
+
+        # --- Caso Minkowski: fuentes físicas nulas (evitamos doble conteo) ---
+        if spacetime_mode == "fixed_minkowski":
+            return J_cell * np.zeros(N), J_cell * np.zeros(N)
+
+        # --- Componentes T^{μν} (fluido perfecto) ---
+        T00, T0r, Trr = self.T_components_from_primitives(
+            rho0=rho0, vr=vr, p=pressure, W=W, h=h,
+            alpha=alpha, beta_r=beta_u, gamma_rr=gamma_rr
+        )
+
+        # --- Derivadas geométricas necesarias ---
+        dalpha_dr = np.zeros(N)
+        if getattr(bssn_d1, 'lapse', None) is not None:
+            lapse_der = np.asarray(bssn_d1.lapse)
+            if lapse_der.ndim >= 2 and lapse_der.shape[1] > i_r:
+                dalpha_dr = lapse_der[:, i_r]
+
+        # D̂_r β^r = ∂_r β^r en 1D esférico
+        hat_D_beta_r = np.zeros(N)
+        if getattr(bssn_d1, 'shift_U', None) is not None:
+            shift_d1 = np.asarray(bssn_d1.shift_U)
+            if shift_d1.ndim >= 3 and shift_d1.shape[1] > i_r and shift_d1.shape[2] > i_r:
+                hat_D_beta_r = shift_d1[:, i_r, i_r]
+
+        # D̂_r γ_{rr} = e^{4φ}[ ∂_r \barγ_{rr} + 4 \barγ_{rr} ∂_r φ ]  (ecuación (35))
+        phi_arr = np.asarray(bssn_vars.phi, dtype=float)
+        e4phi   = np.exp(4.0 * phi_arr)
+        bar_gamma_LL = get_bar_gamma_LL(r, bssn_vars.h_LL, background)   # \barγ_ij
+        bar_gamma_rr = bar_gamma_LL[:, i_r, i_r]
+
+        dphi_dr = np.zeros(N)
+        if getattr(bssn_d1, 'phi', None) is not None:
+            phi_der = np.asarray(bssn_d1.phi)
+            if phi_der.ndim >= 2 and phi_der.shape[1] > i_r:
+                dphi_dr = phi_der[:, i_r]
+
+        dbar_gamma_rr_dr = np.zeros(N)
+        if getattr(bssn_d1, 'h_LL', None) is not None:
+            h_d1 = np.asarray(bssn_d1.h_LL)
+            if h_d1.ndim >= 4 and h_d1.shape[1] > i_r and h_d1.shape[2] > i_r and h_d1.shape[3] > i_r:
+                scaling_rr     = background.scaling_matrix[:, i_r, i_r]
+                dscaling_rr_dr = background.d1_scaling_matrix[:, i_r, i_r, i_r]
+                h_rr           = bssn_vars.h_LL[:, i_r, i_r]
+                dh_rr_dr       = h_d1[:, i_r, i_r, i_r]
+                dbar_gamma_rr_dr = scaling_rr * dh_rr_dr + h_rr * dscaling_rr_dr
+
+        hat_D_gamma_rr = e4phi * (dbar_gamma_rr_dr + 4.0 * bar_gamma_rr * dphi_dr)
+
+        # K_rr = A_rr + (1/3) γ_rr K
+        K = getattr(bssn_vars, 'K', np.zeros(N))
+        bar_A_LL      = get_bar_A_LL(r, bssn_vars, background)
+        A_rr_physical = e4phi * bar_A_LL[:, i_r, i_r]
+        K_rr          = A_rr_physical + (gamma_rr * K) / 3.0
+
+        # Combinación estándar que aparece repetidamente
+        combo = (T00 * (beta_u**2) + 2.0 * T0r * beta_u + Trr)
+
+        # Términos fuente físicos (no densitizados), ecuacs. (34) y (47)
+        src_Sr_phys  = alpha * ( - T00 * dalpha_dr
+                                + (T00 * (gamma_rr*beta_u) + T0r * gamma_rr) * hat_D_beta_r
+                                + 0.5 * combo * hat_D_gamma_rr )
+
+        src_tau_phys = alpha * ( combo * K_rr
+                                - (T00 * beta_u + T0r) * dalpha_dr )
+
+        # Devolvemos J·S_phys (la división por J se hace en compute_rhs)
+        return J_cell * src_Sr_phys, J_cell * src_tau_phys
+
 
     def compute_rhs(self, D, Sr, tau, rho0, vr, pressure, W, h,
                     r, bssn_vars, bssn_d1, background, spacetime_mode,
                     eos, grid, reconstructor, riemann_solver):
         """
-        ∂t(J U) + (1/√ĝ) ∂r[ √ĝ (α J F^r_phys) ] = J S_phys
-        con √ĝ = r^2. Para el momento usamos la forma de tensor mixto
-        (ver eqs. (25), (37)); los aportes angulares (hoop stress) entran
-        vía las fuentes J·S_phys.
+        ∂_t(J U) + (1/√ĝ) ∂_r[ √ĝ (α J F^r_phys) ] = J S_phys,
+        con la corrección de conexión que exige la expansión de la divergencia covariante
+        para el tensor mixto de momento (1309.7808v2, ec. (37)).
         """
-        N = len(r)
-        # Compatibilidad con diferentes tipos de Grid
+
+        # --- paso de malla ---
         if hasattr(grid, 'derivs') and hasattr(grid.derivs, 'dx'):
-            dr = float(grid.derivs.dx)  # Grid completo (engrenage)
+            dr = float(grid.derivs.dx)
         elif hasattr(grid, 'dr'):
-            dr = float(grid.dr)  # Grid simple (test.py)
+            dr = float(grid.dr)
         else:
-            # Fallback: calcular dr de r
             dr = float(r[1] - r[0]) if len(r) > 1 else 1.0
 
-        # 1) BCs en CONSERVADAS (no pisar arrays originales)
-        D = D.copy()
+        # --- CONSERVADAS + BCs ---
+        D  = D.copy()
         Sr = Sr.copy()
         tau = tau.copy()
         D, Sr, tau = self._apply_ghost_cell_boundaries(D, Sr, tau, r)
 
-        # 2) Geometría (α, β_r, e^{6φ}, γ_rr, √ĝ en celda/cara, J en celda/cara)
+        # --- Geometría ---
         g = self._extract_geometry(r, bssn_vars, spacetime_mode, background)
+        N = len(r)
 
-        # 3) Flujos en caras:  flux_hat = √ĝ_face * (α_face * J_face * F_phys)
+        # --- Flujos (densitizados en caras con √ĝ · α · J) ---
         flux_hat = self._compute_interface_fluxes_full(
             rho0, vr, pressure, g, r, eos, reconstructor, riemann_solver
         )
 
-        # 4) Divergencia covariante
-        rhs_D = np.zeros(N)
-        rhs_Sr = np.zeros(N)
+        # --- Divergencia con peso √ĝ ---
+        rhs_D   = np.zeros(N)
+        rhs_Sr  = np.zeros(N)
         rhs_tau = np.zeros(N)
 
-        sgc = g['sqrt_g_hat_cell']   # √ĝ en centros (= r^2)
+        gh_cell = g['sqrt_g_hat_cell']     # √ĝ en centros (r^2)
+        gh_face = g['sqrt_g_hat_face']     # √ĝ en caras
 
-        # Opción: divergencias covariantes completas según ec. (21) del paper
-        use_covariant_divergences = (spacetime_mode != "fixed_minkowski")
+        div_D   = -(np.diff(flux_hat['D'  ])) / (gh_cell[1:-1] * dr + 1e-30)
+        div_Sr  = -(np.diff(flux_hat['Sr' ])) / (gh_cell[1:-1] * dr + 1e-30)
+        div_tau = -(np.diff(flux_hat['tau'])) / (gh_cell[1:-1] * dr + 1e-30)
 
-        if use_covariant_divergences:
-            # Γ̂^k_jk = ∂_j ln √ĝ usando infraestructura de Engrenage
-            # Para √ĝ = r^2: ∂_r ln(r^2) = 2/r
-            hat_christoffel_trace = (background.d1_det_hat_gamma[:, i_r] /
-                                   (background.det_hat_gamma + 1e-30))
+        rhs_D [1:-1] = div_D
+        rhs_Sr[1:-1] = div_Sr
+        rhs_tau[1:-1]= div_tau
 
-        for i in range(NUM_GHOSTS, N - NUM_GHOSTS):
-            inv_vol = 1.0 / (sgc[i] * dr + 1e-30)
+        det_hat = np.asarray(background.det_hat_gamma, dtype=float)                # shape (N,)
+        ddet_dr = np.asarray(background.d1_det_hat_gamma, dtype=float)[:, i_r]     # ∂r det(γ̂)
+        Gamma_trace_r = 0.5 * ddet_dr / (det_hat + 1e-30)                          # = ∂r ln √ĝ
+        #else:
+            # Fallback compatible con el flujo densitizado: ( √ĝ_{i+1/2} − √ĝ_{i−1/2} ) / ( √ĝ_i Δr )
+         #   Gamma_trace_r = (gh_face[1:] - gh_face[:-1]) / (gh_cell[1:-1] * dr + 1e-30)
 
-            # Divergencia básica
-            div_flux_D = -(flux_hat['D'][i] - flux_hat['D'][i-1]) * inv_vol
-            div_flux_Sr = -(flux_hat['Sr'][i] - flux_hat['Sr'][i-1]) * inv_vol
-            div_flux_tau = -(flux_hat['tau'][i] - flux_hat['tau'][i-1]) * inv_vol
+        # Añade + (α J p) Γ̂^k_{rk} sólo al RHS de S_r (tensor mixto)
+        rhs_Sr[1:-1] += (g['alpha'][1:-1] * g['J_cell'][1:-1]) * pressure[1:-1] * Gamma_trace_r[1:-1]
 
-            if use_covariant_divergences:
-                # Corrección covariante: -flux^j Γ̂^k_jk según ec. (21)
-                covariant_correction_D = -flux_hat['D'][i] * hat_christoffel_trace[i] / (sgc[i] + 1e-30)
-                covariant_correction_Sr = -flux_hat['Sr'][i] * hat_christoffel_trace[i] / (sgc[i] + 1e-30)
-                covariant_correction_tau = -flux_hat['tau'][i] * hat_christoffel_trace[i] / (sgc[i] + 1e-30)
-
-                rhs_D[i] = div_flux_D + covariant_correction_D
-                rhs_Sr[i] = div_flux_Sr + covariant_correction_Sr
-                rhs_tau[i] = div_flux_tau + covariant_correction_tau
-            else:
-                # Versión conservativa para Minkowski
-                rhs_D[i] = div_flux_D
-                rhs_Sr[i] = div_flux_Sr
-                rhs_tau[i] = div_flux_tau
-
-        # 5) Fuentes J·S_phys
+        # --- Fuentes físicas (J·S_phys): sólo afectan S_r y τ ---
         src_Sr, src_tau = self._compute_sources_full(
-            pressure, g, bssn_vars, bssn_d1, rho0, h, W, vr, spacetime_mode, r
+            pressure, g, bssn_vars, bssn_d1,
+            rho0, h, W, vr, spacetime_mode, r, background
         )
-        rhs_Sr += src_Sr
+        rhs_Sr  += src_Sr
         rhs_tau += src_tau
 
-        # 6) BCs al RHS (paridades)
+        # --- Pasar de ∂_t(JU) a ∂_t U ---
+        J = g['J_cell'] + 1e-30
+        rhs_D   = rhs_D   / J
+        rhs_Sr  = rhs_Sr  / J
+        rhs_tau = rhs_tau / J
+
+        # --- BCs del RHS ---
         rhs_D, rhs_Sr, rhs_tau = self._apply_rhs_boundary_conditions(rhs_D, rhs_Sr, rhs_tau, r)
         return rhs_D, rhs_Sr, rhs_tau
 
-    def get_implementation_info(self):
+
+    def _compute_sources_full(self, pressure, g, bssn_vars, bssn_d1,
+                            rho0, h, W, vr, spacetime_mode, r, background):
         """
-        Información sobre la implementación integrada con Engrenage.
+        Fuentes físicas para S_r y τ (devolvemos J·S_phys).
+        - Minkowski: 0 (las únicas correcciones geométricas al momento ya se añaden en compute_rhs).
+        - Dinámico: implementación de (s_S)_r y s_τ según 1309.7808v2 (ecs. (34) y (47)),
+        con  \hat D_r γ_{rr} = e^{4φ} [ 4 \barγ_{rr} ∂_r φ + (\hat D \barγ)_{rrr} ].
         """
-        return {
-            'approach': 'Full Reference Metric Valencia (integrado con Engrenage)',
-            'paper': 'Montero et al. 2013 (arXiv:1309.7808v2)',
-            'integration_with_engrenage': {
-                'tensoralgebra': 'Usa get_det_bar_gamma(), get_bar_gamma_LL()',
-                'background': 'Usa hat_christoffel, det_hat_gamma precalculados',
-                'bssn_coupling': 'Integrado con derivadas BSSN existentes',
-                'factor_J': 'J = e^{6φ} √(γ̄/γ̂) usando funciones de Engrenage'
-            },
-            'coordinate_system': 'Spherical (1D radial)',
-            'reference_metric': 'γ̂_ij implementada en sphericalbackground.py',
-            'status': 'Implementación optimizada sin duplicación de código'
-        }
+        import numpy as np
+        from source.backgrounds.sphericalbackground import i_r
+        # Usamos la utilidad que ya implementa \hat D \barγ conforme a Baumgarte (ec. 25).  :contentReference[oaicite:4]{index=4}
+        from source.bssn.tensoralgebra import get_hat_D_bar_gamma_LL
+
+        N       = len(r)
+        J_cell  = g['J_cell']
+        alpha   = g['alpha']
+        beta_u  = g['beta_r']          # β^r (contravariante)
+        gamma_rr= g['gamma_rr']
+
+        # --- Minkowski: sin fuentes físicas ---
+        if spacetime_mode == "fixed_minkowski":
+            return J_cell * np.zeros(N), J_cell * np.zeros(N)
+
+        # --- Componentes T^{μν} desde primitivas (mixto con índice arriba) ---
+        T00, T0u, Tuu = self.T_components_from_primitives(
+            rho0=rho0, vr=vr, p=pressure, W=W, h=h,
+            alpha=alpha, beta_r=beta_u, gamma_rr=gamma_rr
+        )
+
+        # --- Derivadas de calibre ---
+        dalpha_dr = np.zeros(N)
+        if getattr(bssn_d1, 'lapse', None) is not None:
+            lapse_der = np.asarray(bssn_d1.lapse)
+            if lapse_der.ndim >= 2 and lapse_der.shape[1] > i_r:
+                dalpha_dr = lapse_der[:, i_r]
+
+        dbeta_dr = np.zeros(N)
+        if getattr(bssn_d1, 'shift_U', None) is not None:
+            shift_d1 = np.asarray(bssn_d1.shift_U)
+            if shift_d1.ndim >= 3 and shift_d1.shape[1] > i_r and shift_d1.shape[2] > i_r:
+                dbeta_dr = shift_d1[:, i_r, i_r]
+        # \hat D_r β^r = ∂_r β^r + \hatΓ^r_{r r} β^r = ∂_r β^r (en fondo esférico)  :contentReference[oaicite:5]{index=5}
+        hat_D_beta_r = dbeta_dr
+
+        # --- \hat D_r γ_{rr} = e^{4φ} [ 4 \barγ_{rr} ∂_r φ + (\hat D \barγ)_{rrr} ]  (ec. (35))
+        phi_arr = np.asarray(bssn_vars.phi, dtype=float)
+        e4phi   = np.exp(4.0 * phi_arr)
+        from source.bssn.tensoralgebra import get_bar_gamma_LL
+        bar_gamma_LL = get_bar_gamma_LL(r, bssn_vars.h_LL, background)
+        bar_gamma_rr = bar_gamma_LL[:, i_r, i_r]
+
+        dphi_dr = np.zeros(N)
+        if getattr(bssn_d1, 'phi', None) is not None:
+            phi_der = np.asarray(bssn_d1.phi)
+            if phi_der.ndim >= 2 and phi_der.shape[1] > i_r:
+                dphi_dr = phi_der[:, i_r]
+
+        hat_D_bar_gamma = get_hat_D_bar_gamma_LL(r, bssn_vars.h_LL, bssn_d1.h_LL, background)  # (N,3,3,3)
+        hat_D_bar_gamma_rrr = hat_D_bar_gamma[:, i_r, i_r, i_r]
+        hat_D_gamma_rr = e4phi * (4.0 * bar_gamma_rr * dphi_dr + hat_D_bar_gamma_rrr)  # :contentReference[oaicite:6]{index=6}
+
+        # --- K_rr = A_rr + (1/3) γ_rr K ---
+        K = getattr(bssn_vars, 'K', np.zeros(N))
+        from source.bssn.tensoralgebra import get_bar_A_LL
+        bar_A_LL      = get_bar_A_LL(r, bssn_vars, background)
+        A_rr_physical = e4phi * bar_A_LL[:, i_r, i_r]
+        K_rr          = A_rr_physical + (gamma_rr * K) / 3.0
+
+        # --- Combinaciones estándar ---
+        combo = (T00 * (beta_u**2) + 2.0 * T0u * beta_u + Tuu)
+
+        # T^{0}{}_r = T^{00} β_r + T^{0r} γ_{rr}, con β_r = γ_{rr} β^r
+        beta_l       = gamma_rr * beta_u
+        T0_lower_r   = T00 * beta_l + T0u * gamma_rr
+
+        # (s_S)_r  = α[ − T00 ∂_r α + T^{0}{}_r \hat D_r β^r + ½ combo · \hat D_r γ_{rr} ]
+        src_Sr_phys  = alpha * ( - T00 * dalpha_dr
+                                + T0_lower_r * hat_D_beta_r
+                                + 0.5 * combo * hat_D_gamma_rr )
+
+        # s_τ = α[ combo·K_rr − (T^{00} β^r + T^{0r}) ∂_r α ]
+        src_tau_phys = alpha * ( combo * K_rr
+                                - (T00 * beta_u + T0u) * dalpha_dr )
+
+        # Densitizamos (J·S_phys). La división por J se hace en compute_rhs.
+        return J_cell * src_Sr_phys, J_cell * src_tau_phys
+
 
     def _extract_geometry(self, r, bssn_vars, spacetime_mode, background):
-        """Extrae cantidades geométricas con verificación robusta de dimensiones."""
+        """Extracts geometric quantities using BSSN framework functions correctly."""
         N = len(r)
         g = {}
 
-        # Campos geométricos
         if spacetime_mode == "fixed_minkowski":
             g['alpha'] = np.ones(N)
             g['beta_r'] = np.zeros(N)
             g['e6phi'] = np.ones(N)
             g['gamma_rr'] = np.ones(N)
         else:
+            # Use BSSN variables directly
             g['alpha'] = np.asarray(bssn_vars.lapse, dtype=float)
             
-            # Shift con verificación de dimensiones
+            # Extract shift properly
             if hasattr(bssn_vars, 'shift_U') and bssn_vars.shift_U is not None:
                 shift_array = np.asarray(bssn_vars.shift_U)
                 if shift_array.ndim >= 2 and shift_array.shape[1] > i_r:
@@ -149,26 +369,24 @@ class ValenciaReferenceMetric:
             else:
                 g['beta_r'] = np.zeros(N)
             
-            # Factor conformal
-            g['e6phi'] = np.exp(6.0 * np.asarray(bssn_vars.phi, dtype=float))
+            # Conformal factors
+            phi_arr = np.asarray(bssn_vars.phi, dtype=float)
+            g['e6phi'] = np.exp(6.0 * phi_arr)
             
-            # Métrica conforme
+            # CORRECCIÓN: Physical spatial metric γ_rr = e^{4φ} γ̄_rr using BSSN functions
             bar_gamma_LL = get_bar_gamma_LL(r, bssn_vars.h_LL, background)
-            g['gamma_rr'] = g['e6phi'] * bar_gamma_LL[:, i_r, i_r]
+            e4phi = np.exp(4.0 * phi_arr)
+            g['gamma_rr'] = e4phi * bar_gamma_LL[:, i_r, i_r]
 
-        # √ĝ en centros / caras (en 1D esf.: √ĝ = r^2)
-        # Para coordenadas esféricas 1D, la métrica de referencia es ĝ_rr = 1, ĝ_θθ = r^2, ĝ_φφ = r^2 sin^2θ
-        # En 1D (solo r), det(ĝ) = r^4 sin^2θ ≈ r^4, entonces √ĝ = r^2
+        # √ĝ for 1D spherical (det(ĝ) = r⁴ sin²θ, so √ĝ = r²)
         r_c = np.asarray(r, dtype=float)
         r_f = 0.5 * (r_c[:-1] + r_c[1:])
-        r_f_abs = np.maximum(np.abs(r_f), 1e-30)
-
+        
         g['sqrt_g_hat_cell'] = np.maximum(np.abs(r_c), 1e-30)**2
         g['r_faces'] = r_f
-        g['sqrt_g_hat_face'] = r_f_abs**2
+        g['sqrt_g_hat_face'] = np.maximum(np.abs(r_f), 1e-30)**2
 
-        # Factor de densitización J = e^{6φ} √(γ̄/γ̂) según paper 1309.7808v2 ec.(16)-(18)
-        # Usa funciones existentes de tensoralgebra.py y background
+        # CORRECCIÓN: Jacobiano J = e^{6φ} √(γ̄/ĝ) usando funciones del framework
         if spacetime_mode != "fixed_minkowski":
             e6phi = g['e6phi']
             det_bar_gamma = get_det_bar_gamma(r, bssn_vars.h_LL, background)
@@ -185,14 +403,14 @@ class ValenciaReferenceMetric:
 
     def _compute_interface_fluxes_full(self, rho0, vr, pressure, g, r,
                                        eos, reconstructor, riemann_solver):
-        """Calcula flujos densitizados en interfaces."""
+        """Computes densitized fluxes at interfaces."""
         N = len(r)
         nfaces = N - 1
         flux_D = np.zeros(nfaces)
         flux_Sr = np.zeros(nfaces)
         flux_tau = np.zeros(nfaces)
 
-        # Reconstrucción → N+1 caras; recorte a caras interiores [1:-1]
+        # Reconstruction → N+1 faces; trim to interior faces [1:-1]
         (rhoL, vL, pL), (rhoR, vR, pR) = reconstructor.reconstruct_primitive_variables(
             rho0, vr, pressure, x=r, boundary_type="reflecting"
         )
@@ -203,14 +421,14 @@ class ValenciaReferenceMetric:
         vR = vR[1:-1]
         pR = pR[1:-1]
 
-        # Promedios en cara
+        # Face averages
         alpha_f = 0.5 * (g['alpha'][:-1] + g['alpha'][1:])
         beta_r_f = 0.5 * (g['beta_r'][:-1] + g['beta_r'][1:])
         gamma_rr_f = 0.5 * (g['gamma_rr'][:-1] + g['gamma_rr'][1:])
         J_f = g['J_face']               # nfaces
         sqrt_gh_f = g['sqrt_g_hat_face']      # nfaces
 
-        # Limitadores físicos opcionales (longitudes nfaces)
+        # Optional physical limiters (nfaces length)
         if hasattr(reconstructor, "apply_physical_limiters"):
             (rhoL, vL, pL), (rhoR, vR, pR) = reconstructor.apply_physical_limiters(
                 (rhoL, vL, pL), (rhoR, vR, pR),
@@ -218,160 +436,110 @@ class ValenciaReferenceMetric:
                 gamma_rr=gamma_rr_f
             )
 
-        # Flujo físico en cada cara y densitización
-        for j in range(nfaces):
-            UL = prim_to_cons(rhoL[j], vL[j], pL[j], gamma_rr_f[j], eos)
-            UR = prim_to_cons(rhoR[j], vR[j], pR[j], gamma_rr_f[j], eos)
+        # Physical flux at all faces (partially vectorized)
+        # Convert primitives to conservative variables on faces in a vectorized manner
+        UL_D, UL_Sr, UL_tau = prim_to_cons(rhoL, vL, pL, gamma_rr_f, eos)
+        UR_D, UR_Sr, UR_tau = prim_to_cons(rhoR, vR, pR, gamma_rr_f, eos)
 
-            F_phys = riemann_solver.solve(
-                UL, UR,
-                (rhoL[j], vL[j], pL[j]),
-                (rhoR[j], vR[j], pR[j]),
-                gamma_rr_f[j], alpha_f[j], beta_r_f[j], eos
-            )
-            dens_face = alpha_f[j] * J_f[j]
-            Fhat = sqrt_gh_f[j] * dens_face * F_phys  # √ĝ_face * (α_face J_face) * F_phys
+        # Pack batches for the Riemann solver
+        UL_batch = np.stack([UL_D, UL_Sr, UL_tau], axis=1)
+        UR_batch = np.stack([UR_D, UR_Sr, UR_tau], axis=1)
+        primL_batch = np.stack([rhoL, vL, pL], axis=1)
+        primR_batch = np.stack([rhoR, vR, pR], axis=1)
 
-            flux_D[j], flux_Sr[j], flux_tau[j] = Fhat[0], Fhat[1], Fhat[2]
+        F_phys_batch = riemann_solver.solve_batch(
+            UL_batch, UR_batch, primL_batch, primR_batch,
+            gamma_rr_f, alpha_f, beta_r_f, eos
+        )
+
+        # Correct densitization on all faces: √γ̂_face * α_face * J_face * F_phys
+        dens_face = alpha_f * J_f
+        Fhat = (sqrt_gh_f[:, None] * dens_face[:, None]) * F_phys_batch
+
+        flux_D[:] = Fhat[:, 0]
+        flux_Sr[:] = Fhat[:, 1]
+        flux_tau[:] = Fhat[:, 2]
 
         return {'D': flux_D, 'Sr': flux_Sr, 'tau': flux_tau}
 
-    def _compute_sources_full(self, pressure, g, bssn_vars, bssn_d1,
-                              rho0, h, W, vr, spacetime_mode, r):
-        """
-        Implementa fuentes físicas densitizadas según ec. (34) del paper 1309.7808v2:
-        (sS)^i = α J/√γ̂ [T^ab(∇a nb δ^i_b + ∇b na δ^i_a) + (1/2) T^ab ∇^i γab]
-
-        En coordenadas esféricas incluye:
-        - Hoop stress: 2p/r (de Γ̂^θ_rθ = Γ̂^φ_rφ = 1/r)
-        - Acoplamientos gravitacionales con lapse, shift y métrica
-        """
-        N = len(r)
-        J_cell = g['J_cell']
-
-        # --- caso Minkowski fijo: solo hoop stress en la ecuación de momento
-        if spacetime_mode == "fixed_minkowski":
-            r_safe = np.maximum(np.abs(np.asarray(r, dtype=float)), 1e-30)
-            src_Sr_phys = 2.0 * pressure / r_safe   # Γ̂^θ_{rθ} = Γ̂^φ_{rφ} = 1/r  ⇒  +2p/r
-            src_tau_phys = np.zeros(N)               # no hay fuentes geométricas en τ con Cowling
-            # En Minkowski fijo, J_cell = 1, así que no afecta
-            return src_Sr_phys, src_tau_phys
-
-        # --- caso métrica dinámica: términos completos de acoplamiento
-        alpha = g['alpha']
-        gamma_rr = g['gamma_rr']
-
-        # T^{μν} para fluido perfecto
-        T00 = rho0 * h * W**2 - pressure
-        T0r = rho0 * h * W**2 * vr
-        Trr = rho0 * h * W**2 * vr**2 + pressure
-
-        # Derivadas BSSN (radial) - con verificación robusta de dimensiones
-        dalpha_dr = np.zeros(N)
-        dbeta_dr = np.zeros(N)
-        dphi_dr = np.zeros(N)
-        
-        # Derivada del lapse
-        if hasattr(bssn_d1, 'lapse') and bssn_d1.lapse is not None:
-            lapse_deriv = np.asarray(bssn_d1.lapse)
-            if lapse_deriv.ndim >= 2 and lapse_deriv.shape[1] > i_r:
-                dalpha_dr = lapse_deriv[:, i_r]
-        
-        # Derivada del shift
-        if hasattr(bssn_d1, 'shift_U') and bssn_d1.shift_U is not None:
-            shift_deriv = np.asarray(bssn_d1.shift_U)
-            if shift_deriv.ndim >= 3 and shift_deriv.shape[1] > i_r and shift_deriv.shape[2] > i_r:
-                dbeta_dr = shift_deriv[:, i_r, i_r]  # ∂r β^r
-        
-        # Derivada del factor conformal
-        if hasattr(bssn_d1, 'phi') and bssn_d1.phi is not None:
-            phi_deriv = np.asarray(bssn_d1.phi)
-            if phi_deriv.ndim >= 2 and phi_deriv.shape[1] > i_r:
-                dphi_dr = phi_deriv[:, i_r]
-
-        # Aproximación 1D para ∂r γ_rr a partir de φ (γ_rr = e^{4φ} \barγ_rr, con \barγ_rr≈1)
-        d_gamma_rr_dr = gamma_rr * (4.0 * dphi_dr)
-
-        # Hoop stress siempre presente
-        r_safe = np.maximum(np.abs(np.asarray(r, dtype=float)), 1e-30)
-        hoop_stress = 2.0 * pressure / r_safe
-
-        # (sS)^r (ec. (34)), escrito en términos de componentes útiles en 1D
-        src_Sr_phys = hoop_stress + (- T00 * dalpha_dr) + (T0r * dbeta_dr) + 0.5 * Trr * d_gamma_rr_dr
-
-        # s_τ (ec. (47)) – usa K y gradientes de α
-        K = getattr(bssn_vars, 'K', np.zeros(N))
-        src_tau_phys = alpha * K * (pressure - T00)
-
-        return J_cell * src_Sr_phys, J_cell * src_tau_phys
-
-    def _compute_hat_christoffel_trace(self, r, background=None):
-        """
-        Calcula Γ̂^k_jk = ∂j ln √γ̂ para la métrica de referencia esférica.
-        En coordenadas esféricas: Γ̂^r_rr = 2/r, Γ̂^θ_θθ = cotθ, Γ̂^φ_φφ = cotθ
-        Para 1D esférico (solo r): Γ̂^r_rr = 2/r
-        """
-        # background no se usa en la versión 1D, pero se mantiene para consistencia de interfaz
-        _ = background  # suprimir warning
-        r_safe = np.maximum(np.abs(r), 1e-30)
-        return 2.0 / r_safe
-
-    def _validate_geometry(self, g, r, spacetime_mode):
-        """
-        Valida que las cantidades geométricas sean físicamente razonables.
-        """
-        # Verificar que las cantidades sean finitas y positivas donde corresponde
-        assert np.all(np.isfinite(g['alpha'])), "Lapse contains non-finite values"
-        assert np.all(g['alpha'] > 0), "Lapse must be positive"
-        assert np.all(np.isfinite(g['J_cell'])), "J factor contains non-finite values"
-        assert np.all(g['J_cell'] > 0), "J factor must be positive"
-
-        if spacetime_mode != "fixed_minkowski":
-            assert np.all(g['gamma_rr'] > 0), "Spatial metric component must be positive"
-            assert np.all(np.isfinite(g['gamma_rr'])), "Spatial metric contains non-finite values"
-
-        return True
-
     def _apply_ghost_cell_boundaries(self, D, Sr, tau, r):
         """
-        Paridades en r≈0:
-          D, τ  pares;   S_r impar.
-        Extrapolación de orden cero en la frontera externa.
+        Parities at r≈0:
+          D, τ  even;   S_r odd.
+        Zero-order extrapolation at outer boundary.
+        Vectorized implementation.
         """
         N = len(r)
 
-        # r=0 (lado izquierdo, NUM_GHOSTS celdas)
-        for i in range(NUM_GHOSTS):
-            mirror = 2 * NUM_GHOSTS - 1 - i
-            D[i] = D[mirror]     # par
-            Sr[i] = -Sr[mirror]    # impar
-            tau[i] = tau[mirror]   # par
+        # Left boundary (center)
+        if NUM_GHOSTS > 0:
+            mir_slice = slice(2 * NUM_GHOSTS - 1, NUM_GHOSTS - 1, -1)
+            D[:NUM_GHOSTS] = D[mir_slice]
+            Sr[:NUM_GHOSTS] = -Sr[mir_slice]
+            tau[:NUM_GHOSTS] = tau[mir_slice]
 
-        # frontera externa (lado derecho)
+        # Right boundary (outer edge)
         last_interior = N - NUM_GHOSTS - 1
-        for k in range(1, NUM_GHOSTS + 1):
-            idx = last_interior + k
-            D[idx] = D[last_interior]
-            Sr[idx] = Sr[last_interior]
-            tau[idx] = tau[last_interior]
+        if last_interior >= 0 and NUM_GHOSTS > 0:
+            D[-NUM_GHOSTS:] = D[last_interior]
+            Sr[-NUM_GHOSTS:] = Sr[last_interior]
+            tau[-NUM_GHOSTS:] = tau[last_interior]
+
         return D, Sr, tau
 
     def _apply_rhs_boundary_conditions(self, rhs_D, rhs_Sr, rhs_tau, r):
-        """Las mismas paridades para el RHS."""
+        """Same parities for the RHS (vectorized)."""
         N = len(r)
 
-        # r=0
-        for i in range(NUM_GHOSTS):
-            mirror = 2 * NUM_GHOSTS - 1 - i
-            rhs_D[i] = rhs_D[mirror]     # par
-            rhs_Sr[i] = -rhs_Sr[mirror]    # impar
-            rhs_tau[i] = rhs_tau[mirror]   # par
+        if NUM_GHOSTS > 0:
+            mir_slice = slice(2 * NUM_GHOSTS - 1, NUM_GHOSTS - 1, -1)
+            rhs_D[:NUM_GHOSTS] = rhs_D[mir_slice]
+            rhs_Sr[:NUM_GHOSTS] = -rhs_Sr[mir_slice]
+            rhs_tau[:NUM_GHOSTS] = rhs_tau[mir_slice]
 
-        # frontera externa
         last_interior = N - NUM_GHOSTS - 1
-        for k in range(1, NUM_GHOSTS + 1):
-            idx = last_interior + k
-            rhs_D[idx] = rhs_D[last_interior]
-            rhs_Sr[idx] = rhs_Sr[last_interior]
-            rhs_tau[idx] = rhs_tau[last_interior]
+        if last_interior >= 0 and NUM_GHOSTS > 0:
+            rhs_D[-NUM_GHOSTS:] = rhs_D[last_interior]
+            rhs_Sr[-NUM_GHOSTS:] = rhs_Sr[last_interior]
+            rhs_tau[-NUM_GHOSTS:] = rhs_tau[last_interior]
+
         return rhs_D, rhs_Sr, rhs_tau
+
+    @staticmethod
+    def T_components_from_primitives(rho0, vr, p, W, h, alpha, beta_r, gamma_rr):
+        """
+        Devuelve (T^{00}, T^{0r}, T^{rr}) para un fluido perfecto en 3+1 (1D radial):
+            T^{μν} = ρ0 h u^μ u^ν + p g^{μν}
+
+        Convenciones:
+        - u^0 = W / α
+        - u^r = W ( v^r - β^r / α ), con β^r = γ^{rr} β_r
+        - g^{00} = -1/α^2
+        - g^{0r} = β^r/α^2
+        - g^{rr} = γ^{rr} - (β^r)^2 / α^2
+
+        Todos los argumentos pueden ser escalares o arrays de la misma longitud.
+        """
+
+        rho0  = np.asarray(rho0, dtype=float)
+        vr    = np.asarray(vr,   dtype=float)
+        p     = np.asarray(p,    dtype=float)
+        W     = np.asarray(W,    dtype=float)
+        h     = np.asarray(h,    dtype=float)
+        alpha = np.asarray(alpha,dtype=float)
+        beta_r= np.asarray(beta_r,dtype=float)
+        grr   = 1.0/np.asarray(gamma_rr, dtype=float)  # γ^{rr}
+
+        beta_u = grr * beta_r                  # β^r
+        ut = W / (alpha + 1e-30)
+        ur = W * (vr - beta_u/(alpha + 1e-30))
+
+        g00 = -1.0/(alpha**2)
+        g0r =  beta_u/(alpha**2)
+        grr_eff = grr - (beta_u**2)/(alpha**2)
+
+        T00 = rho0*h*ut*ut + p*g00
+        T0r = rho0*h*ut*ur + p*g0r
+        Trr = rho0*h*ur*ur + p*grr_eff
+        return T00, T0r, Trr
+

@@ -6,11 +6,11 @@ See further details in https://github.com/GRChombo/engrenage/wiki/Running-the-bl
 
 import numpy as np
 
-from core.grid import *
-from bssn.bssnstatevariables import *
-from bssn.tensoralgebra import *
-from backgrounds.sphericalbackground import *
-from matter.scalarmatter import *
+from source.core.grid import *
+from source.bssn.bssnstatevariables import *
+from source.bssn.tensoralgebra import *
+from source.backgrounds.sphericalbackground import *
+from source.matter.scalarmatter import *
 
 def get_initial_state(grid: Grid, background) :
     

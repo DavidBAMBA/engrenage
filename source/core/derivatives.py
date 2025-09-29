@@ -1,6 +1,6 @@
 import numpy as np
 
-from core.spacing import Spacing, NUM_GHOSTS
+from source.core.spacing import Spacing, NUM_GHOSTS
 
 class Derivatives:
     """

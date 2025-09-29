@@ -1,8 +1,8 @@
 import numpy as np
-from bssn.bssnstatevariables import *
-from bssn.bssnvars import *
-from core.grid import *
-from bssn.tensoralgebra import *
+from source.bssn.bssnstatevariables import *
+from source.bssn.bssnvars import *
+from source.core.grid import *
+from source.bssn.tensoralgebra import *
 
 class NoMatter :
     """Represents the matter that sources the Einstein equation - in this case none!"""

@@ -1,7 +1,7 @@
 # statevector.py
 
 import numpy as np
-from bssn.bssnstatevariables import *
+from source.bssn.bssnstatevariables import *
 
 class StateVector :
     """Creates the full state vector from the bssn vars and the given matter class."""
