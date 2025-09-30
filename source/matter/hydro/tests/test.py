@@ -13,7 +13,9 @@ import matplotlib.pyplot as plt
 sys.path.append(os.path.join(os.path.dirname(__file__), '..', '..'))
 
 # --- imports absolutos coherentes ---
-from source.core.spacing import NUM_GHOSTS
+from source.core.spacing import NUM_GHOSTS, LinearSpacing, SpacingExtent
+from source.core.grid import Grid
+from source.core.statevector import StateVector
 from source.backgrounds.sphericalbackground import i_r
 from source.bssn.tensoralgebra import get_bar_gamma_LL
 
@@ -22,40 +24,65 @@ from source.matter.hydro.reconstruction import MinmodReconstruction, create_reco
 from source.matter.hydro.riemann import HLLERiemannSolver
 from source.matter.hydro.cons2prim import cons_to_prim, prim_to_cons
 from source.matter.hydro.valencia_reference_metric import ValenciaReferenceMetric
+from source.matter.hydro.perfect_fluid import PerfectFluid
 from source.bssn.tensoralgebra import SPACEDIM
 from source.backgrounds.sphericalbackground import FlatSphericalBackground
 
 
-class Grid:
-    def __init__(self, dx):
-        self.dr = float(dx)
-        
-
 class _DummyBSSNVars:
     #Placeholders no usados en Minkowski fijo.
     def __init__(self, N):
-        import numpy as np
         self.lapse   = np.ones(N)
-        self.shift_U = np.zeros((N,3,3))
+        self.shift_U = np.zeros((N,3))
         self.phi     = np.zeros(N)
         self.K       = np.zeros(N)
+        self.h_LL    = np.zeros((N,3,3))
+        self.a_LL    = np.zeros((N,3,3))
 
 class _DummyBSSND1:
     def __init__(self, N):
         self.lapse   = np.zeros((N,3))
         self.shift_U = np.zeros((N,3,3))
         self.phi     = np.zeros((N,3))
+        self.h_LL    = np.zeros((N,3,3,3))
 
-def build_grid(n_interior=256, r_min=1.0e-3, r_max=1.0, ng=NUM_GHOSTS):
-    #Centros de celda uniformes + ghosts extrapolados linealmente.
+def build_engrenage_grid_with_matter(n_interior=256, r_min=1.0e-3, r_max=1.0, ng=NUM_GHOSTS,
+                                     eos=None, reconstructor=None, riemann_solver=None):
+    """Create standard Engrenage Grid with PerfectFluid matter class."""
     Nin = int(n_interior)
-    r_in = np.linspace(r_min, r_max, Nin)
-    dr = (r_max - r_min) / (Nin - 1)
-    # Extiende a la izquierda (ghosts) y derecha por extrapolación
-    left_ghosts  = r_in[0]  - dr*np.arange(ng,0,-1)
-    right_ghosts = r_in[-1] + dr*np.arange(1,ng+1)
-    r_full = np.concatenate([left_ghosts, r_in, right_ghosts])
-    return r_full, Grid(dr), Nin
+    num_points = Nin + 2 * ng  # total points including ghosts
+    spacing = LinearSpacing(num_points, r_max, SpacingExtent.HALF)
+
+    # Create PerfectFluid matter with proper configuration
+    if eos is None:
+        eos = IdealGasEOS(gamma=1.4)
+    if reconstructor is None:
+        reconstructor = MinmodReconstruction()
+    if riemann_solver is None:
+        riemann_solver = HLLERiemannSolver()
+
+    matter = PerfectFluid(
+        eos=eos,
+        spacetime_mode="fixed_minkowski",
+        reconstructor=reconstructor,
+        riemann_solver=riemann_solver
+    )
+
+    # Create state vector and grid
+    state_vector = StateVector(matter)
+    grid = Grid(spacing, state_vector)
+
+    # Manually adjust r coordinates to get the desired r_min at first interior point
+    r_interior_start = grid.r[ng]
+    shift = r_min - r_interior_start
+    grid.r = grid.r + shift
+
+    return grid, matter, Nin
+
+def build_engrenage_grid(n_interior=256, r_min=1.0e-3, r_max=1.0, ng=NUM_GHOSTS):
+    """Wrapper for compatibility - creates grid with default matter setup."""
+    grid, matter, Nin = build_engrenage_grid_with_matter(n_interior, r_min, r_max, ng)
+    return grid, Nin
 
 def fill_ghosts_primitives(rho, v, p, ng=NUM_GHOSTS):
     """Paridades correctas en r≈0: rho/p pares; v impar. Outflow en borde derecho."""
@@ -84,11 +111,6 @@ def to_conserved(rho0, v, p, eos):
     tau = rho0 * h * W*W - p - D
     return D, Sr, tau 
 
-""" def to_conserved2(rho0, v, p, eos):
-    res =prim_to_cons(rho0, v, p, eos, np.zeros_like(rho0), np.ones_like(rho0))
-    return res['D'], res['Sr'], res['tau']
- """
-
 def to_primitives(D, Sr, tau, eos, p_guess=None):
     res = cons_to_prim(
         (D, Sr, tau), eos,
@@ -109,7 +131,7 @@ def rk3_step(valencia, D, Sr, tau, rho0, v, p, r, grid, eos, recon, rsolve, cfl=
     """Una etapa RK3 Shu–Osher usando compute_rhs (full approach)."""
     # dt CFL
     amax = max_signal_speed(rho0, v, p, eos)
-    dt = cfl * grid.dr / amax
+    dt = cfl * grid.min_dr / amax
 
     # Dummy BSSN (no usado en Minkowski, pero la firma lo pide)
     bssn_vars = _DummyBSSNVars(len(r))
@@ -156,14 +178,104 @@ def rk3_step(valencia, D, Sr, tau, rho0, v, p, r, grid, eos, recon, rsolve, cfl=
 
     return dt, Dn, Snn, taun, rhon, vn, pn
 
+def rk3_step_matter_class(matter, D, Sr, tau, r, grid, cfl=0.5, spacetime_mode="fixed_minkowski"):
+    """RK3 step using PerfectFluid matter class (Engrenage pattern)."""
+    from source.bssn.bssnvars import BSSNVars
+
+    # Setup matter variables in the matter class
+    state_vector = np.zeros((grid.NUM_VARS, len(r)))
+    state_vector[matter.idx_D] = D
+    state_vector[matter.idx_Sr] = Sr
+    state_vector[matter.idx_tau] = tau
+
+    # Dummy BSSN variables for Minkowski
+    bssn_vars = _DummyBSSNVars(len(r))
+    bssn_d1 = _DummyBSSND1(len(r))
+    background = FlatSphericalBackground(r)
+
+    # Set matter variables
+    matter.set_matter_vars(state_vector, bssn_vars, grid)
+
+    # Get primitives for CFL calculation
+    primitives = matter._get_primitives(bssn_vars, r)
+    rho0, vr, p = primitives['rho0'], primitives['vr'], primitives['p']
+
+    # Apply boundary conditions to primitives
+    rho0, vr, p = fill_ghosts_primitives(rho0, vr, p)
+
+    # Update conservatives after BC
+    D, Sr, tau = to_conserved(rho0, vr, p, matter.eos)
+
+    # CFL condition
+    amax = max_signal_speed(rho0, vr, p, matter.eos)
+    dt = cfl * grid.min_dr / amax
+
+    # RK3 Stage 1
+    state_vector[matter.idx_D] = D
+    state_vector[matter.idx_Sr] = Sr
+    state_vector[matter.idx_tau] = tau
+    matter.set_matter_vars(state_vector, bssn_vars, grid)
+
+    rhs = matter.get_matter_rhs(r, bssn_vars, bssn_d1, background)
+    D1 = D + dt * rhs[0]
+    Sr1 = Sr + dt * rhs[1]
+    tau1 = tau + dt * rhs[2]
+
+    rho1, vr1, p1 = to_primitives(D1, Sr1, tau1, matter.eos)
+    rho1, vr1, p1 = fill_ghosts_primitives(rho1, vr1, p1)
+    D1, Sr1, tau1 = to_conserved(rho1, vr1, p1, matter.eos)
+
+    # RK3 Stage 2
+    state_vector[matter.idx_D] = D1
+    state_vector[matter.idx_Sr] = Sr1
+    state_vector[matter.idx_tau] = tau1
+    matter.set_matter_vars(state_vector, bssn_vars, grid)
+
+    rhs = matter.get_matter_rhs(r, bssn_vars, bssn_d1, background)
+    D2 = 0.75*D + 0.25*(D1 + dt * rhs[0])
+    Sr2 = 0.75*Sr + 0.25*(Sr1 + dt * rhs[1])
+    tau2 = 0.75*tau + 0.25*(tau1 + dt * rhs[2])
+
+    rho2, vr2, p2 = to_primitives(D2, Sr2, tau2, matter.eos)
+    rho2, vr2, p2 = fill_ghosts_primitives(rho2, vr2, p2)
+    D2, Sr2, tau2 = to_conserved(rho2, vr2, p2, matter.eos)
+
+    # RK3 Stage 3
+    state_vector[matter.idx_D] = D2
+    state_vector[matter.idx_Sr] = Sr2
+    state_vector[matter.idx_tau] = tau2
+    matter.set_matter_vars(state_vector, bssn_vars, grid)
+
+    rhs = matter.get_matter_rhs(r, bssn_vars, bssn_d1, background)
+    Dn = (1.0/3.0)*D + (2.0/3.0)*(D2 + dt * rhs[0])
+    Srn = (1.0/3.0)*Sr + (2.0/3.0)*(Sr2 + dt * rhs[1])
+    taun = (1.0/3.0)*tau + (2.0/3.0)*(tau2 + dt * rhs[2])
+
+    rhon, vrn, pn = to_primitives(Dn, Srn, taun, matter.eos)
+    rhon, vrn, pn = fill_ghosts_primitives(rhon, vrn, pn)
+
+    return dt, Dn, Srn, taun, rhon, vrn, pn
+
+def compute_derivative_engrenage(var, grid, order=1):
+    """Compute spatial derivative using Engrenage's derivative system."""
+    if hasattr(grid, 'derivs'):
+        # Use Engrenage derivatives
+        return grid.derivs.drn_matrix[order] @ var
+    else:
+        # Fallback to numpy gradient
+        if order == 1:
+            return np.gradient(var, grid.min_dr)
+        else:
+            raise NotImplementedError(f"Order {order} derivatives not implemented for fallback")
+
 def volume_integrals(D, tau, r, grid):
     """Masa y energía total con peso 4π r^2."""
     ng = NUM_GHOSTS
     rin = r[ng:-ng]
     Din = D[ng:-ng]
     taun = tau[ng:-ng]
-    mass  = 4*np.pi * np.sum(Din   * rin*rin) * grid.dr
-    energ = 4*np.pi * np.sum(taun+Din) * grid.dr
+    mass  = 4*np.pi * np.sum(Din   * rin*rin) * grid.min_dr
+    energ = 4*np.pi * np.sum(taun+Din) * grid.min_dr
     return mass, energ
 
 # =========================
@@ -174,7 +286,8 @@ def test_uniform_state():
     print("TEST 1: Estado uniforme (Minkowski, FULL reference-metric)")
     print("="*60)
 
-    r, grid, Nin = build_grid(n_interior=256, r_min=1e-3, r_max=1.0)
+    grid, Nin = build_engrenage_grid(n_interior=256, r_min=1e-3, r_max=1.0)
+    r = grid.r
     N = len(r)
     eos  = IdealGasEOS(gamma=1.4)
     recon= MinmodReconstruction()
@@ -228,7 +341,8 @@ def test_riemann_sod():
     print("="*60)
 
     # Configuración base
-    r, grid, Nin = build_grid(n_interior=200, r_min=1e-3, r_max=1.0)
+    grid, Nin = build_engrenage_grid(n_interior=200, r_min=1e-3, r_max=1.0)
+    r = grid.r
     N = len(r)
     eos = IdealGasEOS(gamma=1.4)
     rsolve = HLLERiemannSolver()
@@ -253,7 +367,8 @@ def test_riemann_sod():
 
         # Para MP5 alta resolución, usar más puntos
         if method == "mp5_hires":
-            r_hires, grid_hires, Nin_hires = build_grid(n_interior=200, r_min=1e-3, r_max=1.0)
+            grid_hires, Nin_hires = build_engrenage_grid(n_interior=200, r_min=1e-3, r_max=1.0)
+            r_hires = grid_hires.r
             N_hires = len(r_hires)
 
             # Discontinuidad en el punto medio del dominio interior
@@ -314,7 +429,11 @@ def test_riemann_sod():
 
         # Métricas de calidad
         rho_in = rho0[ng:-ng]
-        grad = np.gradient(rho_in, rin)
+        # Use Engrenage derivatives for gradient calculation
+        rho_full = np.zeros_like(r)
+        rho_full[ng:-ng] = rho_in
+        grad_full = compute_derivative_engrenage(rho_full, grid, order=1)
+        grad = grad_full[ng:-ng]  # Extract interior gradient
         variation = np.std(rho_in)/np.mean(rho_in)
         contact = np.any(np.abs(grad) > 0.5)
         print(f"  {method}: t≈{t:.3f}, pasos={steps}, variación ρ={variation:.3f}, contacto={contact}")
@@ -475,7 +594,8 @@ def test_blast_wave(case='weak',
     print("="*60)
 
     # --- Grid y parámetros ---
-    r, grid, Nin = build_grid(n_interior=n_interior, r_min=r_min, r_max=r_max)
+    grid, Nin = build_engrenage_grid(n_interior=n_interior, r_min=r_min, r_max=r_max)
+    r = grid.r
     N  = len(r)
     ng = NUM_GHOSTS
 
@@ -520,7 +640,11 @@ def test_blast_wave(case='weak',
     # --- métricas de validación ---
     rin    = r[ng:-ng]
     rho_in = rho0[ng:-ng]
-    grad   = np.gradient(rho_in, rin)
+    # Use Engrenage derivatives for gradient calculation
+    rho_full = np.zeros_like(r)
+    rho_full[ng:-ng] = rho_in
+    grad_full = compute_derivative_engrenage(rho_full, grid, order=1)
+    grad = grad_full[ng:-ng]  # Extract interior gradient
     variation = float(np.std(rho_in)/np.mean(rho_in))
     contact   = bool(np.any(np.abs(grad) > 0.5))
     print(f"[blast:{case}] t≈{t:.4f}, pasos={steps}, variación relativa ρ={variation:.3f}")
@@ -554,7 +678,8 @@ def test_conservation_short():
     print("\n" + "="*60)
     print("TEST 4: Conservación global (masa/energía)")
     print("="*60)
-    r, grid, Nin = build_grid(n_interior=256, r_min=1e-3, r_max=1.0)
+    grid, Nin = build_engrenage_grid(n_interior=256, r_min=1e-3, r_max=1.0)
+    r = grid.r
     N = len(r)
     eos  = IdealGasEOS(gamma=4.0/3.0)
     recon= MinmodReconstruction()
