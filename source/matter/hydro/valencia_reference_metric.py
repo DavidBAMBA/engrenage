@@ -1,8 +1,9 @@
 # valencia_reference_metric.py
 """
-Valencia with reference metric - explicit connection terms.
+Valencia with reference metric - general curvilinear formulation.
 
-Computes: ∂_r F + F · Γ̂^k_{rk} explicitly instead of using Engrenage divergence.
+Following BSSN style: uses einsum for all tensor operations.
+Spherical symmetry assumed for velocity (v^θ = v^φ = 0) but source terms are general.
 """
 
 import numpy as np
@@ -20,15 +21,15 @@ from source.matter.hydro.cons2prim import prim_to_cons
 
 
 class ValenciaReferenceMetric:
-    """Valencia with reference metric - explicit derivative + connection form."""
-
-# valencia_reference_metric.py (solo la parte modificada)
+    """Valencia with reference metric - general curvilinear coordinates."""
 
     def compute_rhs(self, D, Sr, tau, rho0, vr, pressure, W, h,
                     r, bssn_vars, bssn_d1, background, spacetime_mode,
                     eos, grid, reconstructor, riemann_solver):
         """
         RHS with explicit form: ∂_r F + F · Γ̂^k_{rk}
+        
+        General formulation using einsum (BSSN style).
         """
         
         dr = self._get_mesh_spacing(grid, r)
@@ -44,20 +45,16 @@ class ValenciaReferenceMetric:
         )
         
         # ====================================================================
-        # COMPUTE Γ̂^k_{rk} ANALYTICALLY from Christoffel symbols
+        # COMPUTE Γ̂^k_{ik} using einsum (general, like bssnrhs.py)
         # ====================================================================
-        # Γ̂^k_{rk} = Γ̂^r_{rr} + Γ̂^θ_{rθ} + Γ̂^φ_{rφ}
-        # Using hat_christoffel[x, i, j, k] = Γ̂^i_{jk}
+        # Γ̂^k_{ik} = Σ_k Γ̂^k_{ik} where i is the radial direction (i_r)
+        # For spherical: Γ̂^r_{rr} + Γ̂^θ_{rθ} + Γ̂^φ_{rφ} = 0 + 1/r + 1/r = 2/r
         
-        hat_chris = background.hat_christoffel  # (N, i, j, k)
+        hat_chris = background.hat_christoffel  # (N, i, j, k) = Γ̂^i_{jk}
         
-        Gamma_trace = (
-            hat_chris[:, i_r, i_r, i_r]  # Γ̂^r_{rr}
-            + hat_chris[:, i_t, i_r, i_t]  # Γ̂^θ_{rθ}
-            + hat_chris[:, i_p, i_r, i_p]  # Γ̂^φ_{rφ}
-        )
-        
-        # For spherical: = 0 + 1/r + 1/r = 2/r
+        # Extract Γ̂^k_{rk} (second index = i_r), then trace over k
+        chris_radial = hat_chris[:, :, i_r, :]  # Shape: (N, k, k)
+        Gamma_trace = np.einsum('xkk->x', chris_radial)  # Trace: Σ_k Γ̂^k_{rk}
         
         # Fluxes at faces
         F_D_face = flux_phys['D']
@@ -74,24 +71,16 @@ class ValenciaReferenceMetric:
         F_tau_cell[1:-1] = 0.5 * (F_tau_face[:-1] + F_tau_face[1:])
         
         # ====================================================================
-        # MASS: ∂_t(J D) = -∂_r F_D - F_D · Γ̂^k_{rk}
+        # EXPLICIT FORM: -∂_r F - F · Γ̂^k_{rk}
         # ====================================================================
         
         rhs_D = np.zeros(N)
         rhs_D[1:-1] = -(F_D_face[1:] - F_D_face[:-1]) / dr
         rhs_D[1:-1] += -F_D_cell[1:-1] * Gamma_trace[1:-1]
         
-        # ====================================================================
-        # ENERGY: ∂_t(J τ) = -∂_r F_τ - F_τ · Γ̂^k_{rk}
-        # ====================================================================
-        
         rhs_tau = np.zeros(N)
         rhs_tau[1:-1] = -(F_tau_face[1:] - F_tau_face[:-1]) / dr
         rhs_tau[1:-1] += -F_tau_cell[1:-1] * Gamma_trace[1:-1]
-        
-        # ====================================================================
-        # MOMENTUM: ∂_t(J S_r) = -∂_r F_Sr - F_Sr · Γ̂^k_{rk} + α J p · Γ̂^k_{rk}
-        # ====================================================================
         
         rhs_Sr = np.zeros(N)
         rhs_Sr[1:-1] = -(F_Sr_face[1:] - F_Sr_face[:-1]) / dr
@@ -100,7 +89,7 @@ class ValenciaReferenceMetric:
                         pressure[1:-1] * Gamma_trace[1:-1])
         
         # ====================================================================
-        # PHYSICAL SOURCES
+        # PHYSICAL SOURCES (general with einsum)
         # ====================================================================
         
         src_Sr, src_tau = self._compute_source_terms(
@@ -126,14 +115,18 @@ class ValenciaReferenceMetric:
         
         return rhs_D, rhs_Sr, rhs_tau
     
-    
     # ========================================================================
-    # SOURCES (same as before - correct with einsum)
+    # SOURCES (general with einsum)
     # ========================================================================
     
     def _compute_source_terms(self, rho0, vr, pressure, W, h, g,
                               bssn_vars, bssn_d1, background, spacetime_mode, r):
-        """Physical sources with einsum."""
+        """
+        Physical sources with general einsum contractions.
+        
+        Builds full 3D stress-energy tensor even though spherical symmetry
+        means only T^{rr} non-zero. This allows future generalization.
+        """
         
         N = len(r)
         J = g['J_cell']
@@ -143,13 +136,14 @@ class ValenciaReferenceMetric:
         
         alpha, beta_r, gamma_rr = g['alpha'], g['beta_r'], g['gamma_rr']
         
-        T00, T0r, Trr = self._compute_stress_energy_tensor(
+        # Get T^{00}, T^{0r}, T^{rr} for spherical symmetry
+        T00, T0r, Trr = self._compute_stress_energy_tensor_spherical(
             rho0, vr, pressure, W, h, alpha, beta_r, gamma_rr
         )
         
-        # Build 3D tensors
+        # Build full 3D tensors for general einsum contractions
         beta_U = np.zeros((N, SPACEDIM))
-        beta_U[:, i_r] = beta_r
+        beta_U[:, i_r] = beta_r  # In spherical symmetry, only radial component
         
         T0U = np.zeros((N, SPACEDIM))
         T0U[:, i_r] = T0r
@@ -160,11 +154,13 @@ class ValenciaReferenceMetric:
         gamma_LL = e4phi[:, None, None] * bar_gamma_LL
         gamma_UU = np.linalg.inv(gamma_LL)
         
+        # Full T^{ij} tensor (diagonal in spherical symmetry with no angular velocity)
         TUU = np.zeros((N, SPACEDIM, SPACEDIM))
         TUU[:, i_r, i_r] = Trr
-        TUU[:, i_t, i_t] = pressure * gamma_UU[:, i_t, i_t]
-        TUU[:, i_p, i_p] = pressure * gamma_UU[:, i_p, i_p]
+        TUU[:, i_t, i_t] = pressure * gamma_UU[:, i_t, i_t]  # T^{θθ} = p g^{θθ}
+        TUU[:, i_p, i_p] = pressure * gamma_UU[:, i_p, i_p]  # T^{φφ} = p g^{φφ}
         
+        # General einsum contractions
         beta_lower = np.einsum('xij,xj->xi', gamma_LL, beta_U)
         T0_lower = T00[:, None] * beta_lower + np.einsum('xj,xij->xi', T0U, gamma_LL)
         
@@ -207,7 +203,7 @@ class ValenciaReferenceMetric:
             + TUU
         )
         
-        # Sources with einsum contractions
+        # General einsum contractions for sources (equations 34 and 47)
         src_Sr_vector = J[:, None] * alpha[:, None] * (
             -T00[:, None] * alpha[:, None] * dalpha_dx
             + np.einsum('xi,xij->xi', T0_lower, Dhat_beta_U)
@@ -269,11 +265,7 @@ class ValenciaReferenceMetric:
     
     def _compute_interface_fluxes(self, rho0, vr, pressure, g, r,
                                    eos, reconstructor, riemann_solver):
-        """
-        Compute physical fluxes (α J F_phys) WITHOUT √ĝ factor.
-        
-        Returns fluxes at faces ready for ∂_r F calculation.
-        """
+        """Compute physical fluxes (α J F_phys) at faces."""
         N = len(r)
         
         (rhoL, vL, pL), (rhoR, vR, pR) = reconstructor.reconstruct_primitive_variables(
@@ -308,7 +300,6 @@ class ValenciaReferenceMetric:
             gamma_rr_f, alpha_f, beta_r_f, eos
         )
         
-        # Multiply by (α J) only, NOT by √ĝ
         dens_factor = alpha_f * J_f
         F_batch = dens_factor[:, None] * F_phys_batch
         
@@ -318,8 +309,15 @@ class ValenciaReferenceMetric:
             'tau': F_batch[:, 2]
         }
     
-    def _compute_stress_energy_tensor(self, rho0, vr, pressure, W, h,
-                                      alpha, beta_r, gamma_rr):
+    def _compute_stress_energy_tensor_spherical(self, rho0, vr, pressure, W, h,
+                                                alpha, beta_r, gamma_rr):
+        """
+        Compute stress-energy tensor for spherical symmetry.
+        
+        Valid for v^θ = v^φ = 0 (purely radial motion).
+        Returns only non-zero spatial components: T^{00}, T^{0r}, T^{rr}.
+        Angular components T^{θθ} = T^{φφ} = p g^{θθ/φφ} computed in source terms.
+        """
         grr = 1.0 / gamma_rr
         beta_u = grr * beta_r
         ut = W / alpha
@@ -361,4 +359,3 @@ class ValenciaReferenceMetric:
             if last >= 0:
                 rhs_D[-NUM_GHOSTS:], rhs_Sr[-NUM_GHOSTS:], rhs_tau[-NUM_GHOSTS:] = rhs_D[last], rhs_Sr[last], rhs_tau[last]
         return rhs_D, rhs_Sr, rhs_tau
-    
