@@ -1,9 +1,21 @@
 # valencia_reference_metric.py
 """
-Valencia with reference metric - general curvilinear formulation.
+Valencia formulation with reference metric - full 3D BSSN-style implementation.
 
-Following BSSN style: uses einsum for all tensor operations.
-Spherical symmetry assumed for velocity (v^θ = v^φ = 0) but source terms are general.
+Follows the exact same tensor algebra pattern as bssnrhs.py:
+- Full 3D einsum contractions for all tensor operations
+- Spherical symmetry imposed by velocity (v^θ = v^φ = 0) and background metric
+- Source terms following NRPy+ GRHD_equations.py structure
+- Connection terms with CORRECT signs for covariant divergence
+
+Conservative evolution equations in curved coordinates:
+    ∂_t(U) + (1/√ĝ) ∂_j[√ĝ F^j] = S + S_connection
+
+Where:
+    U = (D, S_i, τ)  conserved variables
+    F^j = physical fluxes
+    S = geometric source terms
+    S_connection = -Γ̂^k_{jk} F^j (covariant divergence correction)
 """
 
 import numpy as np
@@ -11,9 +23,10 @@ import numpy as np
 from source.bssn.tensoralgebra import (
     SPACEDIM,
     get_bar_gamma_LL,
+    get_bar_gamma_UU,
     get_det_bar_gamma,
     get_bar_A_LL,
-    get_hat_D_bar_gamma_LL
+    get_hat_D_bar_gamma_LL,
 )
 from source.backgrounds.sphericalbackground import i_r, i_t, i_p
 from source.core.spacing import NUM_GHOSTS
@@ -21,341 +34,504 @@ from source.matter.hydro.cons2prim import prim_to_cons
 
 
 class ValenciaReferenceMetric:
-    """Valencia with reference metric - general curvilinear coordinates."""
+    """Valencia formulation - full 3D tensor algebra following BSSN pattern."""
 
     def compute_rhs(self, D, Sr, tau, rho0, vr, pressure, W, h,
                     r, bssn_vars, bssn_d1, background, spacetime_mode,
                     eos, grid, reconstructor, riemann_solver):
         """
-        RHS with explicit form: ∂_r F + F · Γ̂^k_{rk}
-        
-        General formulation using einsum (BSSN style).
+        Compute RHS of Valencia equations using full 3D tensor contractions.
+
+        Follows bssnrhs.py structure with einsum for all tensor operations.
+        Implements equations from NRPy+ GRHD_equations.py with CORRECT signs.
         """
-        
         dr = self._get_mesh_spacing(grid, r)
         N = len(r)
-        
+
+        # Compute W and h from primitives if not provided
+        if W is None:
+            v2 = vr * vr
+            W = 1.0 / np.sqrt(np.maximum(1.0 - v2, 1e-16))
+
+        if h is None:
+            eps = eos.eps_from_rho_p(rho0, pressure)
+            h = 1.0 + eps + pressure / np.maximum(rho0, 1e-30)
+
+        # Copy and apply boundary conditions to conservatives
         D, Sr, tau = D.copy(), Sr.copy(), tau.copy()
         D, Sr, tau = self._apply_ghost_cell_boundaries(D, Sr, tau, r)
-        
+
+        # Extract geometry (α, β^i, γ_ij, √γ, √ĝ, etc.)
         g = self._extract_geometry(r, bssn_vars, spacetime_mode, background)
-        
-        flux_phys = self._compute_interface_fluxes(
+
+        # Compute densitized fluxes at interfaces: √ĝ_face (α J F_phys)
+        flux_hat = self._compute_interface_fluxes(
             rho0, vr, pressure, g, r, eos, reconstructor, riemann_solver
         )
-        
+
+        # Reference metric Christoffel symbols Γ̂^i_{jk}
+        hat_chris = background.hat_christoffel  # (N, 3, 3, 3)
+
+        # Densitized fluxes at faces
+        F_D_face = flux_hat['D']
+        F_Sr_face = flux_hat['Sr']
+        F_tau_face = flux_hat['tau']
+
+        # sqrt(ĝ) at cells (for normalization)
+        sqrt_g_hat_cell = g['sqrt_g_hat_cell']
+
         # ====================================================================
-        # COMPUTE Γ̂^k_{ik} using einsum (general, like bssnrhs.py)
+        # FLUX DIVERGENCE: -(1/√ĝ) ∂_r[√ĝ F^r]
         # ====================================================================
-        # Γ̂^k_{ik} = Σ_k Γ̂^k_{ik} where i is the radial direction (i_r)
-        # For spherical: Γ̂^r_{rr} + Γ̂^θ_{rθ} + Γ̂^φ_{rφ} = 0 + 1/r + 1/r = 2/r
-        
-        hat_chris = background.hat_christoffel  # (N, i, j, k) = Γ̂^i_{jk}
-        
-        # Extract Γ̂^k_{rk} (second index = i_r), then trace over k
-        chris_radial = hat_chris[:, :, i_r, :]  # Shape: (N, k, k)
-        Gamma_trace = np.einsum('xkk->x', chris_radial)  # Trace: Σ_k Γ̂^k_{rk}
-        
-        # Fluxes at faces
-        F_D_face = flux_phys['D']
-        F_Sr_face = flux_phys['Sr']
-        F_tau_face = flux_phys['tau']
-        
-        # Interpolate fluxes to cell centers for connection term
-        F_D_cell = np.zeros(N)
-        F_Sr_cell = np.zeros(N)
-        F_tau_cell = np.zeros(N)
-        
-        F_D_cell[1:-1] = 0.5 * (F_D_face[:-1] + F_D_face[1:])
-        F_Sr_cell[1:-1] = 0.5 * (F_Sr_face[:-1] + F_Sr_face[1:])
-        F_tau_cell[1:-1] = 0.5 * (F_tau_face[:-1] + F_tau_face[1:])
-        
-        # ====================================================================
-        # EXPLICIT FORM: -∂_r F - F · Γ̂^k_{rk}
-        # ====================================================================
-        
+
         rhs_D = np.zeros(N)
-        rhs_D[1:-1] = -(F_D_face[1:] - F_D_face[:-1]) / dr
-        rhs_D[1:-1] += -F_D_cell[1:-1] * Gamma_trace[1:-1]
-        
-        rhs_tau = np.zeros(N)
-        rhs_tau[1:-1] = -(F_tau_face[1:] - F_tau_face[:-1]) / dr
-        rhs_tau[1:-1] += -F_tau_cell[1:-1] * Gamma_trace[1:-1]
-        
         rhs_Sr = np.zeros(N)
-        rhs_Sr[1:-1] = -(F_Sr_face[1:] - F_Sr_face[:-1]) / dr
-        rhs_Sr[1:-1] += -F_Sr_cell[1:-1] * Gamma_trace[1:-1]
-        rhs_Sr[1:-1] += (g['alpha'][1:-1] * g['J_cell'][1:-1] * 
-                        pressure[1:-1] * Gamma_trace[1:-1])
-        
+        rhs_tau = np.zeros(N)
+
+        # Compute divergence in interior cells
+        for i in range(NUM_GHOSTS, N - NUM_GHOSTS):
+            inv_vol = 1.0 / (sqrt_g_hat_cell[i] * dr + 1e-30)
+
+            rhs_D[i] = -(F_D_face[i] - F_D_face[i-1]) * inv_vol
+            rhs_Sr[i] = -(F_Sr_face[i] - F_Sr_face[i-1]) * inv_vol
+            rhs_tau[i] = -(F_tau_face[i] - F_tau_face[i-1]) * inv_vol
+
         # ====================================================================
-        # PHYSICAL SOURCES (general with einsum)
+        # CONNECTION TERMS: -Γ̂^k_{jk} F^j (covariant divergence correction)
         # ====================================================================
-        
+        # This is the difference between flat and curved space divergence
+        # Note: NEGATIVE sign is correct (see NRPy+ line 367-375 with RHS assembly)
+        # Only compute for curved spacetime
+
+        if spacetime_mode != "fixed_minkowski":
+            # Interpolate densitized fluxes to cell centers for connection terms
+            F_D_cell = np.zeros(N)
+            F_Sr_cell = np.zeros(N)
+            F_tau_cell = np.zeros(N)
+            F_D_cell[1:-1] = 0.5 * (F_D_face[:-1] + F_D_face[1:])
+            F_Sr_cell[1:-1] = 0.5 * (F_Sr_face[:-1] + F_Sr_face[1:])
+            F_tau_cell[1:-1] = 0.5 * (F_tau_face[:-1] + F_tau_face[1:])
+
+            # Build 3D flux vectors (extend 1D fluxes to 3D for einsum)
+            fD_U = np.zeros((N, SPACEDIM))
+            fD_U[:, i_r] = F_D_cell
+
+            fTau_U = np.zeros((N, SPACEDIM))
+            fTau_U[:, i_r] = F_tau_cell
+
+            # For momentum, build full T^j_i flux tensor
+            T4UD = self._compute_T4UD(rho0, vr, pressure, W, h, g, bssn_vars, background, r)
+
+            alpha = g['alpha']
+            sqrt_gamma = g['sqrt_gamma']
+            sqrt_g_hat = g['sqrt_g_hat_cell']
+
+            # Momentum flux tensor: F^j_i = √ĝ (α √γ T^j_i)
+            fS_mixed = np.zeros((N, SPACEDIM, SPACEDIM))
+            for j in range(SPACEDIM):
+                for i in range(SPACEDIM):
+                    fS_mixed[:, j, i] = sqrt_g_hat * alpha * sqrt_gamma * T4UD[:, j, i]
+
+            # Connection terms with CORRECT negative sign
+            # Density: -Γ̂^k_{jk} F^j_D / √ĝ
+            Gamma_trace = np.einsum('xkkj->xj', hat_chris)  # Γ̂^k_{jk}
+            conn_D = -np.einsum('xj,xj->x', Gamma_trace, fD_U) / (sqrt_g_hat + 1e-30)
+
+            # Energy: -Γ̂^k_{jk} F^j_τ / √ĝ
+            conn_tau = -np.einsum('xj,xj->x', Gamma_trace, fTau_U) / (sqrt_g_hat + 1e-30)
+
+            # Momentum: (Γ̂^j_{jl} F^l_i - Γ̂^l_{ji} F^j_l) / √ĝ (NRPy+ line 383-386)
+            conn_S_vector = np.zeros((N, SPACEDIM))
+            for i in range(SPACEDIM):
+                conn_S_vector[:, i] = (
+                    -np.einsum('xjjl,xli->x', hat_chris, fS_mixed) / (sqrt_g_hat + 1e-30)
+                    + np.einsum('xlji,xjl->x', hat_chris, fS_mixed) / (sqrt_g_hat + 1e-30)
+                )
+
+            conn_Sr = conn_S_vector[:, i_r]
+
+            # Add connection terms to RHS
+            rhs_D += conn_D
+            rhs_tau += conn_tau
+            rhs_Sr += conn_Sr
+
+        # ====================================================================
+        # SOURCE TERMS (geometric couplings - NRPy+ style)
+        # ====================================================================
+
         src_Sr, src_tau = self._compute_source_terms(
             rho0, vr, pressure, W, h, g, bssn_vars, bssn_d1,
             background, spacetime_mode, r
         )
-        
+
         rhs_Sr += src_Sr
         rhs_tau += src_tau
-        
+
         # ====================================================================
-        # DIVIDE BY J
+        # FINAL NORMALIZATION
         # ====================================================================
-        
-        J = g['J_cell'] + 1e-30
-        rhs_D /= J
-        rhs_Sr /= J
-        rhs_tau /= J
-        
+        # The RHS is already properly normalized by the (1/√ĝ) factors above
+        # No additional division needed
+
+        # Apply boundary conditions to RHS
         rhs_D, rhs_Sr, rhs_tau = self._apply_rhs_boundary_conditions(
             rhs_D, rhs_Sr, rhs_tau, r
         )
-        
+
         return rhs_D, rhs_Sr, rhs_tau
-    
-    # ========================================================================
-    # SOURCES (general with einsum)
-    # ========================================================================
-    
-    def _compute_source_terms(self, rho0, vr, pressure, W, h, g,
-                              bssn_vars, bssn_d1, background, spacetime_mode, r):
+
+    def _compute_T4UD(self, rho0, vr, pressure, W, h, g, bssn_vars, background, r):
         """
-        Physical sources with general einsum contractions.
-        
-        Builds full 3D stress-energy tensor even though spherical symmetry
-        means only T^{rr} non-zero. This allows future generalization.
+        Compute T^i_j = T^{ik} γ_{kj} following NRPy+ (lines 176-213).
+
+        This is the spatial part of the stress-energy tensor with one index raised
+        and one lowered, needed for momentum flux computation.
+
+        Returns: T^i_j as (N, 3, 3) array
         """
-        
-        N = len(r)
-        J = g['J_cell']
-        
-        if spacetime_mode == "fixed_minkowski":
-            return np.zeros(N), np.zeros(N)
-        
-        alpha, beta_r, gamma_rr = g['alpha'], g['beta_r'], g['gamma_rr']
-        
-        # Get T^{00}, T^{0r}, T^{rr} for spherical symmetry
-        T00, T0r, Trr = self._compute_stress_energy_tensor_spherical(
-            rho0, vr, pressure, W, h, alpha, beta_r, gamma_rr
-        )
-        
-        # Build full 3D tensors for general einsum contractions
-        beta_U = np.zeros((N, SPACEDIM))
-        beta_U[:, i_r] = beta_r  # In spherical symmetry, only radial component
-        
-        T0U = np.zeros((N, SPACEDIM))
-        T0U[:, i_r] = T0r
-        
+        N = len(rho0)
+
+        # Build 4-velocity components
+        alpha = g['alpha']
+
+        # u^t = W / α (timelike component for Valencia)
+        ut = W / alpha
+
+        # u^i = W v^i (spatial components, only radial in spherical symmetry)
+        uU = np.zeros((N, SPACEDIM))
+        uU[:, i_r] = W * vr
+
+        # Build full 3D metric γ_ij = e^{4φ} γ̄_ij (BSSN conformal decomposition)
         phi = np.asarray(bssn_vars.phi, dtype=float)
         e4phi = np.exp(4.0 * phi)
         bar_gamma_LL = get_bar_gamma_LL(r, bssn_vars.h_LL, background)
         gamma_LL = e4phi[:, None, None] * bar_gamma_LL
         gamma_UU = np.linalg.inv(gamma_LL)
-        
-        # Full T^{ij} tensor (diagonal in spherical symmetry with no angular velocity)
+
+        # Build contravariant spatial stress-energy: T^{ij} = ρ₀ h u^i u^j + P γ^{ij}
+        # (NRPy+ line 159-161)
+        TUU_spatial = np.zeros((N, SPACEDIM, SPACEDIM))
+        for i in range(SPACEDIM):
+            for j in range(SPACEDIM):
+                TUU_spatial[:, i, j] = (
+                    rho0 * h * uU[:, i] * uU[:, j]
+                    + pressure * gamma_UU[:, i, j]
+                )
+
+        # Lower second index: T^i_j = T^{ik} γ_{kj} (NRPy+ line 194-198)
+        T4UD = np.zeros((N, SPACEDIM, SPACEDIM))
+        for i in range(SPACEDIM):
+            for j in range(SPACEDIM):
+                T4UD[:, i, j] = np.einsum('xk,xkj->x', TUU_spatial[:, i, :], gamma_LL)
+
+        return T4UD
+
+    def _compute_source_terms(self, rho0, vr, pressure, W, h, g,
+                              bssn_vars, bssn_d1, background, spacetime_mode, r):
+        """
+        Physical source terms following NRPy+ GRHD_equations.py (lines 334-438).
+
+        Energy source (tau_source_term, NRPy+ line 334-358):
+            S_τ = α √γ [K_ij (T^tt β^i β^j + 2 T^{ti} β^j + T^{ij})
+                        - (T^tt β^i + T^{ti}) ∂_i α]
+
+        Momentum source (S_tilde_source_termD, NRPy+ line 388-438):
+            S_{S_i} = α √γ [-T^tt α ∂_i α
+                            + T^t_j (∂_i β^j + Γ̂^j_{ik} β^k)
+                            + (1/2) T^{jk} ∇̂_i γ_{jk}]
+        """
+        N = len(r)
+
+        if spacetime_mode == "fixed_minkowski":
+            # In Minkowski, only hoop stress for momentum
+            src_Sr = 2.0 * pressure / (r + 1e-30)
+            src_tau = np.zeros(N)
+            return src_Sr, src_tau
+
+        alpha = g['alpha']
+        sqrt_gamma = g['sqrt_gamma']
+
+        # Build 3D shift vector β^i
+        beta_U = np.zeros((N, SPACEDIM))
+        beta_U[:, i_r] = g['beta_r']
+
+        # Build full 3D metric γ_ij = e^{4φ} γ̄_ij
+        phi = np.asarray(bssn_vars.phi, dtype=float)
+        e4phi = np.exp(4.0 * phi)
+        bar_gamma_LL = get_bar_gamma_LL(r, bssn_vars.h_LL, background)
+        gamma_LL = e4phi[:, None, None] * bar_gamma_LL
+        gamma_UU = np.linalg.inv(gamma_LL)
+
+        # ====================================================================
+        # BUILD STRESS-ENERGY TENSOR T^{μν} (contravariant)
+        # ====================================================================
+
+        # 4-velocity components
+        ut = W / alpha
+        uU = np.zeros((N, SPACEDIM))
+        uU[:, i_r] = W * vr
+
+        # T^{00} = ρ₀ h u^t u^t + P g^{tt} (NRPy+ line 159)
+        # Note: g^{tt} = -1/α²
+        T00 = rho0 * h * ut * ut - pressure / (alpha ** 2)
+
+        # T^{0i} = ρ₀ h u^t u^i (NRPy+ line 159)
+        T0U = np.zeros((N, SPACEDIM))
+        T0U[:, i_r] = rho0 * h * ut * uU[:, i_r]
+
+        # T^{ij} = ρ₀ h u^i u^j + P γ^{ij} (NRPy+ line 159-161)
         TUU = np.zeros((N, SPACEDIM, SPACEDIM))
-        TUU[:, i_r, i_r] = Trr
-        TUU[:, i_t, i_t] = pressure * gamma_UU[:, i_t, i_t]  # T^{θθ} = p g^{θθ}
-        TUU[:, i_p, i_p] = pressure * gamma_UU[:, i_p, i_p]  # T^{φφ} = p g^{φφ}
-        
-        # General einsum contractions
-        beta_lower = np.einsum('xij,xj->xi', gamma_LL, beta_U)
-        T0_lower = T00[:, None] * beta_lower + np.einsum('xj,xij->xi', T0U, gamma_LL)
-        
-        # Geometric derivatives
+        for i in range(SPACEDIM):
+            for j in range(SPACEDIM):
+                TUU[:, i, j] = (
+                    rho0 * h * uU[:, i] * uU[:, j]
+                    + pressure * gamma_UU[:, i, j]
+                )
+
+        # ====================================================================
+        # GEOMETRIC QUANTITIES FOR SOURCE TERMS
+        # ====================================================================
+
+        # Lapse derivatives ∂_i α (NRPy+ line 340)
         dalpha_dx = np.zeros((N, SPACEDIM))
         if hasattr(bssn_d1, 'lapse') and bssn_d1.lapse is not None:
             dalpha_dx = np.asarray(bssn_d1.lapse)
-        
-        Dhat_beta_U = np.zeros((N, SPACEDIM, SPACEDIM))
+
+        # Shift derivatives ∂_i β^j (NRPy+ line 393, 420)
+        dbeta_dx = np.zeros((N, SPACEDIM, SPACEDIM))
         if hasattr(bssn_d1, 'shift_U') and bssn_d1.shift_U is not None:
             shift_d1 = np.asarray(bssn_d1.shift_U)
             if shift_d1.ndim >= 3:
-                Dhat_beta_U = shift_d1.copy()
-                hat_chris = background.hat_christoffel
-                Dhat_beta_U += np.einsum('xjik,xk->xij', hat_chris, beta_U)
-        
+                dbeta_dx = shift_d1.copy()
+
+        # Covariant derivative of shift: ∇̂_i β^j = ∂_i β^j + Γ̂^j_{ik} β^k
+        # (NRPy+ line 422-423)
+        hat_chris = background.hat_christoffel
+        hatD_beta_U = dbeta_dx + np.einsum('xjik,xk->xij', hat_chris, beta_U)
+
+        # Covariant derivative of metric: ∇̂_i γ_{jk} (NRPy+ line 407-415)
+        # ∇̂_i γ_{jk} = e^{4φ} [4 γ̄_{jk} ∂_i φ + ∇̂_i γ̄_{jk}]
         dphi_dx = np.zeros((N, SPACEDIM))
         if hasattr(bssn_d1, 'phi') and bssn_d1.phi is not None:
             dphi_dx = np.asarray(bssn_d1.phi)
-        
-        hat_D_bar_gamma = get_hat_D_bar_gamma_LL(r, bssn_vars.h_LL,
-                                                  bssn_d1.h_LL, background)
-        
-        Dhat_gamma_LL = np.zeros((N, SPACEDIM, SPACEDIM, SPACEDIM))
+
+        hat_D_bar_gamma = get_hat_D_bar_gamma_LL(r, bssn_vars.h_LL, bssn_d1.h_LL, background)
+
+        hatD_gamma_LL = np.zeros((N, SPACEDIM, SPACEDIM, SPACEDIM))
         for i in range(SPACEDIM):
             for j in range(SPACEDIM):
                 for k in range(SPACEDIM):
-                    Dhat_gamma_LL[:, i, j, k] = e4phi * (
+                    hatD_gamma_LL[:, i, j, k] = e4phi * (
                         4.0 * bar_gamma_LL[:, j, k] * dphi_dx[:, i]
                         + hat_D_bar_gamma[:, j, k, i]
                     )
-        
+
+        # Extrinsic curvature K_ij = e^{4φ} Ā_ij + (K/3) γ_ij (NRPy+ line 336)
         K = np.asarray(bssn_vars.K, dtype=float)
         bar_A_LL = get_bar_A_LL(r, bssn_vars, background)
         K_LL = e4phi[:, None, None] * bar_A_LL + (K / 3.0)[:, None, None] * gamma_LL
-        
+
+        # ====================================================================
+        # ENERGY SOURCE TERM (NRPy+ line 334-358)
+        # ====================================================================
+
+        # Tensor block: T^tt β^i β^j + 2 T^{ti} β^j + T^{ij} (NRPy+ line 347-351)
         tensor_block = (
             T00[:, None, None] * np.einsum('xi,xj->xij', beta_U, beta_U)
             + 2.0 * np.einsum('xi,xj->xij', T0U, beta_U)
             + TUU
         )
-        
-        # General einsum contractions for sources (equations 34 and 47)
-        src_Sr_vector = J[:, None] * alpha[:, None] * (
-            -T00[:, None] * alpha[:, None] * dalpha_dx
-            + np.einsum('xi,xij->xi', T0_lower, Dhat_beta_U)
-            + 0.5 * np.einsum('xjk,xijk->xi', tensor_block, Dhat_gamma_LL)
-        )
-        
-        src_tau = J * alpha * (
-            np.einsum('x,xi,xj,xij->x', T00, beta_U, beta_U, K_LL)
-            - np.einsum('x,xi,xi->x', T00, beta_U, dalpha_dx)
-            + 2.0 * np.einsum('xi,xj,xij->x', T0U, beta_U, K_LL)
-            - np.einsum('xi,xi->x', T0U, dalpha_dx)
-            + np.einsum('xij,xij->x', TUU, K_LL)
-        )
-        
-        return src_Sr_vector[:, i_r], src_tau
 
-    # ========================================================================
-    # GEOMETRY & UTILITIES
-    # ========================================================================
-    
+        # S_τ = α √γ [K_ij * tensor_block - (T^tt β^i + T^{ti}) ∂_i α]
+        # (NRPy+ line 343-358)
+        src_tau = alpha * sqrt_gamma * (
+            np.einsum('xij,xij->x', K_LL, tensor_block)
+            - np.einsum('x,xi,xi->x', T00, beta_U, dalpha_dx)
+            - np.einsum('xi,xi->x', T0U, dalpha_dx)
+        )
+
+        # ====================================================================
+        # MOMENTUM SOURCE TERM (NRPy+ line 388-438)
+        # ====================================================================
+
+        # Term 1: -T^tt α ∂_i α (NRPy+ line 418)
+        first_term = -T00[:, None] * alpha[:, None] * dalpha_dx
+
+        # Term 2: T^t_j ∇̂_i β^j (NRPy+ line 420-423)
+        # First lower index: T^t_j = T^{tk} γ_{kj}
+        T0_lower = np.einsum('xk,xkj->xj', T0U, gamma_LL)
+        second_term = np.einsum('xj,xij->xi', T0_lower, hatD_beta_U)
+
+        # Term 3: (1/2) T^{jk} ∇̂_i γ_{jk} (NRPy+ line 425-433)
+        third_term = 0.5 * np.einsum('xjk,xijk->xi', TUU, hatD_gamma_LL)
+
+        # Combine all momentum source terms (NRPy+ line 436-438)
+        src_S_vector = alpha[:, None] * sqrt_gamma[:, None] * (
+            first_term + second_term + third_term
+        )
+
+        # Extract radial component
+        src_Sr = src_S_vector[:, i_r]
+
+        return src_Sr, src_tau
+
     def _extract_geometry(self, r, bssn_vars, spacetime_mode, background):
+        """
+        Extract geometric quantities from BSSN variables.
+
+        Returns dictionary with all geometric quantities needed for RHS computation.
+        """
         N = len(r)
         g = {}
-        
+
         if spacetime_mode == "fixed_minkowski":
             g['alpha'] = np.ones(N)
             g['beta_r'] = np.zeros(N)
-            g['e6phi'] = np.ones(N)
             g['gamma_rr'] = np.ones(N)
+            g['sqrt_gamma'] = np.ones(N)
+            g['sqrt_g_hat_cell'] = background.det_hat_gamma ** 0.5  # r² for spherical
+            g['sqrt_g_hat_face'] = 0.5 * (g['sqrt_g_hat_cell'][:-1] + g['sqrt_g_hat_cell'][1:])
         else:
+            # Lapse α
             g['alpha'] = np.asarray(bssn_vars.lapse, dtype=float)
-            
+
+            # Shift β^r
             if hasattr(bssn_vars, 'shift_U') and bssn_vars.shift_U is not None:
                 shift_array = np.asarray(bssn_vars.shift_U)
                 g['beta_r'] = (shift_array[:, i_r].astype(float)
                               if shift_array.ndim >= 2 else np.zeros(N))
             else:
                 g['beta_r'] = np.zeros(N)
-            
+
+            # Conformal factor e^{φ}
             phi_arr = np.asarray(bssn_vars.phi, dtype=float)
-            g['e6phi'] = np.exp(6.0 * phi_arr)
-            
-            bar_gamma_LL = get_bar_gamma_LL(r, bssn_vars.h_LL, background)
+            e6phi = np.exp(6.0 * phi_arr)
             e4phi = np.exp(4.0 * phi_arr)
+
+            # Physical metric γ_rr = e^{4φ} γ̄_rr
+            bar_gamma_LL = get_bar_gamma_LL(r, bssn_vars.h_LL, background)
             g['gamma_rr'] = e4phi * bar_gamma_LL[:, i_r, i_r]
-        
-        if spacetime_mode != "fixed_minkowski":
+
+            # √γ = e^{6φ} √(det γ̄) (NRPy+ uses e6phi, line 223, 244, 257)
             det_bar_gamma = get_det_bar_gamma(r, bssn_vars.h_LL, background)
-            sqrt_bar_gamma = np.sqrt(np.abs(det_bar_gamma) + 1e-30)
-            sqrt_hat_gamma = np.sqrt(np.abs(background.det_hat_gamma) + 1e-30)
-            J_cell = g['e6phi'] * sqrt_bar_gamma / sqrt_hat_gamma
-        else:
-            J_cell = np.ones(N)
-        
-        g['J_cell'] = J_cell
-        g['J_face'] = 0.5 * (J_cell[:-1] + J_cell[1:])
-        
+            g['sqrt_gamma'] = e6phi * np.sqrt(np.abs(det_bar_gamma) + 1e-30)
+
+            # √ĝ for reference metric
+            g['sqrt_g_hat_cell'] = np.sqrt(np.abs(background.det_hat_gamma) + 1e-30)
+            g['sqrt_g_hat_face'] = 0.5 * (g['sqrt_g_hat_cell'][:-1] + g['sqrt_g_hat_cell'][1:])
+
         return g
-    
+
     def _compute_interface_fluxes(self, rho0, vr, pressure, g, r,
                                    eos, reconstructor, riemann_solver):
-        """Compute physical fluxes (α J F_phys) at faces."""
+        """
+        Compute densitized fluxes at cell interfaces: √ĝ_face (α √γ F_phys).
+
+        Returns fluxes already multiplied by √ĝ α √γ.
+        """
         N = len(r)
-        
+
+        # Reconstruct primitives to left/right states at interfaces
         (rhoL, vL, pL), (rhoR, vR, pR) = reconstructor.reconstruct_primitive_variables(
             rho0, vr, pressure, x=r, boundary_type="reflecting"
         )
-        
+
+        # Extract interior faces (exclude ghost zones)
         rhoL, vL, pL = rhoL[1:-1], vL[1:-1], pL[1:-1]
         rhoR, vR, pR = rhoR[1:-1], vR[1:-1], pR[1:-1]
-        
+
+        # Interpolate geometry to faces
         alpha_f = 0.5 * (g['alpha'][:-1] + g['alpha'][1:])
         beta_r_f = 0.5 * (g['beta_r'][:-1] + g['beta_r'][1:])
         gamma_rr_f = 0.5 * (g['gamma_rr'][:-1] + g['gamma_rr'][1:])
-        J_f = g['J_face']
-        
+        sqrt_gamma_f = 0.5 * (g['sqrt_gamma'][:-1] + g['sqrt_gamma'][1:])
+        sqrt_g_hat_f = g['sqrt_g_hat_face']
+
+        # Apply physical limiters if available
         if hasattr(reconstructor, "apply_physical_limiters"):
             (rhoL, vL, pL), (rhoR, vR, pR) = reconstructor.apply_physical_limiters(
                 (rhoL, vL, pL), (rhoR, vR, pR),
                 atmosphere_rho=1e-13, p_floor=1e-15, v_max=0.999999,
                 gamma_rr=gamma_rr_f
             )
-        
+
+        # Convert primitives to conservatives at interfaces
         UL_D, UL_Sr, UL_tau = prim_to_cons(rhoL, vL, pL, gamma_rr_f, eos)
         UR_D, UR_Sr, UR_tau = prim_to_cons(rhoR, vR, pR, gamma_rr_f, eos)
-        
+
+        # Package for Riemann solver
         UL_batch = np.stack([UL_D, UL_Sr, UL_tau], axis=1)
         UR_batch = np.stack([UR_D, UR_Sr, UR_tau], axis=1)
         primL_batch = np.stack([rhoL, vL, pL], axis=1)
         primR_batch = np.stack([rhoR, vR, pR], axis=1)
-        
+
+        # Solve Riemann problem to get physical fluxes
         F_phys_batch = riemann_solver.solve_batch(
             UL_batch, UR_batch, primL_batch, primR_batch,
             gamma_rr_f, alpha_f, beta_r_f, eos
         )
-        
-        dens_factor = alpha_f * J_f
+
+        # Multiply by √ĝ α √γ to get fully densitized fluxes
+        dens_factor = sqrt_g_hat_f * alpha_f * sqrt_gamma_f
         F_batch = dens_factor[:, None] * F_phys_batch
-        
+
         return {
             'D': F_batch[:, 0],
             'Sr': F_batch[:, 1],
             'tau': F_batch[:, 2]
         }
-    
-    def _compute_stress_energy_tensor_spherical(self, rho0, vr, pressure, W, h,
-                                                alpha, beta_r, gamma_rr):
-        """
-        Compute stress-energy tensor for spherical symmetry.
-        
-        Valid for v^θ = v^φ = 0 (purely radial motion).
-        Returns only non-zero spatial components: T^{00}, T^{0r}, T^{rr}.
-        Angular components T^{θθ} = T^{φφ} = p g^{θθ/φφ} computed in source terms.
-        """
-        grr = 1.0 / gamma_rr
-        beta_u = grr * beta_r
-        ut = W / alpha
-        ur = W * (vr - beta_u / alpha)
-        
-        g00 = -1.0 / (alpha ** 2)
-        g0r = beta_u / (alpha ** 2)
-        grr_eff = grr - (beta_u ** 2) / (alpha ** 2)
-        
-        T00 = rho0 * h * ut * ut + pressure * g00
-        T0r = rho0 * h * ut * ur + pressure * g0r
-        Trr = rho0 * h * ur * ur + pressure * grr_eff
-        
-        return T00, T0r, Trr
-    
+
     def _get_mesh_spacing(self, grid, r):
+        """Get mesh spacing from grid object."""
         if hasattr(grid, 'derivs') and hasattr(grid.derivs, 'dx'):
             return float(grid.derivs.dx)
         elif hasattr(grid, 'dr'):
             return float(grid.dr)
         return float(r[1] - r[0]) if len(r) > 1 else 1.0
-    
+
     def _apply_ghost_cell_boundaries(self, D, Sr, tau, r):
+        """
+        Apply parity boundary conditions to conservative variables.
+
+        Inner boundary (r=0): Parity reflection
+            - D: even parity
+            - Sr: odd parity (radial momentum)
+            - tau: even parity
+
+        Outer boundary: Constant extrapolation
+        """
         N = len(r)
         if NUM_GHOSTS > 0:
+            # Inner boundary: parity reflection
             mir = slice(2 * NUM_GHOSTS - 1, NUM_GHOSTS - 1, -1)
-            D[:NUM_GHOSTS], Sr[:NUM_GHOSTS], tau[:NUM_GHOSTS] = D[mir], -Sr[mir], tau[mir]
+            D[:NUM_GHOSTS] = D[mir]       # Even parity
+            Sr[:NUM_GHOSTS] = -Sr[mir]    # Odd parity
+            tau[:NUM_GHOSTS] = tau[mir]   # Even parity
+
+            # Outer boundary: constant extrapolation
             last = N - NUM_GHOSTS - 1
             if last >= 0:
-                D[-NUM_GHOSTS:], Sr[-NUM_GHOSTS:], tau[-NUM_GHOSTS:] = D[last], Sr[last], tau[last]
+                D[-NUM_GHOSTS:] = D[last]
+                Sr[-NUM_GHOSTS:] = Sr[last]
+                tau[-NUM_GHOSTS:] = tau[last]
+
         return D, Sr, tau
-    
+
     def _apply_rhs_boundary_conditions(self, rhs_D, rhs_Sr, rhs_tau, r):
+        """Apply parity boundary conditions to RHS (same as state variables)."""
         N = len(r)
         if NUM_GHOSTS > 0:
+            # Inner boundary
             mir = slice(2 * NUM_GHOSTS - 1, NUM_GHOSTS - 1, -1)
-            rhs_D[:NUM_GHOSTS], rhs_Sr[:NUM_GHOSTS], rhs_tau[:NUM_GHOSTS] = rhs_D[mir], -rhs_Sr[mir], rhs_tau[mir]
+            rhs_D[:NUM_GHOSTS] = rhs_D[mir]
+            rhs_Sr[:NUM_GHOSTS] = -rhs_Sr[mir]
+            rhs_tau[:NUM_GHOSTS] = rhs_tau[mir]
+
+            # Outer boundary
             last = N - NUM_GHOSTS - 1
             if last >= 0:
-                rhs_D[-NUM_GHOSTS:], rhs_Sr[-NUM_GHOSTS:], rhs_tau[-NUM_GHOSTS:] = rhs_D[last], rhs_Sr[last], rhs_tau[last]
+                rhs_D[-NUM_GHOSTS:] = rhs_D[last]
+                rhs_Sr[-NUM_GHOSTS:] = rhs_Sr[last]
+                rhs_tau[-NUM_GHOSTS:] = rhs_tau[last]
+
         return rhs_D, rhs_Sr, rhs_tau
