@@ -109,7 +109,7 @@ class MinmodReconstruction:
             TL, TR = self.reconstruct(tau, dx=dx, x=x, boundary_type="outflow")
             # Parities at r≈0: D, tau even; Sr odd
             DL[0], DR[0] = D[0],  D[0]
-            SL[0], SR[0] = -Sr[0], Sr[0]
+            SL[0], SR[0] = 0.0,    0.0  # S_r = 0 at r=0 (odd parity)
             TL[0], TR[0] = tau[0], tau[0]
         else:
             DL, DR = self.reconstruct(D,   dx=dx, x=x, boundary_type=boundary_type)
@@ -133,7 +133,7 @@ class MinmodReconstruction:
             pL, pR = self.reconstruct(pressure, dx=dx, x=x, boundary_type="outflow")
             # Parities at r≈0: rho0, p even; v^r odd
             rL[0], rR[0] = rho0[0],  rho0[0]
-            vL[0], vR[0] = -vr[0],   vr[0]
+            vL[0], vR[0] = 0.0,      0.0  # v^r = 0 at r=0 (odd parity)
             pL[0], pR[0] = pressure[0], pressure[0]
         else:
             rL, rR = self.reconstruct(rho0,    dx=dx, x=x, boundary_type=boundary_type)
@@ -414,7 +414,7 @@ class HighOrderReconstruction:
             TL, TR = self.reconstruct(tau, dx=dx, x=x, boundary_type="outflow")
             # Parities at r≈0: D, tau even; Sr odd
             DL[0], DR[0] = D[0],  D[0]
-            SL[0], SR[0] = -Sr[0], Sr[0]
+            SL[0], SR[0] = 0.0,    0.0  # S_r = 0 at r=0 (odd parity)
             TL[0], TR[0] = tau[0], tau[0]
         else:
             DL, DR = self.reconstruct(D,   dx=dx, x=x, boundary_type=boundary_type)
@@ -438,7 +438,7 @@ class HighOrderReconstruction:
             pL, pR = self.reconstruct(pressure, dx=dx, x=x, boundary_type="outflow")
             # Parities at r≈0: rho0, p even; v^r odd
             rL[0], rR[0] = rho0[0],  rho0[0]
-            vL[0], vR[0] = -vr[0],   vr[0]
+            vL[0], vR[0] = 0.0,      0.0  # v^r = 0 at r=0 (odd parity)
             pL[0], pR[0] = pressure[0], pressure[0]
         else:
             rL, rR = self.reconstruct(rho0,    dx=dx, x=x, boundary_type=boundary_type)

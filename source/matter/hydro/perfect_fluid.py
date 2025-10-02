@@ -54,7 +54,7 @@ class PerfectFluid:
             "p_floor": 1e-15,
             "v_max": 0.999999,
             "tol": 1e-10,
-            "max_iter": 100
+            "max_iter": 200
         }
 
         # State variables (engrenage pattern)

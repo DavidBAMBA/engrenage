@@ -356,8 +356,8 @@ def test_riemann_sod():
     # Lista de métodos de reconstrucción a probar
     methods = ["minmod", "mp5"]#, "weno5", "wenoz", "mp5_hires"]
     colors = ["lightcoral", "lightblue",]# "lightgreen", "moccasin", "black"]
-    labels = ["MINMOD", "MP5"]#, "WENO5", "WENO-Z", "MP5 (Hi-Res)"]
-    linestyles = ["--", "--"]#, "--", "--", "-"]  # Punteadas para baja res, continua para alta res
+    labels = ["Minmod", "MP5"]#, "WENO5", "WENO-Z", "MP5 (Hi-Res)"]
+    linestyles = ["--", "-"]#, "--", "--", "-"]  # Punteadas para baja res, continua para alta res
 
     # Guardar resultados para cada método
     results = {}
@@ -367,7 +367,7 @@ def test_riemann_sod():
 
         # Para MP5 alta resolución, usar más puntos
         if method == "mp5_hires":
-            grid_hires, Nin_hires = build_engrenage_grid(n_interior=200, r_min=1e-3, r_max=1.0)
+            grid_hires, Nin_hires = build_engrenage_grid(n_interior=100, r_min=1e-3, r_max=1.0)
             r_hires = grid_hires.r
             N_hires = len(r_hires)
 
