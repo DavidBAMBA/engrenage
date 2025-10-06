@@ -36,6 +36,12 @@ from source.matter.hydro.eos import PolytropicEOS
 from source.matter.hydro.reconstruction import create_reconstruction
 from source.matter.hydro.riemann import HLLERiemannSolver
 from source.matter.hydro.cons2prim import prim_to_cons
+
+# ------------------------------------------------------------------
+# Toggle: freeze the energy equation (tau) – barotropic/Cowling helper
+# When True, sets d(tau)/dt = 0 in the hydro RHS (no energy evolution).
+# ------------------------------------------------------------------
+FREEZE_TAU = True
 from examples.tov_solver import TOVSolver
 
 def create_initial_data(tov_solution, grid, background, eos, atmosphere_rho):
@@ -283,6 +289,10 @@ def get_rhs_cowling(t, y, grid, background, hydro, bssn_fixed, bssn_d1_fixed):
     hydro.set_matter_vars(state, bssn_vars, grid)
 
     hydro_rhs = hydro.get_matter_rhs(grid.r, bssn_vars, bssn_d1_fixed, background)
+    # Optionally freeze energy equation (barotropic Cowling test)
+    if FREEZE_TAU:
+        # hydro_rhs shape: (3, N) ordering [dD/dt, dS_r/dt, dτ/dt]
+        hydro_rhs[2, :] = 0.0
 
     # Full RHS (BSSN frozen, only hydro evolves)
     rhs = np.zeros_like(state)
@@ -606,7 +616,7 @@ def main():
     # ==================================================================
     print("Solving TOV equations on evolution grid (no interpolation)...")
     tov_solver = TOVSolver(K=K, Gamma=Gamma, use_isotropic=True)
-    r_positive = grid.r[grid.r > 0]  # Only use positive radii for TOV
+    r_positive = grid.r[NUM_GHOSTS:]  # use interior positive radii (exclude ghosts) for TOV
     tov_solution = tov_solver.solve(rho_central, r_grid=r_positive, r_max=r_max)
 
     print(f"TOV Solution: M={tov_solution['M_star']:.6f}, R={tov_solution['R']:.3f}, C={tov_solution['C']:.4f}\n")

@@ -447,9 +447,11 @@ class ValenciaReferenceMetric:
         """
         N = len(r)
 
-        # Reconstruct primitives to left/right states at interfaces
+        # Reconstruct primitives to left/right states at interfaces.
+        # Map Valencia boundary_mode to reconstructor boundary_type
+        recon_boundary = "reflecting" if self.boundary_mode == "parity" else "outflow"
         (rhoL, vL, pL), (rhoR, vR, pR) = reconstructor.reconstruct_primitive_variables(
-            rho0, vr, pressure, x=r, boundary_type="reflecting"
+            rho0, vr, pressure, x=r, boundary_type=recon_boundary
         )
 
         # Extract interior faces (exclude ghost zones)
@@ -462,6 +464,20 @@ class ValenciaReferenceMetric:
         gamma_rr_f = 0.5 * (g['gamma_rr'][:-1] + g['gamma_rr'][1:])
         sqrt_gamma_f = 0.5 * (g['sqrt_gamma'][:-1] + g['sqrt_gamma'][1:])
         sqrt_g_hat_f = g['sqrt_g_hat_face']
+
+        # Enforce a strictly reflecting condition at the first physical interior face
+        # (between the first two interior cells) to avoid tiny asymmetries at r≈0.
+        if recon_boundary == "reflecting" and (len(vL) > NUM_GHOSTS):
+            k0 = NUM_GHOSTS  # interface between cells NUM_GHOSTS and NUM_GHOSTS+1 after [1:-1] trim
+            if k0 < len(vL):
+                vL[k0] = 0.0
+                vR[k0] = 0.0
+                rho_ref = rho0[NUM_GHOSTS]
+                p_ref = pressure[NUM_GHOSTS]
+                rhoL[k0] = rho_ref
+                rhoR[k0] = rho_ref
+                pL[k0] = p_ref
+                pR[k0] = p_ref
 
         # Apply physical limiters if available
         if hasattr(reconstructor, "apply_physical_limiters"):
