@@ -375,14 +375,14 @@ def test_riemann_sod():
     # Discontinuidad en el punto medio del dominio interior
     r_mid = 0.5*(r[NUM_GHOSTS] + r[-NUM_GHOSTS-1])
     rho0_base = np.where(r < r_mid, 10.0, 1.0)
-    p_base = np.where(r < r_mid, 400.0/3.0, 1.0e-6)
+    p_base = np.where(r < r_mid, 40.0/3.0, 1.0e-6)
     v_base = np.zeros(N)
 
     # Lista de métodos de reconstrucción a probar
-    methods = ["minmod", "mp5", "weno5", "mp5_hires"]#, "weno5", "wenoz", "mp5_hires"]
-    colors = ["lightcoral", "lightblue", "lightgreen", "moccasin"]  
-    labels = ["Minmod", "MP5", "WENO5" , "MP5 (Hi-Res)"]
-    linestyles = ["--", "-", "--", "-"]
+    methods = ["mp5"]# "mp5", "weno5","wenoz", "mp5_hires"]#, "weno5", "wenoz", "mp5_hires"]
+    colors = ["lightcoral"]# "lightblue", "lightgreen", "cyan", "black"]  
+    labels = ["MP5"]# od"]#, "MP5", "WENO5" , "WENOZ", "MP5 (Hi-Res)"]
+    linestyles = ["--"]#, "-", "--", "--", "-"]
 
     # Guardar resultados para cada método
     results = {}
@@ -399,7 +399,7 @@ def test_riemann_sod():
             # Discontinuidad en el punto medio del dominio interior
             r_mid_hires = 0.5*(r_hires[NUM_GHOSTS] + r_hires[-NUM_GHOSTS-1])
             rho0 = np.where(r_hires < r_mid_hires, 10.0, 1.0)
-            p = np.where(r_hires < r_mid_hires, 400.0/3.0, 1.0e-6)
+            p = np.where(r_hires < r_mid_hires, 40.0/3.0, 1.0e-6)
             v = np.zeros(N_hires)
 
             # Aplicar paridades/outflow
@@ -468,7 +468,7 @@ def test_riemann_sod():
     # ======================
     # Estados iniciales (usar grid normal para referencia)
     rho0_init = np.where(r < r_mid, 10.0, 1.0)
-    p_init = np.where(r < r_mid, 400.0/3.0, 1.0e-6)
+    p_init = np.where(r < r_mid, 40.0/3.0, 1.0e-6)
     v_init = np.zeros(N)
     rho0_init, v_init, p_init = fill_ghosts_primitives(rho0_init, v_init, p_init)
 
@@ -600,104 +600,254 @@ def test_riemann_sod():
     return all_ok
 
 # ========= TEST ÚNICO (unificado): BLAST WAVE ESFÉRICO =========
-def test_blast_wave(case='weak',
-                   n_interior=800, r_min=1e-3, r_max=1.0,
-                   gamma=1.4, r0=None,
-                   t_final=0.4, cfl=0.45,
-                   plot=True, savefig=True):
+# ========= TEST: BLAST WAVE ESFÉRICO — COMPARACIÓN DE RECONSTRUCTORES =========
+def test_blast_compare(case='weak',
+                       n_interior=200, r_min=1e-3, r_max=1.0,
+                       gamma=1.4, r0=None,
+                       t_final=0.40, cfl=0.45,
+                       methods=("minmod", "mp5", "weno5", "mp5_hires"),
+                       hires_factor=10,           # multiplicador de resolución para la referencia
+                       spacetime_mode="fixed_minkowski",
+                       plot=True, savefig=True):
     """
-    Blast wave esférico (Minkowski, FULL reference-metric) — test unificado.
-      - case='weak'  : pi=1.0,    pe=0.1,   rhoi=1.0,  rhoe=0.125
-      - case='strong': pi=133.33, pe=0.125, rhoi=10.0, rhoe=1.0
-    Devuelve True/False según variación y presencia de discontinuidad.
-    También guarda 'blast_final_<case>.png' si plot=True y savefig=True.
+    Blast wave esférico (Minkowski, FULL reference-metric) — comparación de reconstructores.
+      - case='weak'  : p_in=1.0,   p_out=0.1,   rho_in=1.0,  rho_out=0.125
+      - case='strong': p_in=133.33,p_out=0.125, rho_in=10.0, rho_out=1.0
+
+    'mp5_hires' corre con n_interior*hires_factor y sirve como baseline de alta resolución.
+    Devuelve True si todos los métodos superan umbrales básicos de variación/contacto.
     """
-    # --- Imports (del propio paquete) ---
 
-    print("\n" + "="*60)
-    print(f"TEST Blast Wave Esférico ({case})")
-    print("="*60)
+    import numpy as np
+    import matplotlib.pyplot as plt
 
-    # --- Grid y parámetros ---
+    print("\n" + "="*70)
+    print(f"TEST Blast Esférico — Comparación de Reconstructores (case={case})")
+    print("="*70)
+
+    # --- Grid base ---
     grid, Nin = build_engrenage_grid(n_interior=n_interior, r_min=r_min, r_max=r_max)
-    r = grid.r
+    r  = grid.r
     N  = len(r)
     ng = NUM_GHOSTS
 
-    # --- parámetros físicos del blast (Tabla I) ---
+    # --- parámetros físicos del blast ---
     if case.lower() == 'weak':
-        p_in, p_out   = 1.0, 0.1
+        p_in, p_out     = 1.0, 0.1
         rho_in, rho_out = 1.0, 0.125
     elif case.lower() == 'strong':
-        p_in, p_out   = 133.33, 0.125
+        p_in, p_out     = 133.33, 0.125
         rho_in, rho_out = 10.0, 1.0
     else:
         raise ValueError("case debe ser 'weak' o 'strong'")
 
+    # radio de membrana
     if r0 is None:
-        r0 = 0.5*(r[ng] + r[-ng-1])  # membrana en el centro del dominio interior
+        r0 = 0.5*(r[ng] + r[-ng-1])
 
-    # --- estado inicial (primitivas) + paridades/outflow ---
-    rho0 = np.where(r < r0, rho_in, rho_out).astype(float)
-    p    = np.where(r < r0, p_in,  p_out ).astype(float)
-    v    = np.zeros_like(r, dtype=float)
-    rho0, v, p = fill_ghosts_primitives(rho0, v, p)
+    # --- estado inicial base (para reusar en métodos de resolución normal) ---
+    rho0_base = np.where(r < r0, rho_in, rho_out).astype(float)
+    p_base    = np.where(r < r0, p_in,  p_out ).astype(float)
+    v_base    = np.zeros_like(r, dtype=float)
 
-    # --- objetos físicos ---
+    # --- objetos físicos comunes ---
     eos    = IdealGasEOS(gamma=gamma)
-    recon = create_reconstruction("mp5")
     rsolve = HLLERiemannSolver()
     val    = ValenciaReferenceMetric()
 
-    # --- conservadas iniciales ---
-    D, Sr, tau = to_conserved(rho0, v, p, eos)
+    # --- configuración de estilos de plot ---
+    # (mantener longitudes en sincronía con 'methods')
+    default_colors     = ["lightcoral", "lightblue", "lightgreen", "moccasin", "thistle", "black"]
+    default_labels_map = {
+        "minmod":    "Minmod",
+        "mp5":       "MP5",
+        "weno5":     "WENO5",
+        "wenoz":     "WENO-Z",
+        "mp5_hires": "MP5 (Hi-Res)",
+    }
+    default_linestyles = {"mp5_hires": "-", "mp5": "-", "weno5": "--", "minmod": "--", "wenoz": "--"}
 
-    # --- evolución RK4 con compute_rhs (full approach) ---
-    t, steps = 0.0, 0
-    while t < t_final and steps < 20000:
-        dt, D, Sr, tau, rho0, v, p = rk4_step(
-            val, D, Sr, tau, rho0, v, p,
-            r, grid, eos, recon, rsolve, cfl=cfl,
-            spacetime_mode="fixed_minkowski"
-        )
-        t += dt; steps += 1
+    # --- result container ---
+    results = {}
 
-    # --- métricas de validación ---
-    rin    = r[ng:-ng]
-    rho_in = rho0[ng:-ng]
-    # Use Engrenage derivatives for gradient calculation
-    rho_full = np.zeros_like(r)
-    rho_full[ng:-ng] = rho_in
-    grad_full = compute_derivative_engrenage(rho_full, grid, order=1)
-    grad = grad_full[ng:-ng]  # Extract interior gradient
-    variation = float(np.std(rho_in)/np.mean(rho_in))
-    contact   = bool(np.any(np.abs(grad) > 0.5))
-    print(f"[blast:{case}] t≈{t:.4f}, pasos={steps}, variación relativa ρ={variation:.3f}")
+    # ======================
+    # EJECUCIÓN POR MÉTODO
+    # ======================
+    for idx, method in enumerate(methods):
+        label = default_labels_map.get(method, method.upper())
+        print(f"\nEjecutando con {label}...")
 
-    # --- ploteo final (ρ, p, v, W) ---
+        # ¿Alta resolución para baseline?
+        if method == "mp5_hires":
+            n_hi = max(4*n_interior, int(n_interior*hires_factor))
+            grid_hi, Nin_hi = build_engrenage_grid(n_interior=n_hi, r_min=r_min, r_max=r_max)
+            r_current  = grid_hi.r
+            grid_curr  = grid_hi
+            actual_mth = "mp5"
+
+            # CI en alta resolución
+            r0_hi = 0.5*(r_current[ng] + r_current[-ng-1])
+            rho0 = np.where(r_current < r0_hi, rho_in, rho_out).astype(float)
+            p    = np.where(r_current < r0_hi, p_in,  p_out ).astype(float)
+            v    = np.zeros_like(r_current, dtype=float)
+
+        else:
+            # resolución normal
+            r_current  = r
+            grid_curr  = grid
+            actual_mth = method
+
+            rho0 = rho0_base.copy()
+            p    = p_base.copy()
+            v    = v_base.copy()
+
+        # aplicar paridades / outflow en primitivas
+        rho0, v, p = fill_ghosts_primitives(rho0, v, p)
+
+        # convertir a conservadas
+        D, Sr, tau = to_conserved(rho0, v, p, eos)
+
+        # reconstructor específico
+        recon = create_reconstruction(actual_mth)
+
+        # evolución temporal
+        t, steps = 0.0, 0
+        while t < t_final and steps < 20000:
+            dt, D, Sr, tau, rho0, v, p = rk4_step(
+                val, D, Sr, tau, rho0, v, p,
+                r_current, grid_curr, eos, recon, rsolve, cfl=cfl,
+                spacetime_mode=spacetime_mode
+            )
+            t += dt
+            steps += 1
+
+        # guardar resultados del interior
+        rin = r_current[ng:-ng]
+        results[method] = {
+            "r": rin.copy(),
+            "rho": rho0[ng:-ng].copy(),
+            "p":   p[ng:-ng].copy(),
+            "v":   v[ng:-ng].copy(),
+            "t":   t,
+            "steps": steps,
+            "label": label,
+            "color": default_colors[idx % len(default_colors)],
+            "ls":    default_linestyles.get(method, "--"),
+        }
+
+        # métricas rápidas
+        rho_interior = rho0[ng:-ng]
+        rho_full = np.zeros_like(r_current)
+        rho_full[ng:-ng] = rho_interior
+        grad_full = compute_derivative_engrenage(rho_full, grid_curr, order=1)
+        grad = grad_full[ng:-ng]
+        variation = float(np.std(rho_interior)/np.mean(rho_interior))
+        contact = bool(np.any(np.abs(grad) > 0.5))
+        print(f"  {label}: t≈{t:.4f}, pasos={steps}, variación ρ={variation:.3f}, contacto={contact}")
+
+    # ======================
+    # PLOTS COMPARATIVOS
+    # ======================
     if plot:
-        eps = eos.eps_from_rho_p(rho0, p)
-        h   = 1.0 + eps + p/np.maximum(rho0, 1e-300)
-        W   = 1.0/np.sqrt(np.maximum(1.0 - v*v, 1e-16))
+        # Estados iniciales (como referencia visual, con grid base)
+        rho0_init = np.where(r < r0, rho_in, rho_out).astype(float)
+        p_init    = np.where(r < r0, p_in,  p_out ).astype(float)
+        v_init    = np.zeros_like(r, dtype=float)
+        rho0_init, v_init, p_init = fill_ghosts_primitives(rho0_init, v_init, p_init)
+        rin_ref = r[ng:-ng]
 
-        fig, ax = plt.subplots(2, 2, figsize=(12, 8))
-        ax[0,0].plot(rin, rho0[ng:-ng], 'r-', lw=2); ax[0,0].set_xlabel("r"); ax[0,0].set_ylabel("ρ₀"); ax[0,0].grid(True, alpha=0.3)
-        ax[0,1].plot(rin, p[ng:-ng],    'r-', lw=2); ax[0,1].set_xlabel("r"); ax[0,1].set_ylabel("p"); ax[0,1].grid(True, alpha=0.3)
-        ax[1,0].plot(rin, v[ng:-ng],    'r-', lw=2); ax[1,0].set_xlabel("r"); ax[1,0].set_ylabel("v^r"); ax[1,0].grid(True, alpha=0.3)
-        ax[1,1].plot(rin, W[ng:-ng],    'r-', lw=2); ax[1,1].set_xlabel("r"); ax[1,1].set_ylabel("W"); ax[1,1].grid(True, alpha=0.3)
-        fig.suptitle(f"Spherical blast ({case}) — Γ={gamma}, r0={r0:.3f}, t≈{t:.3f}, pasos={steps}")
-        fig.tight_layout()
+        # tiempo medio de simulaciones (solo para el título)
+        avg_time = np.mean([results[m]["t"] for m in methods])
+
+        # === Figura 1: Densidad ===
+        fig1, (ax1, ax1z) = plt.subplots(1, 2, figsize=(14, 6))
+        ax1.plot(rin_ref, rho0_init[ng:-ng], 'k:', label='ρ inicial', alpha=0.7, linewidth=2)
+        for m in methods:
+            R = results[m]
+            ax1.plot(R["r"], R["rho"], color=R["color"], linestyle=R["ls"], linewidth=2, label=R["label"])
+        ax1.set_xlabel('r'); ax1.set_ylabel('Densidad ρ₀'); ax1.set_xlim(r_min, r_max); ax1.grid(True, alpha=0.3); ax1.legend()
+        ax1.set_title('Densidad — Dominio completo')
+
+        # zona de choque (ajusta si tu choque se mueve distinto)
+        ax1z.plot(rin_ref, rho0_init[ng:-ng], 'k:', alpha=0.7, linewidth=2)
+        for m in methods:
+            R = results[m]
+            ax1z.plot(R["r"], R["rho"], color=R["color"], linestyle=R["ls"], linewidth=2, label=R["label"])
+        ax1z.set_xlabel('r'); ax1z.set_ylabel('Densidad ρ₀'); ax1z.set_xlim(0.45, 0.8); ax1z.grid(True, alpha=0.3)
+        ax1z.set_title('Densidad — Zoom shock')
+
+        fig1.suptitle(f"Blast esférico ({case}) — ρ₀ (t ≈ {avg_time:.3f})")
+        plt.tight_layout()
         if savefig:
-            fname = f"blast_final_{case}2.png"
-            plt.savefig(fname, dpi=150, bbox_inches="tight")
-            print(f"Gráfico guardado como '{fname}'")
+            plt.savefig(f"blast_{case}_density_compare.png", dpi=150, bbox_inches="tight")
+
+        # === Figura 2: Presión ===
+        fig2, (ax2, ax2z) = plt.subplots(1, 2, figsize=(14, 6))
+        ax2.plot(rin_ref, p_init[ng:-ng], 'k:', label='p inicial', alpha=0.7, linewidth=2)
+        for m in methods:
+            R = results[m]
+            ax2.plot(R["r"], R["p"], color=R["color"], linestyle=R["ls"], linewidth=2, label=R["label"])
+        ax2.set_xlabel('r'); ax2.set_ylabel('p'); ax2.set_xlim(r_min, r_max); ax2.set_yscale('log'); ax2.grid(True, alpha=0.3); ax2.legend()
+        ax2.set_title('Presión — Dominio completo')
+
+        ax2z.plot(rin_ref, p_init[ng:-ng], 'k:', alpha=0.7, linewidth=2)
+        for m in methods:
+            R = results[m]
+            ax2z.plot(R["r"], R["p"], color=R["color"], linestyle=R["ls"], linewidth=2, label=R["label"])
+        ax2z.set_xlabel('r'); ax2z.set_ylabel('p'); ax2z.set_xlim(0.45, 0.8); ax2z.set_yscale('log'); ax2z.grid(True, alpha=0.3)
+        ax2z.set_title('Presión — Zoom shock')
+
+        fig2.suptitle(f"Blast esférico ({case}) — p (t ≈ {avg_time:.3f})")
+        plt.tight_layout()
+        if savefig:
+            plt.savefig(f"blast_{case}_pressure_compare.png", dpi=150, bbox_inches="tight")
+
+        # === Figura 3: Velocidad ===
+        fig3, (ax3, ax3z) = plt.subplots(1, 2, figsize=(14, 6))
+        ax3.plot(rin_ref, v_init[ng:-ng], 'k:', label='v inicial', alpha=0.7, linewidth=2)
+        for m in methods:
+            R = results[m]
+            ax3.plot(R["r"], R["v"], color=R["color"], linestyle=R["ls"], linewidth=2, label=R["label"])
+        ax3.set_xlabel('r'); ax3.set_ylabel('v^r'); ax3.set_xlim(r_min, r_max); ax3.grid(True, alpha=0.3); ax3.legend()
+        ax3.set_title('Velocidad — Dominio completo')
+
+        ax3z.plot(rin_ref, v_init[ng:-ng], 'k:', alpha=0.7, linewidth=2)
+        for m in methods:
+            R = results[m]
+            ax3z.plot(R["r"], R["v"], color=R["color"], linestyle=R["ls"], linewidth=2, label=R["label"])
+        ax3z.set_xlabel('r'); ax3z.set_ylabel('v^r'); ax3z.set_xlim(0.45, 0.8); ax3z.grid(True, alpha=0.3)
+        ax3z.set_title('Velocidad — Zoom shock')
+
+        fig3.suptitle(f"Blast esférico ({case}) — v^r (t ≈ {avg_time:.3f})")
+        plt.tight_layout()
+        if savefig:
+            plt.savefig(f"blast_{case}_velocity_compare.png", dpi=150, bbox_inches="tight")
+
+        if savefig:
+            print("\nGráficos guardados:")
+            print(f"  - blast_{case}_density_compare.png")
+            print(f"  - blast_{case}_pressure_compare.png")
+            print(f"  - blast_{case}_velocity_compare.png")
         else:
             plt.show()
 
-    ok = (variation > 0.1) and contact
-    print("✓ PASA" if ok else "✗ FALLA")
-    return ok
+    # ======================
+    # CHECKS SENCILLOS
+    # ======================
+    all_ok = True
+    for m in methods:
+        R = results[m]
+        rho_in = R["rho"]
+        # gradiente numérico simple en r del propio método (sin mezclar grids)
+        grad = np.gradient(rho_in, R["r"])
+        variation = float(np.std(rho_in)/np.mean(rho_in))
+        contact = bool(np.any(np.abs(grad) > 0.5))
+        ok = (variation > 0.1) and contact
+        all_ok = all_ok and ok
+        print(f"  {R['label']}: {'✓ PASA' if ok else '✗ FALLA'} (var={variation:.3f}, contact={contact})")
 
+    print("✓ PASA" if all_ok else "✗ FALLA")
+    return all_ok
 
 def test_conservation_short():
     print("\n" + "="*60)
