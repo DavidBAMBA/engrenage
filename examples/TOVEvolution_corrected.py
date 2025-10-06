@@ -141,15 +141,18 @@ def create_initial_data(tov_solution, grid, background, eos, atmosphere_rho):
     state_2d = np.zeros((grid.NUM_VARS, grid.N))
 
     for i, r in enumerate(grid.r):
-        # Physical metric from TOV (in isotropic coordinates)
-        # γ_rr = exp(4φ_TOV), γ_θθ = r² exp(4φ_TOV), γ_φφ = r² sin²θ exp(4φ_TOV)
+        # Physical metric from TOV (in Schwarzschild/polar coordinates)
+        # γ_rr = exp(4φ_TOV) = 1/(1-2M/r), γ_θθ = r², γ_φφ = r² sin²θ
         exp4phi_tov = exp4phi_grid[i]
         gamma_phys_rr = exp4phi_tov
-        gamma_phys_thth = r**2 * exp4phi_tov
-        gamma_phys_phph = r**2 * exp4phi_tov  # sin²θ = 1 in equatorial plane
+        gamma_phys_thth = r**2
+        gamma_phys_phph = r**2  # sin²θ = 1 in equatorial plane
 
-        # In isotropic coordinates, γ_ij = e^{4φ} ĝ_ij ⇒ φ = 0.25 ln(e^{4φ})
-        phi = 0.25 * np.log(max(exp4phi_tov, 1e-300))
+        # BSSN conformal factor: det(γ̄_ij) = det(ĝ_ij) with γ̄_ij = e^(-4φ) γ_ij
+        # det(γ̄) = e^(-12φ) det(γ) = det(ĝ)
+        # In Schwarzschild: det(γ) = exp4phi_tov * r⁴, det(ĝ) = r⁴
+        # Therefore: e^(-12φ) * exp4phi_tov * r⁴ = r⁴ → e^(12φ) = exp4phi_tov
+        phi = np.log(max(exp4phi_tov, 1e-300)) / 12.0
 
         # Conformal metric: γ̄_ij = e^(-4φ) γ_ij
         exp_minus_4phi = np.exp(-4.0 * phi)
@@ -190,7 +193,8 @@ def create_initial_data(tov_solution, grid, background, eos, atmosphere_rho):
         rho = max(rho_grid[i], atmosphere_rho)
         P = max(P_grid[i], p_atm)
 
-        # Use physical metric from TOV for cons2prim (isotropic coordinates)
+        # Use physical metric from TOV for prim_to_cons (Schwarzschild coordinates)
+        # γ_rr = exp4phi = 1/(1-2M/r) in Schwarzschild
         gamma_rr_phys = exp4phi_grid[i]
         D, Sr, tau = prim_to_cons(rho, 0.0, P, gamma_rr_phys, eos)
 
@@ -660,7 +664,7 @@ def main():
         eos=eos,
         spacetime_mode="dynamic",
         atmosphere_rho=atmosphere_rho,
-        reconstructor=create_reconstruction("mp5"),
+        reconstructor=create_reconstruction("minmod"),
         riemann_solver=HLLERiemannSolver()
     )
 
@@ -676,7 +680,8 @@ def main():
     # SOLVE TOV
     # ==================================================================
     print("Solving TOV equations on evolution grid (no interpolation)...")
-    tov_solver = TOVSolver(K=K, Gamma=Gamma, use_isotropic=True)
+    # Use Schwarzschild coordinates (use_isotropic=False) to get full domain coverage
+    tov_solver = TOVSolver(K=K, Gamma=Gamma, use_isotropic=False)
     r_positive = grid.r[NUM_GHOSTS:]  # use interior positive radii (exclude ghosts) for TOV
     tov_solution = tov_solver.solve(rho_central, r_grid=r_positive, r_max=r_max)
 
@@ -708,7 +713,7 @@ def main():
 
     if integration_method == 'fixed':
         dt = 0.15 * grid.min_dr  # CFL condition
-        num_steps = 10
+        num_steps = 100
         print(f"\nEvolving with fixed dt={dt:.6f} (CFL=0.15) for {num_steps} steps using RK4")
 
         # Single step for comparison

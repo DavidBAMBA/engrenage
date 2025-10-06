@@ -156,13 +156,11 @@ class ValenciaReferenceMetric:
             conn_tau = -np.einsum('xj,xj->x', Gamma_trace, fTau_U) / (sqrt_g_hat + 1e-30)
 
             # Momentum: (Γ̂^j_{jl} F^l_i - Γ̂^l_{ji} F^j_l) / √ĝ (NRPy+ line 383-386)
-            conn_S_vector = np.zeros((N, SPACEDIM))
-            for i in range(SPACEDIM):
-                conn_S_vector[:, i] = (
-                    -np.einsum('xjjl,xli->x', hat_chris, fS_mixed) / (sqrt_g_hat + 1e-30)
-                    + np.einsum('xlji,xjl->x', hat_chris, fS_mixed) / (sqrt_g_hat + 1e-30)
-                )
-
+            # CORRECTO
+            conn_S_vector = (
+                -np.einsum('xjjl,xli->xi', hat_chris, fS_mixed) / (sqrt_g_hat[:, None] + 1e-30)
+                + np.einsum('xlji,xjl->xi', hat_chris, fS_mixed) / (sqrt_g_hat[:, None] + 1e-30)
+            )
             conn_Sr = conn_S_vector[:, i_r]
 
             # Add connection terms to RHS
@@ -238,10 +236,8 @@ class ValenciaReferenceMetric:
                 )
 
         # Lower second index: T^i_j = T^{ik} γ_{kj} (NRPy+ line 194-198)
-        T4UD = np.zeros((N, SPACEDIM, SPACEDIM))
-        for i in range(SPACEDIM):
-            for j in range(SPACEDIM):
-                T4UD[:, i, j] = np.einsum('xk,xkj->x', TUU_spatial[:, i, :], gamma_LL)
+        # Correct contraction over k only, preserving j index
+        T4UD = np.einsum('xik,xkj->xij', TUU_spatial, gamma_LL)
 
         return T4UD
 
@@ -329,7 +325,8 @@ class ValenciaReferenceMetric:
         hatD_beta_U = dbeta_dx + np.einsum('xjik,xk->xij', hat_chris, beta_U)
 
         # Covariant derivative of metric: ∇̂_i γ_{jk} (NRPy+ line 407-415)
-        # ∇̂_i γ_{jk} = e^{4φ} [4 γ̄_{jk} ∂_i φ + ∇̂_i γ̄_{jk}]
+        # ∇̂_i γ_{jk} = e^{-4φ} [4 γ̄_{jk} ∂_i φ + ∂_i γ̄_{jk} - Γ̂^l_{ij} γ̄_{lk} - Γ̂^l_{ik} γ̄_{jl}]
+        # Note: Final result is then multiplied by e^{4φ} to get physical metric derivative
         dphi_dx = np.zeros((N, SPACEDIM))
         if hasattr(bssn_d1, 'phi') and bssn_d1.phi is not None:
             dphi_dx = np.asarray(bssn_d1.phi)
@@ -340,10 +337,19 @@ class ValenciaReferenceMetric:
         for i in range(SPACEDIM):
             for j in range(SPACEDIM):
                 for k in range(SPACEDIM):
-                    hatD_gamma_LL[:, i, j, k] = e4phi * (
+                    # Start with partial derivatives and phi term
+                    hatD_gamma_LL[:, i, j, k] = (
                         4.0 * bar_gamma_LL[:, j, k] * dphi_dx[:, i]
                         + hat_D_bar_gamma[:, j, k, i]
                     )
+                    # Subtract Christoffel correction terms (NRPy+ line 412-415)
+                    for l in range(SPACEDIM):
+                        hatD_gamma_LL[:, i, j, k] -= (
+                            hat_chris[:, l, i, j] * bar_gamma_LL[:, l, k]
+                            + hat_chris[:, l, i, k] * bar_gamma_LL[:, j, l]
+                        )
+                    # Multiply by e^{4φ} to get physical metric derivative
+                    hatD_gamma_LL[:, i, j, k] *= e4phi
 
         # Extrinsic curvature K_ij = e^{4φ} Ā_ij + (K/3) γ_ij (NRPy+ line 336)
         K = np.asarray(bssn_vars.K, dtype=float)
@@ -572,12 +578,18 @@ class ValenciaReferenceMetric:
                     tau[-NUM_GHOSTS:] = tau[last]
             else:
                 # Parity mode (default)
-                # Inner boundary: parity reflection (apply only at inner boundary)
+                # Inner boundary: parity reflection
                 mir = slice(2 * NUM_GHOSTS - 1, NUM_GHOSTS - 1, -1)
                 D[:NUM_GHOSTS] = D[mir]       # Even parity
                 Sr[:NUM_GHOSTS] = -Sr[mir]    # Odd parity
                 tau[:NUM_GHOSTS] = tau[mir]   # Even parity
-                # Do not enforce outer BC on conservatives here; primitives/flux BC handle it.
+                
+                # Outer boundary: constant extrapolation
+                last = N - NUM_GHOSTS - 1
+                if last >= 0:
+                    D[-NUM_GHOSTS:] = D[last]
+                    Sr[-NUM_GHOSTS:] = Sr[last]
+                    tau[-NUM_GHOSTS:] = tau[last]
 
         return D, Sr, tau
 
@@ -613,3 +625,4 @@ class ValenciaReferenceMetric:
                     rhs_tau[-NUM_GHOSTS:] = rhs_tau[last]
 
         return rhs_D, rhs_Sr, rhs_tau
+

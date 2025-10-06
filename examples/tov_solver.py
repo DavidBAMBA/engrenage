@@ -428,15 +428,15 @@ def _cli():
     import argparse
 
     p = argparse.ArgumentParser(description='Solve TOV and plot solution.')
-    p.add_argument('--K', type=float, default=100.0)
+    p.add_argument('--K', type=float, default=1.0)
     p.add_argument('--Gamma', type=float, default=2.0)
-    p.add_argument('--rho_central', type=float, default=1.28e-3)
+    p.add_argument('--rho_central', type=float, default=0.42)
     p.add_argument('--r_max', type=float, default=20.0)
     p.add_argument('--num_points', type=int, default=1000)
     p.add_argument('--make_A_comparison', action='store_true', help='Also plot A(r) comparison like TOV (1).py')
     args = p.parse_args()
 
-    solver = TOVSolver(K=args.K, Gamma=args.Gamma, use_isotropic=True)
+    solver = TOVSolver(K=args.K, Gamma=args.Gamma, use_isotropic=False)
     r_grid = np.linspace(0.001, args.r_max, args.num_points)
     sol = solver.solve(rho_central=args.rho_central, r_grid=r_grid, r_max=args.r_max)
 
