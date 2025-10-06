@@ -22,11 +22,12 @@ sys.path.insert(0, '/home/yo/repositories/engrenage')
 from source.core.grid import Grid
 from source.core.spacing import LinearSpacing, NUM_GHOSTS
 from source.core.statevector import StateVector
-from source.backgrounds.sphericalbackground import FlatSphericalBackground, i_r
+from source.backgrounds.sphericalbackground import FlatSphericalBackground, i_r, i_t, i_p
 
 # BSSN
 from source.bssn.bssnvars import BSSNVars
-from source.bssn.bssnstatevariables import NUM_BSSN_VARS, idx_lapse
+from source.bssn.bssnstatevariables import (NUM_BSSN_VARS, idx_phi, idx_hrr, idx_htt, idx_hpp,
+                                             idx_K, idx_arr, idx_att, idx_app, idx_lapse)
 from source.bssn.tensoralgebra import get_bar_gamma_LL
 
 # Hydro
@@ -38,11 +39,12 @@ from source.matter.hydro.cons2prim import prim_to_cons
 
 
 class TOVSolver:
-    """TOV solver in polar (Schwarzschild) coordinates."""
+    """TOV solver with isotropic coordinates (following NRPy+ implementation)."""
 
-    def __init__(self, K, Gamma):
+    def __init__(self, K, Gamma, use_isotropic=True):
         self.K = K
         self.Gamma = Gamma
+        self.use_isotropic = use_isotropic
 
     def eos_pressure(self, rho_baryon):
         return self.K * rho_baryon**self.Gamma
@@ -59,23 +61,50 @@ class TOVSolver:
         eps = P / ((self.Gamma - 1.0) * rho_b) if rho_b > 0 else 0.0
         return rho_b * (1.0 + eps)
 
-    def tov_rhs(self, r, y):
-        """RHS of TOV equations: y = [P, Phi, M]"""
-        P, Phi, M = y
-        if r < 1e-10:
-            return np.array([0.0, 0.0, 0.0])
+    def tov_rhs(self, r_schw, y):
+        """
+        RHS of TOV equations in Schwarzschild radius r_schw.
+
+        If use_isotropic=True:
+            y = [P, nu, M, r_iso]
+        Else (Schwarzschild):
+            y = [P, Phi, M]
+        """
+        if self.use_isotropic:
+            P, nu, M, r_iso = y
+        else:
+            P, Phi, M = y
+
+        if r_schw < 1e-10:
+            if self.use_isotropic:
+                return np.array([0.0, 0.0, 0.0, 1.0])  # dr_iso/dr = 1 at center
+            else:
+                return np.array([0.0, 0.0, 0.0])
 
         rho = self.eos_rho_energy(P)
-        denom = r * (r - 2.0 * M)
+        denom = r_schw * (r_schw - 2.0 * M)
         if abs(denom) < 1e-30:
-            return np.array([0.0, 0.0, 0.0])
+            if self.use_isotropic:
+                return np.array([0.0, 0.0, 0.0, 0.0])
+            else:
+                return np.array([0.0, 0.0, 0.0])
 
-        numerator = M + 4.0 * np.pi * r**3 * P
+        numerator = M + 4.0 * np.pi * r_schw**3 * P
+
+        # Common equations
         dP_dr = -(rho + P) * numerator / denom
-        dPhi_dr = numerator / denom
-        dM_dr = 4.0 * np.pi * r**2 * rho
+        dnu_dr = numerator / denom
+        dM_dr = 4.0 * np.pi * r_schw**2 * rho
 
-        return np.array([dP_dr, dPhi_dr, dM_dr])
+        if self.use_isotropic:
+            # Isotropic radius evolution: dr_iso/dr = r_iso / (r * sqrt(1 - 2M/r))
+            if r_iso > 0 and r_schw > 2.0 * M:
+                dr_iso_dr = r_iso / (r_schw * np.sqrt(1.0 - 2.0 * M / r_schw))
+            else:
+                dr_iso_dr = 1.0  # At center
+            return np.array([dP_dr, dnu_dr, dM_dr, dr_iso_dr])
+        else:
+            return np.array([dP_dr, dnu_dr, dM_dr])
 
     def solve(self, rho_central, r_grid=None, r_max=20.0, dr=0.001):
         """
@@ -88,68 +117,189 @@ class TOVSolver:
             dr: Step size if r_grid not provided
         """
         P_c = self.eos_pressure(rho_central)
-        Phi_c = 0.0
+        nu_c = 0.0
         M_c = 0.0
+        r_iso_c = 0.0
 
         solver = ode(self.tov_rhs).set_integrator('dopri5')
-        solver.set_initial_value([P_c, Phi_c, M_c], 0.001)
+        if self.use_isotropic:
+            solver.set_initial_value([P_c, nu_c, M_c, r_iso_c], 0.001)
+        else:
+            solver.set_initial_value([P_c, nu_c, M_c], 0.001)
 
         if r_grid is not None:
             # Solve directly at grid points (no interpolation!)
-            r_arr = []
+            r_schw_arr = []
             P_arr = []
-            Phi_arr = []
+            nu_arr = []
             M_arr = []
+            r_iso_arr = [] if self.use_isotropic else None
+            surface_found = False
+            R_star = None
+            M_star = None
+            nu_star = None
+            r_iso_star = None
 
-            for r in r_grid:
-                if r < 0.001:
+            for r_schw in r_grid:
+                if r_schw < 0.001:
                     continue
-                solver.integrate(r)
-                if not solver.successful():
-                    break
-                r_arr.append(r)
-                P_arr.append(max(solver.y[0], 0.0))
-                Phi_arr.append(solver.y[1])
-                M_arr.append(solver.y[2])
-                if solver.y[0] <= 1e-10:  # Reached surface
-                    break
 
-            r_arr = np.array(r_arr)
+                if not surface_found:
+                    solver.integrate(r_schw)
+                    if not solver.successful():
+                        break
+                    r_schw_arr.append(r_schw)
+                    P_arr.append(max(solver.y[0], 0.0))
+                    nu_arr.append(solver.y[1])
+                    M_arr.append(solver.y[2])
+                    if self.use_isotropic:
+                        r_iso_arr.append(solver.y[3])
+
+                    if solver.y[0] <= 1e-10:  # Reached surface
+                        surface_found = True
+                        R_star = r_schw
+                        M_star = solver.y[2]
+                        nu_star = solver.y[1]
+                        if self.use_isotropic:
+                            r_iso_star = solver.y[3]
+                else:
+                    # Beyond surface: vacuum Schwarzschild solution
+                    r_schw_arr.append(r_schw)
+                    P_arr.append(0.0)
+                    # Schwarzschild exterior: α = sqrt(1 - 2M/r)
+                    # Since α = exp(nu) / sqrt(1 - 2M/r), we need:
+                    # exp(nu) = (1 - 2M/r), so nu = ln(1 - 2M/r)
+                    # Add offset for continuity: nu(r) = ln(1-2M/r) + [nu_star - ln(1-2M/R)]
+                    if r_schw > 2.0 * M_star and R_star > 2.0 * M_star:
+                        nu_ext = np.log(1.0 - 2.0*M_star/r_schw) + (nu_star - np.log(1.0 - 2.0*M_star/R_star))
+                    else:
+                        nu_ext = nu_star
+                    nu_arr.append(nu_ext)
+                    M_arr.append(M_star)
+
+                    # Isotropic radius in exterior
+                    if self.use_isotropic and r_iso_star is not None:
+                        # Continue r_iso evolution in exterior
+                        # dr_iso/dr = r_iso / (r * sqrt(1 - 2M/r))
+                        # Integrate: r_iso = r_iso_star * exp(integral)
+                        # For Schwarzschild: r_iso ~ r_iso_surface * (r/R) * sqrt((r-2M)/(R-2M))
+                        if r_schw > 2.0 * M_star:
+                            factor = (r_schw / R_star) * np.sqrt((r_schw - 2.0*M_star) / (R_star - 2.0*M_star))
+                            r_iso_ext = r_iso_star * factor
+                        else:
+                            r_iso_ext = r_iso_star
+                        r_iso_arr.append(r_iso_ext)
+
+            r_schw_arr = np.array(r_schw_arr)
             P_arr = np.array(P_arr)
-            Phi_arr = np.array(Phi_arr)
+            nu_arr = np.array(nu_arr)
             M_arr = np.array(M_arr)
+            if self.use_isotropic:
+                r_iso_arr = np.array(r_iso_arr)
         else:
             # Original method with fixed dr
-            r_arr, P_arr, Phi_arr, M_arr = [0.001], [P_c], [Phi_c], [M_c]
+            r_schw_arr = [0.001]
+            P_arr = [P_c]
+            nu_arr = [nu_c]
+            M_arr = [M_c]
+            r_iso_arr = [r_iso_c] if self.use_isotropic else None
 
+            # Integrate until surface
             while solver.successful() and solver.y[0] > 1e-10 and solver.t < r_max:
                 solver.integrate(solver.t + dr)
-                r_arr.append(solver.t)
+                r_schw_arr.append(solver.t)
                 P_arr.append(solver.y[0])
-                Phi_arr.append(solver.y[1])
+                nu_arr.append(solver.y[1])
                 M_arr.append(solver.y[2])
+                if self.use_isotropic:
+                    r_iso_arr.append(solver.y[3])
 
-            r_arr = np.array(r_arr)
+            # Record surface values
+            R_star = r_schw_arr[-1]
+            M_star = M_arr[-1]
+            nu_star = nu_arr[-1]
+            r_iso_star = r_iso_arr[-1] if self.use_isotropic else None
+
+            # Continue to r_max with vacuum solution
+            r_current = R_star + dr
+            while r_current <= r_max:
+                r_schw_arr.append(r_current)
+                P_arr.append(0.0)
+                # Schwarzschild exterior
+                if r_current > 2.0 * M_star and R_star > 2.0 * M_star:
+                    nu_ext = np.log(1.0 - 2.0*M_star/r_current) + (nu_star - np.log(1.0 - 2.0*M_star/R_star))
+                else:
+                    nu_ext = nu_star
+                nu_arr.append(nu_ext)
+                M_arr.append(M_star)
+
+                # Isotropic radius in exterior
+                if self.use_isotropic and r_iso_star is not None:
+                    if r_current > 2.0 * M_star:
+                        factor = (r_current / R_star) * np.sqrt((r_current - 2.0*M_star) / (R_star - 2.0*M_star))
+                        r_iso_ext = r_iso_star * factor
+                    else:
+                        r_iso_ext = r_iso_star
+                    r_iso_arr.append(r_iso_ext)
+
+                r_current += dr
+
+            r_schw_arr = np.array(r_schw_arr)
             P_arr = np.array(P_arr)
-            Phi_arr = np.array(Phi_arr)
+            nu_arr = np.array(nu_arr)
             M_arr = np.array(M_arr)
+            if self.use_isotropic:
+                r_iso_arr = np.array(r_iso_arr)
 
         rho_arr = np.array([self.eos_rho_baryon(P) for P in P_arr])
 
-        # Surface radius and metric
-        R_star = r_arr[-1]
-        M_star = M_arr[-1]
-        exp4phi = 1.0 / (1.0 - 2.0 * M_arr / r_arr)
-        alpha = np.exp(Phi_arr) / np.sqrt(1.0 - 2.0 * M_arr / r_arr)
+        # Surface radius: find where P first drops below threshold
+        surface_idx = np.where(P_arr <= 1e-10)[0]
+        if len(surface_idx) > 0:
+            R_star_schw = r_schw_arr[surface_idx[0]]
+        else:
+            R_star_schw = r_schw_arr[-1]  # Fallback if no surface found
 
-        return {
-            'r': r_arr, 'P': P_arr, 'M': M_arr, 'Phi': Phi_arr,
+        M_star = M_arr[-1]  # Total mass (same everywhere after surface)
+
+        if self.use_isotropic:
+            # Normalize r_iso following NRPy+ (line 318 in TOVola_solve.py)
+            R_iso_surface = r_iso_arr[surface_idx[0]] if len(surface_idx) > 0 else r_iso_arr[-1]
+            normalize = 0.5 * (np.sqrt(R_star_schw * (R_star_schw - 2.0 * M_star)) + R_star_schw - M_star) / R_iso_surface
+            r_iso_normalized = r_iso_arr * normalize
+
+            # Conformal factor in isotropic coords: exp(4φ) = (r_schw / r_iso)²
+            exp4phi = (r_schw_arr / r_iso_normalized)**2
+
+            # Normalize lapse (line 323 in TOVola_solve.py)
+            nu_surface = nu_arr[surface_idx[0]] if len(surface_idx) > 0 else nu_arr[-1]
+            expnu = np.exp(nu_arr - nu_surface + np.log(1.0 - 2.0 * M_star / R_star_schw))
+            alpha = expnu
+
+            # Use normalized isotropic radius as coordinate
+            r_coord = r_iso_normalized
+            R_star = R_iso_surface * normalize
+        else:
+            # Schwarzschild coordinates
+            exp4phi = 1.0 / (1.0 - 2.0 * M_arr / r_schw_arr)
+            alpha = np.exp(nu_arr) / np.sqrt(1.0 - 2.0 * M_arr / r_schw_arr)
+            r_coord = r_schw_arr
+            R_star = R_star_schw
+
+        result = {
+            'r': r_coord, 'P': P_arr, 'M': M_arr, 'nu': nu_arr,
             'rho_baryon': rho_arr, 'exp4phi': exp4phi, 'alpha': alpha,
             'R': R_star, 'M_star': M_star, 'C': M_star / R_star
         }
 
+        if self.use_isotropic:
+            result['r_schw'] = r_schw_arr
+            result['r_iso'] = r_iso_normalized
 
-def create_initial_data(tov_solution, grid, eos, atmosphere_rho):
+        return result
+
+
+def create_initial_data(tov_solution, grid, background, eos, atmosphere_rho):
     """Create BSSN + hydro initial data from TOV solution."""
     r_tov = tov_solution['r']
 
@@ -163,14 +313,14 @@ def create_initial_data(tov_solution, grid, eos, atmosphere_rho):
         print("  TOV and evolution grids match - using direct values (no interpolation)")
         rho_tov_vals = tov_solution['rho_baryon']
         P_tov_vals = tov_solution['P']
-        Phi_tov_vals = tov_solution['Phi']
+        nu_tov_vals = tov_solution['nu']
         M_tov_vals = tov_solution['M']
 
         # Initialize arrays
         n_tov = len(r_tov)
         rho_grid = np.zeros(grid.N)
         P_grid = np.zeros(grid.N)
-        Phi_grid = np.zeros(grid.N)
+        nu_grid = np.zeros(grid.N)
         M_grid = np.zeros(grid.N)
 
         # Find indices where grid.r > 0 (these match TOV grid)
@@ -180,14 +330,14 @@ def create_initial_data(tov_solution, grid, eos, atmosphere_rho):
         # Copy TOV values to corresponding positive-r grid points
         rho_grid[positive_indices[:n_tov]] = rho_tov_vals
         P_grid[positive_indices[:n_tov]] = P_tov_vals
-        Phi_grid[positive_indices[:n_tov]] = Phi_tov_vals
+        nu_grid[positive_indices[:n_tov]] = nu_tov_vals
         M_grid[positive_indices[:n_tov]] = M_tov_vals
 
         # Atmosphere: negative radii and beyond stellar surface
         rho_grid[~positive_mask] = atmosphere_rho  # Negative radii
         rho_grid[positive_indices[n_tov:]] = atmosphere_rho  # Beyond surface
         P_grid[positive_indices[n_tov:]] = 0.0
-        Phi_grid[positive_indices[n_tov:]] = Phi_tov_vals[-1]
+        nu_grid[positive_indices[n_tov:]] = nu_tov_vals[-1]
         M_grid[positive_indices[n_tov:]] = M_tov_vals[-1]
     else:
         # Need interpolation (less accurate)
@@ -196,42 +346,95 @@ def create_initial_data(tov_solution, grid, eos, atmosphere_rho):
                                   bounds_error=False, fill_value=(tov_solution['rho_baryon'][0], 0.0))
         P_tov_interp = interp1d(r_tov, tov_solution['P'], kind='cubic',
                                 bounds_error=False, fill_value=(tov_solution['P'][0], 0.0))
-        Phi_tov_interp = interp1d(r_tov, tov_solution['Phi'], kind='cubic',
-                                  bounds_error=False, fill_value=(tov_solution['Phi'][0], 0.0))
+        nu_tov_interp = interp1d(r_tov, tov_solution['nu'], kind='cubic',
+                                  bounds_error=False, fill_value=(tov_solution['nu'][0], 0.0))
         M_tov_interp = interp1d(r_tov, tov_solution['M'], kind='cubic',
                                 bounds_error=False, fill_value=(0.0, tov_solution['M'][-1]))
 
         rho_grid = rho_tov_interp(grid.r)
         P_grid = P_tov_interp(grid.r)
-        Phi_grid = Phi_tov_interp(grid.r)
+        nu_grid = nu_tov_interp(grid.r)
         M_grid = M_tov_interp(grid.r)
+
+    # Interpolate exp4phi and alpha to grid
+    exp4phi_interp = interp1d(r_tov, tov_solution['exp4phi'], kind='cubic',
+                              bounds_error=False, fill_value=(1.0, tov_solution['exp4phi'][-1]))
+    alpha_interp = interp1d(r_tov, tov_solution['alpha'], kind='cubic',
+                            bounds_error=False, fill_value=(1.0, tov_solution['alpha'][-1]))
+
+    exp4phi_grid = exp4phi_interp(grid.r)
+    alpha_grid = alpha_interp(grid.r)
+
+    # Get reference metric from background (ĝ_ij)
+    ghatDD = background.hat_gamma_LL  # Shape: [N, 3, 3]
+    ReDD = background.scaling_matrix  # Rescaling matrix s_i s_j
 
     # BSSN variables
     state_2d = np.zeros((grid.NUM_VARS, grid.N))
 
     for i, r in enumerate(grid.r):
-        M = M_grid[i]
-        Phi = Phi_grid[i]
+        # Physical metric from TOV (in isotropic coordinates)
+        # γ_rr = exp(4φ_TOV), γ_θθ = r² exp(4φ_TOV), γ_φφ = r² sin²θ exp(4φ_TOV)
+        exp4phi_tov = exp4phi_grid[i]
+        gamma_phys_rr = exp4phi_tov
+        gamma_phys_thth = r**2 * exp4phi_tov
+        gamma_phys_phph = r**2 * exp4phi_tov  # sin²θ = 1 in equatorial plane
 
-        # Conformal factor: exp(4φ) = (1 - 2M/r)^(-1)
-        exp4phi = 1.0 / (1.0 - 2.0 * M / r) if r > 2.0 * M else 1.0
-        phi = 0.25 * np.log(exp4phi)
+        # Determinant of physical metric
+        det_gamma_phys = gamma_phys_rr * gamma_phys_thth * gamma_phys_phph
 
-        # Lapse: α = exp(Φ) / sqrt(1 - 2M/r)
-        alpha = np.exp(Phi) / np.sqrt(1.0 - 2.0 * M / r) if r > 2.0 * M else 1.0
+        # Determinant of reference metric ĝ_ij
+        det_ghat = ghatDD[i, i_r, i_r] * ghatDD[i, i_t, i_t] * ghatDD[i, i_p, i_p]
 
-        # Set BSSN vars (rest are zero for spherical symmetry)
-        state_2d[0, i] = phi  # conformal factor
-        state_2d[idx_lapse, i] = alpha  # lapse
+        # Conformal factor: φ = (1/12) ln(det(γ_phys) / det(ĝ))
+        # Following NRPy+ convention (BSSN_in_terms_of_ADM.py line 134-135)
+        if det_gamma_phys > 0 and det_ghat > 0:
+            phi = (1.0/12.0) * np.log(det_gamma_phys / det_ghat)
+        else:
+            phi = 0.0
+
+        # Conformal metric: γ̄_ij = e^(-4φ) γ_ij
+        exp_minus_4phi = np.exp(-4.0 * phi)
+        gammabar_rr = exp_minus_4phi * gamma_phys_rr
+        gammabar_thth = exp_minus_4phi * gamma_phys_thth
+        gammabar_phph = exp_minus_4phi * gamma_phys_phph
+
+        # Deviation from reference: h_ij = (γ̄_ij - ĝ_ij) / ReDD_ij
+        # Following engrenage convention (bssnstatevariables.py line 18-20)
+        h_rr = (gammabar_rr - ghatDD[i, i_r, i_r]) / ReDD[i, i_r, i_r] if ReDD[i, i_r, i_r] != 0 else 0.0
+        h_tt = (gammabar_thth - ghatDD[i, i_t, i_t]) / ReDD[i, i_t, i_t] if ReDD[i, i_t, i_t] != 0 else 0.0
+        h_pp = (gammabar_phph - ghatDD[i, i_p, i_p]) / ReDD[i, i_p, i_p] if ReDD[i, i_p, i_p] != 0 else 0.0
+
+        # TOV is static equilibrium: K_ij = 0 everywhere
+        # Following NRPy+ prescription for static initial data
+        trK = 0.0
+        a_rr = 0.0
+        a_tt = 0.0
+        a_pp = 0.0
+
+        # Lapse from TOV
+        alpha = alpha_grid[i]
+
+        # Assign BSSN variables to state vector
+        state_2d[idx_phi, i] = phi
+        state_2d[idx_hrr, i] = h_rr
+        state_2d[idx_htt, i] = h_tt
+        state_2d[idx_hpp, i] = h_pp
+        state_2d[idx_K, i] = trK
+        state_2d[idx_arr, i] = a_rr
+        state_2d[idx_att, i] = a_tt
+        state_2d[idx_app, i] = a_pp
+        state_2d[idx_lapse, i] = alpha
+        # lambdar, shiftr, br remain zero (will be computed from FD derivatives)
 
     # Hydro variables
     for i, r in enumerate(grid.r):
         rho = max(rho_grid[i], atmosphere_rho)
         P = P_grid[i]
-        M = M_grid[i]
 
-        gamma_rr = 1.0 / (1.0 - 2.0 * M / r) if r > 2.0 * M else 1.0
-        D, Sr, tau = prim_to_cons(rho, 0.0, P, gamma_rr, eos)
+        # Use physical metric from TOV for cons2prim (isotropic coordinates)
+        gamma_rr_phys = exp4phi_grid[i]
+        D, Sr, tau = prim_to_cons(rho, 0.0, P, gamma_rr_phys, eos)
 
         state_2d[NUM_BSSN_VARS + 0, i] = D
         state_2d[NUM_BSSN_VARS + 1, i] = Sr
@@ -327,9 +530,9 @@ def plot_tov_diagnostics(tov_solution, r_max):
     R_star = tov_solution['R']
     M_star = tov_solution['M_star']
 
-    fig, axes = plt.subplots(2, 2, figsize=(12, 8))
+    fig, axes = plt.subplots(2, 3, figsize=(16, 8))
 
-    axes[0, 0].semilogy(r, tov_solution['rho_baryon'], color='navy')
+    axes[0, 0].plot(r, tov_solution['rho_baryon'], color='navy')
     axes[0, 0].axvline(R_star, color='gray', linestyle=':', alpha=0.5, label=f'R={R_star:.2f}')
     axes[0, 0].set_xlabel(r"$r$")
     axes[0, 0].set_ylabel(r"$\rho_0$")
@@ -338,7 +541,7 @@ def plot_tov_diagnostics(tov_solution, r_max):
     axes[0, 0].legend()
     axes[0, 0].grid(True, alpha=0.3)
 
-    axes[0, 1].semilogy(r, tov_solution['P'], color='darkgreen')
+    axes[0, 1].plot(r, tov_solution['P'], color='darkgreen')
     axes[0, 1].axvline(R_star, color='gray', linestyle=':', alpha=0.5)
     axes[0, 1].set_xlabel(r"$r$")
     axes[0, 1].set_ylabel('P')
@@ -346,23 +549,42 @@ def plot_tov_diagnostics(tov_solution, r_max):
     axes[0, 1].set_xlim(0, r_max)
     axes[0, 1].grid(True, alpha=0.3)
 
-    axes[1, 0].plot(r, tov_solution['M'], color='maroon')
+    axes[0, 2].plot(r, tov_solution['M'], color='maroon')
+    axes[0, 2].axvline(R_star, color='gray', linestyle=':', alpha=0.5)
+    axes[0, 2].axhline(M_star, color='gray', linestyle='--', alpha=0.3, label=f'M={M_star:.3f}')
+    axes[0, 2].set_xlabel(r"$r$")
+    axes[0, 2].set_ylabel('M(r)')
+    axes[0, 2].set_title('Enclosed Mass')
+    axes[0, 2].set_xlim(0, r_max)
+    axes[0, 2].legend()
+    axes[0, 2].grid(True, alpha=0.3)
+
+    axes[1, 0].plot(r, tov_solution['alpha'], color='purple')
     axes[1, 0].axvline(R_star, color='gray', linestyle=':', alpha=0.5)
-    axes[1, 0].axhline(M_star, color='gray', linestyle='--', alpha=0.3, label=f'M={M_star:.3f}')
     axes[1, 0].set_xlabel(r"$r$")
-    axes[1, 0].set_ylabel('M(r)')
-    axes[1, 0].set_title('Enclosed Mass')
+    axes[1, 0].set_ylabel(r'$\alpha$')
+    axes[1, 0].set_title('Lapse Function')
     axes[1, 0].set_xlim(0, r_max)
-    axes[1, 0].legend()
     axes[1, 0].grid(True, alpha=0.3)
 
-    axes[1, 1].plot(r, tov_solution['alpha'], color='purple')
+    # Conformal factor exp(4φ)
+    axes[1, 1].plot(r, tov_solution['exp4phi'], color='orange')
     axes[1, 1].axvline(R_star, color='gray', linestyle=':', alpha=0.5)
     axes[1, 1].set_xlabel(r"$r$")
-    axes[1, 1].set_ylabel(r'$\alpha$')
-    axes[1, 1].set_title('Lapse Function')
+    axes[1, 1].set_ylabel(r'$e^{4\phi}$')
+    axes[1, 1].set_title('Conformal Factor')
     axes[1, 1].set_xlim(0, r_max)
     axes[1, 1].grid(True, alpha=0.3)
+
+    # φ itself
+    phi = 0.25 * np.log(tov_solution['exp4phi'])
+    axes[1, 2].plot(r, phi, color='teal')
+    axes[1, 2].axvline(R_star, color='gray', linestyle=':', alpha=0.5)
+    axes[1, 2].set_xlabel(r"$r$")
+    axes[1, 2].set_ylabel(r'$\phi$')
+    axes[1, 2].set_title('Conformal Factor φ')
+    axes[1, 2].set_xlim(0, r_max)
+    axes[1, 2].grid(True, alpha=0.3)
 
     plt.tight_layout()
     plt.savefig('tov_solution.png', dpi=150, bbox_inches='tight')
@@ -559,7 +781,7 @@ def main():
     # INITIAL DATA
     # ==================================================================
     print("Creating initial data...")
-    initial_state_2d = create_initial_data(tov_solution, grid, eos, atmosphere_rho)
+    initial_state_2d = create_initial_data(tov_solution, grid, background, eos, atmosphere_rho)
 
     plot_initial_comparison(tov_solution, initial_state_2d, grid, hydro)
 
