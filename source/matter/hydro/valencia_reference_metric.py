@@ -71,6 +71,9 @@ class ValenciaReferenceMetric:
 
         # Copy and apply boundary conditions to conservatives
         D, Sr, tau = D.copy(), Sr.copy(), tau.copy()
+        # Apply only inner (parity) BC to conservatives in "parity" mode to avoid
+        # contradicting primitive-based BC at the outer boundary. In "outflow" mode
+        # keep zero-gradient on both ends for robustness.
         D, Sr, tau = self._apply_ghost_cell_boundaries(D, Sr, tau, r)
 
         # Extract geometry (α, β^i, γ_ij, √γ, √ĝ, etc.)
@@ -479,6 +482,24 @@ class ValenciaReferenceMetric:
                 pL[k0] = p_ref
                 pR[k0] = p_ref
 
+        # Surface/atmosphere flattening: in interfaces where density is near atmosphere,
+        # switch to first-order (average) and force v=0 to avoid overshoots.
+        # Threshold based on a small floor (~1e-13) times a factor.
+        dens_floor = 1.0e-13
+        thr = 10.0 * dens_floor
+        if len(rhoL) > 0:
+            import numpy as _np
+            mask = (rhoL < thr) | (rhoR < thr)
+            if _np.any(mask):
+                rho_avg = 0.5 * (rhoL + rhoR)
+                p_avg = _np.maximum(0.5 * (pL + pR), 1.0e-15)
+                rhoL[mask] = rho_avg[mask]
+                rhoR[mask] = rho_avg[mask]
+                pL[mask] = p_avg[mask]
+                pR[mask] = p_avg[mask]
+                vL[mask] = 0.0
+                vR[mask] = 0.0
+
         # Apply physical limiters if available
         if hasattr(reconstructor, "apply_physical_limiters"):
             (rhoL, vL, pL), (rhoR, vR, pR) = reconstructor.apply_physical_limiters(
@@ -551,18 +572,12 @@ class ValenciaReferenceMetric:
                     tau[-NUM_GHOSTS:] = tau[last]
             else:
                 # Parity mode (default)
-                # Inner boundary: parity reflection
+                # Inner boundary: parity reflection (apply only at inner boundary)
                 mir = slice(2 * NUM_GHOSTS - 1, NUM_GHOSTS - 1, -1)
                 D[:NUM_GHOSTS] = D[mir]       # Even parity
                 Sr[:NUM_GHOSTS] = -Sr[mir]    # Odd parity
                 tau[:NUM_GHOSTS] = tau[mir]   # Even parity
-
-                # Outer boundary: constant extrapolation
-                last = N - NUM_GHOSTS - 1
-                if last >= 0:
-                    D[-NUM_GHOSTS:] = D[last]
-                    Sr[-NUM_GHOSTS:] = Sr[last]
-                    tau[-NUM_GHOSTS:] = tau[last]
+                # Do not enforce outer BC on conservatives here; primitives/flux BC handle it.
 
         return D, Sr, tau
 

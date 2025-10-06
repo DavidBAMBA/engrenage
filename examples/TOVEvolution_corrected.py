@@ -32,16 +32,17 @@ from source.bssn.tensoralgebra import get_bar_gamma_LL
 
 # Hydro
 from source.matter.hydro.perfect_fluid import PerfectFluid
-from source.matter.hydro.eos import PolytropicEOS
+from source.matter.hydro.eos import PolytropicEOS, IdealGasEOS
 from source.matter.hydro.reconstruction import create_reconstruction
 from source.matter.hydro.riemann import HLLERiemannSolver
 from source.matter.hydro.cons2prim import prim_to_cons
+from source.bssn.tensoralgebra import get_bar_gamma_LL
 
 # ------------------------------------------------------------------
 # Toggle: freeze the energy equation (tau) – barotropic/Cowling helper
 # When True, sets d(tau)/dt = 0 in the hydro RHS (no energy evolution).
 # ------------------------------------------------------------------
-FREEZE_TAU = True
+FREEZE_TAU = False
 from examples.tov_solver import TOVSolver
 
 def create_initial_data(tov_solution, grid, background, eos, atmosphere_rho):
@@ -57,7 +58,8 @@ def create_initial_data(tov_solution, grid, background, eos, atmosphere_rho):
     if hasattr(eos, 'K') and hasattr(eos, 'gamma'):
         p_atm = eos.K * (atmosphere_rho ** eos.gamma)
     else:
-        p_atm = 0.0
+        # Ideal gas or other: use a tiny floor consistent with cons2prim
+        p_atm = 1.0e-15
 
     if same_grid:
         # Direct copy - no interpolation errors!
@@ -300,6 +302,48 @@ def get_rhs_cowling(t, y, grid, background, hydro, bssn_fixed, bssn_d1_fixed):
     return rhs.flatten()
 
 
+def _reproject_tau_barotropic(state_2d, grid, background, hydro):
+    """Recompute tau from (rho0, v^r, p) assuming barotropic EOS.
+
+    Keeps D fixed; sets tau = rho h W^2 - p - D with
+    h = 1 + eps(rho), eps from EOS (barotropic path ignores p).
+    """
+    # Build BSSN vars to extract metric
+    bssn_vars = BSSNVars(grid.N)
+    bssn_vars.set_bssn_vars(state_2d[:NUM_BSSN_VARS, :])
+
+    # Primitives from current conservative state
+    hydro.set_matter_vars(state_2d, bssn_vars, grid)
+    prim = hydro._get_primitives(bssn_vars, grid.r)
+
+    rho0 = prim['rho0']
+    vr = prim['vr']
+    p = prim['p']
+
+    # Metric γ_rr = e^{4φ} γ̄_rr
+    e4phi = np.exp(4.0 * state_2d[idx_phi, :])
+    bar_gamma_LL = get_bar_gamma_LL(grid.r, bssn_vars.h_LL, background)
+    gamma_rr = e4phi * bar_gamma_LL[:, i_r, i_r]
+
+    # Lorentz factor and enthalpy for barotropic EOS
+    v2 = np.clip(gamma_rr * vr * vr, 0.0, 1.0 - 1e-12)
+    W = 1.0 / np.sqrt(1.0 - v2)
+
+    eos = hydro.eos
+    # For polytropic EOS, eps_from_rho_p ignores p and uses rho only
+    eps = eos.eps_from_rho_p(rho0, p)
+    if hasattr(eos, 'K') and hasattr(eos, 'gamma'):
+        h = 1.0 + eps
+    else:
+        h = 1.0 + eps + p / np.maximum(rho0, 1e-30)
+
+    D = state_2d[NUM_BSSN_VARS + 0, :]
+    tau_new = rho0 * h * W * W - p - D
+
+    state_2d[NUM_BSSN_VARS + 2, :] = tau_new
+    return state_2d
+
+
 def rk4_step(state_flat, dt, grid, background, hydro, bssn_fixed, bssn_d1_fixed):
     """Single RK4 (classical 4th order Runge-Kutta) timestep."""
     # Stage 1
@@ -307,18 +351,34 @@ def rk4_step(state_flat, dt, grid, background, hydro, bssn_fixed, bssn_d1_fixed)
 
     # Stage 2
     state_2 = state_flat + 0.5 * dt * k1
+    if FREEZE_TAU:
+        s2 = state_2.reshape((grid.NUM_VARS, grid.N))
+        _reproject_tau_barotropic(s2, grid, background, hydro)
+        state_2 = s2.flatten()
     k2 = get_rhs_cowling(0, state_2, grid, background, hydro, bssn_fixed, bssn_d1_fixed)
 
     # Stage 3
     state_3 = state_flat + 0.5 * dt * k2
+    if FREEZE_TAU:
+        s3 = state_3.reshape((grid.NUM_VARS, grid.N))
+        _reproject_tau_barotropic(s3, grid, background, hydro)
+        state_3 = s3.flatten()
     k3 = get_rhs_cowling(0, state_3, grid, background, hydro, bssn_fixed, bssn_d1_fixed)
 
     # Stage 4
     state_4 = state_flat + dt * k3
+    if FREEZE_TAU:
+        s4 = state_4.reshape((grid.NUM_VARS, grid.N))
+        _reproject_tau_barotropic(s4, grid, background, hydro)
+        state_4 = s4.flatten()
     k4 = get_rhs_cowling(0, state_4, grid, background, hydro, bssn_fixed, bssn_d1_fixed)
 
     # Combine
     state_new = state_flat + (dt / 6.0) * (k1 + 2*k2 + 2*k3 + k4)
+    if FREEZE_TAU:
+        snew = state_new.reshape((grid.NUM_VARS, grid.N))
+        _reproject_tau_barotropic(snew, grid, background, hydro)
+        state_new = snew
 
     return state_new
 
@@ -579,9 +639,9 @@ def main():
     # CONFIGURATION
     # ==================================================================
     r_max = 20.0
-    num_points = 3000  # Use 4000+ for production runs
+    num_points = 3000 
     K = 100.0
-    Gamma = 2.0  # NOTE: Gamma=2.0 is pathological (tau→0)
+    Gamma = 2.0 
     rho_central = 1.28e-3
     atmosphere_rho = 1.0e-10
 
@@ -594,7 +654,8 @@ def main():
     # SETUP
     # ==================================================================
     spacing = LinearSpacing(num_points, r_max)
-    eos = PolytropicEOS(K=K, gamma=Gamma)
+    # Evolve with ideal-gas EOS using the same Gamma as the TOV polytrope
+    eos = IdealGasEOS(gamma=Gamma)
     hydro = PerfectFluid(
         eos=eos,
         spacetime_mode="dynamic",
@@ -647,7 +708,7 @@ def main():
 
     if integration_method == 'fixed':
         dt = 0.15 * grid.min_dr  # CFL condition
-        num_steps = 100
+        num_steps = 10
         print(f"\nEvolving with fixed dt={dt:.6f} (CFL=0.15) for {num_steps} steps using RK4")
 
         # Single step for comparison
