@@ -36,6 +36,18 @@ from source.matter.hydro.cons2prim import prim_to_cons
 class ValenciaReferenceMetric:
     """Valencia formulation - full 3D tensor algebra following BSSN pattern."""
 
+    def __init__(self, boundary_mode="parity"):
+        """
+        Initialize Valencia formulation.
+
+        Parameters:
+        -----------
+        boundary_mode : str
+            "parity" - Parity boundary conditions at inner boundary (r=0)
+            "outflow" - Outflow (zero-gradient) at both boundaries
+        """
+        self.boundary_mode = boundary_mode
+
     def compute_rhs(self, D, Sr, tau, rho0, vr, pressure, W, h,
                     r, bssn_vars, bssn_d1, background, spacetime_mode,
                     eos, grid, reconstructor, riemann_solver):
@@ -173,10 +185,14 @@ class ValenciaReferenceMetric:
         # The RHS is already properly normalized by the (1/√ĝ) factors above
         # No additional division needed
 
-        # Apply boundary conditions to RHS
-        rhs_D, rhs_Sr, rhs_tau = self._apply_rhs_boundary_conditions(
-            rhs_D, rhs_Sr, rhs_tau, r
-        )
+        # DISABLED: BC on RHS are unnecessary in Method of Lines
+        # The state BC are sufficient - RHS BC were redundant/harmful
+        # rhs_D, rhs_Sr, rhs_tau = self._apply_rhs_boundary_conditions(
+        #     rhs_D, rhs_Sr, rhs_tau, r
+        # )
+
+        # NOTE: No RHS limiter applied following GRoovy/NRPy+ approach
+        # Atmosphere handling is done via reconstruction limiters and cons2prim floors
 
         return rhs_D, rhs_Sr, rhs_tau
 
@@ -491,47 +507,78 @@ class ValenciaReferenceMetric:
 
     def _apply_ghost_cell_boundaries(self, D, Sr, tau, r):
         """
-        Apply parity boundary conditions to conservative variables.
+        Apply boundary conditions to conservative variables.
 
-        Inner boundary (r=0): Parity reflection
-            - D: even parity
-            - Sr: odd parity (radial momentum)
-            - tau: even parity
+        Parity mode:
+            Inner boundary (r=0): Parity reflection
+                - D: even parity
+                - Sr: odd parity (radial momentum)
+                - tau: even parity
+            Outer boundary: Constant extrapolation
 
-        Outer boundary: Constant extrapolation
+        Outflow mode:
+            Both boundaries: Constant extrapolation (zero-gradient)
         """
         N = len(r)
         if NUM_GHOSTS > 0:
-            # Inner boundary: parity reflection
-            mir = slice(2 * NUM_GHOSTS - 1, NUM_GHOSTS - 1, -1)
-            D[:NUM_GHOSTS] = D[mir]       # Even parity
-            Sr[:NUM_GHOSTS] = -Sr[mir]    # Odd parity
-            tau[:NUM_GHOSTS] = tau[mir]   # Even parity
+            if self.boundary_mode == "outflow":
+                # Left boundary: outflow (zero-gradient)
+                D[:NUM_GHOSTS] = D[NUM_GHOSTS]
+                Sr[:NUM_GHOSTS] = Sr[NUM_GHOSTS]
+                tau[:NUM_GHOSTS] = tau[NUM_GHOSTS]
 
-            # Outer boundary: constant extrapolation
-            last = N - NUM_GHOSTS - 1
-            if last >= 0:
-                D[-NUM_GHOSTS:] = D[last]
-                Sr[-NUM_GHOSTS:] = Sr[last]
-                tau[-NUM_GHOSTS:] = tau[last]
+                # Right boundary: outflow (zero-gradient)
+                last = N - NUM_GHOSTS - 1
+                if last >= 0:
+                    D[-NUM_GHOSTS:] = D[last]
+                    Sr[-NUM_GHOSTS:] = Sr[last]
+                    tau[-NUM_GHOSTS:] = tau[last]
+            else:
+                # Parity mode (default)
+                # Inner boundary: parity reflection
+                mir = slice(2 * NUM_GHOSTS - 1, NUM_GHOSTS - 1, -1)
+                D[:NUM_GHOSTS] = D[mir]       # Even parity
+                Sr[:NUM_GHOSTS] = -Sr[mir]    # Odd parity
+                tau[:NUM_GHOSTS] = tau[mir]   # Even parity
+
+                # Outer boundary: constant extrapolation
+                last = N - NUM_GHOSTS - 1
+                if last >= 0:
+                    D[-NUM_GHOSTS:] = D[last]
+                    Sr[-NUM_GHOSTS:] = Sr[last]
+                    tau[-NUM_GHOSTS:] = tau[last]
 
         return D, Sr, tau
 
     def _apply_rhs_boundary_conditions(self, rhs_D, rhs_Sr, rhs_tau, r):
-        """Apply parity boundary conditions to RHS (same as state variables)."""
+        """Apply boundary conditions to RHS (same as state variables)."""
         N = len(r)
         if NUM_GHOSTS > 0:
-            # Inner boundary
-            mir = slice(2 * NUM_GHOSTS - 1, NUM_GHOSTS - 1, -1)
-            rhs_D[:NUM_GHOSTS] = rhs_D[mir]
-            rhs_Sr[:NUM_GHOSTS] = -rhs_Sr[mir]
-            rhs_tau[:NUM_GHOSTS] = rhs_tau[mir]
+            if self.boundary_mode == "outflow":
+                # Left boundary: outflow
+                rhs_D[:NUM_GHOSTS] = rhs_D[NUM_GHOSTS]
+                rhs_Sr[:NUM_GHOSTS] = rhs_Sr[NUM_GHOSTS]
+                rhs_tau[:NUM_GHOSTS] = rhs_tau[NUM_GHOSTS]
 
-            # Outer boundary
-            last = N - NUM_GHOSTS - 1
-            if last >= 0:
-                rhs_D[-NUM_GHOSTS:] = rhs_D[last]
-                rhs_Sr[-NUM_GHOSTS:] = rhs_Sr[last]
-                rhs_tau[-NUM_GHOSTS:] = rhs_tau[last]
+                # Right boundary: outflow
+                last = N - NUM_GHOSTS - 1
+                if last >= 0:
+                    rhs_D[-NUM_GHOSTS:] = rhs_D[last]
+                    rhs_Sr[-NUM_GHOSTS:] = rhs_Sr[last]
+                    rhs_tau[-NUM_GHOSTS:] = rhs_tau[last]
+            else:
+                # Parity mode
+                # Inner boundary
+                mir = slice(2 * NUM_GHOSTS - 1, NUM_GHOSTS - 1, -1)
+                rhs_D[:NUM_GHOSTS] = rhs_D[mir]
+                rhs_Sr[:NUM_GHOSTS] = -rhs_Sr[mir]
+                rhs_tau[:NUM_GHOSTS] = rhs_tau[mir]
+
+                # Outer boundary
+                last = N - NUM_GHOSTS - 1
+                if last >= 0:
+                    rhs_D[-NUM_GHOSTS:] = rhs_D[last]
+                    rhs_Sr[-NUM_GHOSTS:] = rhs_Sr[last]
+                    rhs_tau[-NUM_GHOSTS:] = rhs_tau[last]
 
         return rhs_D, rhs_Sr, rhs_tau

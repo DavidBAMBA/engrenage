@@ -107,8 +107,10 @@ class PerfectFluid:
         vD = np.einsum('xij,xj->xi', gamma_LL, vU)
 
         # Momentum abajo y tensores de esfuerzo abajo
-        emtensor.Si  = rho0*h*W*W * vD                             # S_i
-        emtensor.Sij = rho0*h*W*W * np.einsum('xi,xj->xij', vD, vD) + p[:,None,None]*gamma_LL  # S_ij
+        pref = (rho0 * h * W * W)
+        emtensor.Si  = pref[:, None] * vD  # S_i with proper broadcasting
+        emtensor.Sij = pref[:, None, None] * np.einsum('xi,xj->xij', vD, vD) \
+                       + p[:, None, None] * gamma_LL  # S_ij
 
         # Traza S = γ^{ij} S_{ij}
         emtensor.S   = np.einsum('xij,xij->x', gamma_UU, emtensor.Sij)
@@ -190,4 +192,3 @@ class PerfectFluid:
             primitives['h'][failed] = 1.0 + primitives['eps'][failed] + primitives['p'][failed] / primitives['rho0'][failed]
 
         return primitives
-

@@ -10,9 +10,10 @@ import os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..', '..'))
 
 # Importar el test
-from test import test_riemann_sod
+from test import test_blast_compare
 
 if __name__ == "__main__":
     print("Ejecutando test de Sod con múltiples reconstructores...")
-    result = test_riemann_sod()
-    print(f"\nResultado final: {'ÉXITO' if result else 'FALLO'}")
+    result = test_blast_compare(case="weak")
+    result2 = test_blast_compare(case="strong")
+    print(f"\nResultado final: {'ÉXITO' if result and result2 else 'FALLO'}")

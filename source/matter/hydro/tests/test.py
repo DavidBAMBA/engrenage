@@ -53,14 +53,6 @@ def build_engrenage_grid_with_matter(n_interior=256, r_min=1.0e-3, r_max=1.0, ng
     num_points = Nin + 2 * ng  # total points including ghosts
     spacing = LinearSpacing(num_points, r_max, SpacingExtent.HALF)
 
-    # Create PerfectFluid matter with proper configuration
-    if eos is None:
-        eos = IdealGasEOS(gamma=1.4)
-    if reconstructor is None:
-        reconstructor = MinmodReconstruction()
-    if riemann_solver is None:
-        riemann_solver = HLLERiemannSolver()
-
     matter = PerfectFluid(
         eos=eos,
         spacetime_mode="fixed_minkowski",
@@ -126,9 +118,9 @@ def max_signal_speed(rho0, v, p, eos, cfl_guard=1e-6):
     cs  = np.sqrt(cs2)
     return np.max(np.abs(v) + cs) + cfl_guard
 
-def rk3_step(valencia, D, Sr, tau, rho0, v, p, r, grid, eos, recon, rsolve, cfl=0.5,
+def rk4_step(valencia, D, Sr, tau, rho0, v, p, r, grid, eos, recon, rsolve, cfl=0.5,
              spacetime_mode="fixed_minkowski"):
-    """Una etapa RK3 Shu–Osher usando compute_rhs (full approach)."""
+    """Una etapa RK4 clásico usando compute_rhs (full approach)."""
     # dt CFL
     amax = max_signal_speed(rho0, v, p, eos)
     dt = cfl * grid.min_dr / amax
@@ -136,50 +128,66 @@ def rk3_step(valencia, D, Sr, tau, rho0, v, p, r, grid, eos, recon, rsolve, cfl=
     # Dummy BSSN (no usado en Minkowski, pero la firma lo pide)
     bssn_vars = _DummyBSSNVars(len(r))
     bssn_d1   = _DummyBSSND1(len(r))
-    #background = None
     background = FlatSphericalBackground(r)
 
+    # Stage 1: k1 = f(U_n)
+    k1_D, k1_Sr, k1_tau = valencia.compute_rhs(D, Sr, tau, rho0, v, p,
+                                                W=None, h=None,
+                                                r=r, bssn_vars=bssn_vars, bssn_d1=bssn_d1,
+                                                background=background, spacetime_mode=spacetime_mode,
+                                                eos=eos, grid=grid, reconstructor=recon, riemann_solver=rsolve)
 
-    # Stage 1
-    rhsD, rhsSr, rhsTau = valencia.compute_rhs(D, Sr, tau, rho0, v, p, 
-                                               W=None, h=None,
-                                               r=r, bssn_vars=bssn_vars, bssn_d1=bssn_d1,
-                                               background=background, spacetime_mode=spacetime_mode,
-                                               eos=eos, grid=grid, reconstructor=recon, riemann_solver=rsolve)
-    D1   = D   + dt*rhsD
-    Sr1  = Sr  + dt*rhsSr
-    tau1 = tau + dt*rhsTau
+    D1   = D   + 0.5*dt*k1_D
+    Sr1  = Sr  + 0.5*dt*k1_Sr
+    tau1 = tau + 0.5*dt*k1_tau
     rho1, v1, p1 = to_primitives(D1, Sr1, tau1, eos, p_guess=p)
     rho1, v1, p1 = fill_ghosts_primitives(rho1, v1, p1)
 
-    # Stage 2
-    rhsD, rhsSr, rhsTau = valencia.compute_rhs(D1, Sr1, tau1, rho1, v1, p1, 
-                                               W=None, h=None,
-                                               r=r, bssn_vars=bssn_vars, bssn_d1=bssn_d1,
-                                               background=background, spacetime_mode=spacetime_mode,
-                                               eos=eos, grid=grid, reconstructor=recon, riemann_solver=rsolve)
-    D2   = 0.75*D   + 0.25*(D1  + dt*rhsD)
-    Sr2  = 0.75*Sr  + 0.25*(Sr1 + dt*rhsSr)
-    tau2 = 0.75*tau + 0.25*(tau1+ dt*rhsTau)
+    # Stage 2: k2 = f(U_n + 0.5*dt*k1)
+    k2_D, k2_Sr, k2_tau = valencia.compute_rhs(D1, Sr1, tau1, rho1, v1, p1,
+                                                W=None, h=None,
+                                                r=r, bssn_vars=bssn_vars, bssn_d1=bssn_d1,
+                                                background=background, spacetime_mode=spacetime_mode,
+                                                eos=eos, grid=grid, reconstructor=recon, riemann_solver=rsolve)
+
+    D2   = D   + 0.5*dt*k2_D
+    Sr2  = Sr  + 0.5*dt*k2_Sr
+    tau2 = tau + 0.5*dt*k2_tau
     rho2, v2, p2 = to_primitives(D2, Sr2, tau2, eos, p_guess=p1)
     rho2, v2, p2 = fill_ghosts_primitives(rho2, v2, p2)
 
-    # Stage 3
-    rhsD, rhsSr, rhsTau = valencia.compute_rhs(D2, Sr2, tau2, rho2, v2, p2, 
-                                               W=None, h=None,
-                                               r=r, bssn_vars=bssn_vars, bssn_d1=bssn_d1,
-                                               background=background, spacetime_mode=spacetime_mode,
-                                               eos=eos, grid=grid, reconstructor=recon, riemann_solver=rsolve)
-    Dn   = (1.0/3.0)*D   + (2.0/3.0)*(D2   + dt*rhsD)
-    Snn  = (1.0/3.0)*Sr  + (2.0/3.0)*(Sr2  + dt*rhsSr)
-    taun = (1.0/3.0)*tau + (2.0/3.0)*(tau2 + dt*rhsTau)
-    rhon, vn, pn = to_primitives(Dn, Snn, taun, eos, p_guess=p2)
+    # Stage 3: k3 = f(U_n + 0.5*dt*k2)
+    k3_D, k3_Sr, k3_tau = valencia.compute_rhs(D2, Sr2, tau2, rho2, v2, p2,
+                                                W=None, h=None,
+                                                r=r, bssn_vars=bssn_vars, bssn_d1=bssn_d1,
+                                                background=background, spacetime_mode=spacetime_mode,
+                                                eos=eos, grid=grid, reconstructor=recon, riemann_solver=rsolve)
+
+    D3   = D   + dt*k3_D
+    Sr3  = Sr  + dt*k3_Sr
+    tau3 = tau + dt*k3_tau
+    rho3, v3, p3 = to_primitives(D3, Sr3, tau3, eos, p_guess=p2)
+    rho3, v3, p3 = fill_ghosts_primitives(rho3, v3, p3)
+
+    # Stage 4: k4 = f(U_n + dt*k3)
+    k4_D, k4_Sr, k4_tau = valencia.compute_rhs(D3, Sr3, tau3, rho3, v3, p3,
+                                                W=None, h=None,
+                                                r=r, bssn_vars=bssn_vars, bssn_d1=bssn_d1,
+                                                background=background, spacetime_mode=spacetime_mode,
+                                                eos=eos, grid=grid, reconstructor=recon, riemann_solver=rsolve)
+
+    # Final update: U_{n+1} = U_n + (dt/6)*(k1 + 2*k2 + 2*k3 + k4)
+    Dn   = D   + (dt/6.0)*(k1_D   + 2.0*k2_D   + 2.0*k3_D   + k4_D)
+    Snn  = Sr  + (dt/6.0)*(k1_Sr  + 2.0*k2_Sr  + 2.0*k3_Sr  + k4_Sr)
+    taun = tau + (dt/6.0)*(k1_tau + 2.0*k2_tau + 2.0*k3_tau + k4_tau)
+
+    rhon, vn, pn = to_primitives(Dn, Snn, taun, eos, p_guess=p3)
     rhon, vn, pn = fill_ghosts_primitives(rhon, vn, pn)
 
     return dt, Dn, Snn, taun, rhon, vn, pn
 
-def rk3_step_matter_class(matter, D, Sr, tau, r, grid, cfl=0.5, spacetime_mode="fixed_minkowski"):
-    """RK3 step using PerfectFluid matter class (Engrenage pattern)."""
+def rk4_step_matter_class(matter, D, Sr, tau, r, grid, cfl=0.5, spacetime_mode="fixed_minkowski"):
+    """RK4 step using PerfectFluid matter class (Engrenage pattern)."""
     from source.bssn.bssnvars import BSSNVars
 
     # Setup matter variables in the matter class
@@ -210,46 +218,63 @@ def rk3_step_matter_class(matter, D, Sr, tau, r, grid, cfl=0.5, spacetime_mode="
     amax = max_signal_speed(rho0, vr, p, matter.eos)
     dt = cfl * grid.min_dr / amax
 
-    # RK3 Stage 1
+    # RK4 Stage 1: k1 = f(U_n)
     state_vector[matter.idx_D] = D
     state_vector[matter.idx_Sr] = Sr
     state_vector[matter.idx_tau] = tau
     matter.set_matter_vars(state_vector, bssn_vars, grid)
 
-    rhs = matter.get_matter_rhs(r, bssn_vars, bssn_d1, background)
-    D1 = D + dt * rhs[0]
-    Sr1 = Sr + dt * rhs[1]
-    tau1 = tau + dt * rhs[2]
+    k1 = matter.get_matter_rhs(r, bssn_vars, bssn_d1, background)
+    D1 = D + 0.5*dt * k1[0]
+    Sr1 = Sr + 0.5*dt * k1[1]
+    tau1 = tau + 0.5*dt * k1[2]
 
     rho1, vr1, p1 = to_primitives(D1, Sr1, tau1, matter.eos)
     rho1, vr1, p1 = fill_ghosts_primitives(rho1, vr1, p1)
     D1, Sr1, tau1 = to_conserved(rho1, vr1, p1, matter.eos)
 
-    # RK3 Stage 2
+    # RK4 Stage 2: k2 = f(U_n + 0.5*dt*k1)
     state_vector[matter.idx_D] = D1
     state_vector[matter.idx_Sr] = Sr1
     state_vector[matter.idx_tau] = tau1
     matter.set_matter_vars(state_vector, bssn_vars, grid)
 
-    rhs = matter.get_matter_rhs(r, bssn_vars, bssn_d1, background)
-    D2 = 0.75*D + 0.25*(D1 + dt * rhs[0])
-    Sr2 = 0.75*Sr + 0.25*(Sr1 + dt * rhs[1])
-    tau2 = 0.75*tau + 0.25*(tau1 + dt * rhs[2])
+    k2 = matter.get_matter_rhs(r, bssn_vars, bssn_d1, background)
+    D2 = D + 0.5*dt * k2[0]
+    Sr2 = Sr + 0.5*dt * k2[1]
+    tau2 = tau + 0.5*dt * k2[2]
 
     rho2, vr2, p2 = to_primitives(D2, Sr2, tau2, matter.eos)
     rho2, vr2, p2 = fill_ghosts_primitives(rho2, vr2, p2)
     D2, Sr2, tau2 = to_conserved(rho2, vr2, p2, matter.eos)
 
-    # RK3 Stage 3
+    # RK4 Stage 3: k3 = f(U_n + 0.5*dt*k2)
     state_vector[matter.idx_D] = D2
     state_vector[matter.idx_Sr] = Sr2
     state_vector[matter.idx_tau] = tau2
     matter.set_matter_vars(state_vector, bssn_vars, grid)
 
-    rhs = matter.get_matter_rhs(r, bssn_vars, bssn_d1, background)
-    Dn = (1.0/3.0)*D + (2.0/3.0)*(D2 + dt * rhs[0])
-    Srn = (1.0/3.0)*Sr + (2.0/3.0)*(Sr2 + dt * rhs[1])
-    taun = (1.0/3.0)*tau + (2.0/3.0)*(tau2 + dt * rhs[2])
+    k3 = matter.get_matter_rhs(r, bssn_vars, bssn_d1, background)
+    D3 = D + dt * k3[0]
+    Sr3 = Sr + dt * k3[1]
+    tau3 = tau + dt * k3[2]
+
+    rho3, vr3, p3 = to_primitives(D3, Sr3, tau3, matter.eos)
+    rho3, vr3, p3 = fill_ghosts_primitives(rho3, vr3, p3)
+    D3, Sr3, tau3 = to_conserved(rho3, vr3, p3, matter.eos)
+
+    # RK4 Stage 4: k4 = f(U_n + dt*k3)
+    state_vector[matter.idx_D] = D3
+    state_vector[matter.idx_Sr] = Sr3
+    state_vector[matter.idx_tau] = tau3
+    matter.set_matter_vars(state_vector, bssn_vars, grid)
+
+    k4 = matter.get_matter_rhs(r, bssn_vars, bssn_d1, background)
+
+    # Final update: U_{n+1} = U_n + (dt/6)*(k1 + 2*k2 + 2*k3 + k4)
+    Dn = D + (dt/6.0)*(k1[0] + 2.0*k2[0] + 2.0*k3[0] + k4[0])
+    Srn = Sr + (dt/6.0)*(k1[1] + 2.0*k2[1] + 2.0*k3[1] + k4[1])
+    taun = tau + (dt/6.0)*(k1[2] + 2.0*k2[2] + 2.0*k3[2] + k4[2])
 
     rhon, vrn, pn = to_primitives(Dn, Srn, taun, matter.eos)
     rhon, vrn, pn = fill_ghosts_primitives(rhon, vrn, pn)
@@ -302,7 +327,7 @@ def test_uniform_state():
     t, Tfinal = 0.0, 0.1
     steps = 0
     while t < Tfinal and steps < 2000:
-        dt, D, Sr, tau, rho0, vr, p = rk3_step(val, D, Sr, tau, rho0, vr, p, r, grid, eos, recon, rsolve, cfl=0.5)
+        dt, D, Sr, tau, rho0, vr, p = rk4_step(val, D, Sr, tau, rho0, vr, p, r, grid, eos, recon, rsolve, cfl=0.5)
         t += dt; steps += 1
 
     # Variación relativa (interior)
@@ -350,14 +375,14 @@ def test_riemann_sod():
     # Discontinuidad en el punto medio del dominio interior
     r_mid = 0.5*(r[NUM_GHOSTS] + r[-NUM_GHOSTS-1])
     rho0_base = np.where(r < r_mid, 10.0, 1.0)
-    p_base = np.where(r < r_mid, 40.0/3.0, 1.0e-6)
+    p_base = np.where(r < r_mid, 400.0/3.0, 1.0e-6)
     v_base = np.zeros(N)
 
     # Lista de métodos de reconstrucción a probar
-    methods = ["minmod", "mp5"]#, "weno5", "wenoz", "mp5_hires"]
-    colors = ["lightcoral", "lightblue",]# "lightgreen", "moccasin", "black"]
-    labels = ["Minmod", "MP5"]#, "WENO5", "WENO-Z", "MP5 (Hi-Res)"]
-    linestyles = ["--", "-"]#, "--", "--", "-"]  # Punteadas para baja res, continua para alta res
+    methods = ["minmod", "mp5", "weno5", "mp5_hires"]#, "weno5", "wenoz", "mp5_hires"]
+    colors = ["lightcoral", "lightblue", "lightgreen", "moccasin"]  
+    labels = ["Minmod", "MP5", "WENO5" , "MP5 (Hi-Res)"]
+    linestyles = ["--", "-", "--", "-"]
 
     # Guardar resultados para cada método
     results = {}
@@ -367,14 +392,14 @@ def test_riemann_sod():
 
         # Para MP5 alta resolución, usar más puntos
         if method == "mp5_hires":
-            grid_hires, Nin_hires = build_engrenage_grid(n_interior=100, r_min=1e-3, r_max=1.0)
+            grid_hires, Nin_hires = build_engrenage_grid(n_interior=2000, r_min=1e-3, r_max=1.0)
             r_hires = grid_hires.r
             N_hires = len(r_hires)
 
             # Discontinuidad en el punto medio del dominio interior
             r_mid_hires = 0.5*(r_hires[NUM_GHOSTS] + r_hires[-NUM_GHOSTS-1])
             rho0 = np.where(r_hires < r_mid_hires, 10.0, 1.0)
-            p = np.where(r_hires < r_mid_hires, 40.0/3.0, 1.0e-6)
+            p = np.where(r_hires < r_mid_hires, 400.0/3.0, 1.0e-6)
             v = np.zeros(N_hires)
 
             # Aplicar paridades/outflow
@@ -409,7 +434,7 @@ def test_riemann_sod():
         t, Tfinal = 0.0, 0.2
         steps = 0
         while t < Tfinal and steps < 5000:
-            dt, D, Sr, tau, rho0, v, p = rk3_step(
+            dt, D, Sr, tau, rho0, v, p = rk4_step(
                 val, D, Sr, tau, rho0, v, p, r_current, grid_current, eos, recon, rsolve, cfl=0.45
             )
             t += dt
@@ -430,9 +455,9 @@ def test_riemann_sod():
         # Métricas de calidad
         rho_in = rho0[ng:-ng]
         # Use Engrenage derivatives for gradient calculation
-        rho_full = np.zeros_like(r)
+        rho_full = np.zeros_like(r_current)
         rho_full[ng:-ng] = rho_in
-        grad_full = compute_derivative_engrenage(rho_full, grid, order=1)
+        grad_full = compute_derivative_engrenage(rho_full, grid_current, order=1)
         grad = grad_full[ng:-ng]  # Extract interior gradient
         variation = np.std(rho_in)/np.mean(rho_in)
         contact = np.any(np.abs(grad) > 0.5)
@@ -443,7 +468,7 @@ def test_riemann_sod():
     # ======================
     # Estados iniciales (usar grid normal para referencia)
     rho0_init = np.where(r < r_mid, 10.0, 1.0)
-    p_init = np.where(r < r_mid, 40.0/3.0, 1.0e-6)
+    p_init = np.where(r < r_mid, 400.0/3.0, 1.0e-6)
     v_init = np.zeros(N)
     rho0_init, v_init, p_init = fill_ghosts_primitives(rho0_init, v_init, p_init)
 
@@ -620,17 +645,17 @@ def test_blast_wave(case='weak',
 
     # --- objetos físicos ---
     eos    = IdealGasEOS(gamma=gamma)
-    recon  = MinmodReconstruction()
+    recon = create_reconstruction("mp5")
     rsolve = HLLERiemannSolver()
     val    = ValenciaReferenceMetric()
 
     # --- conservadas iniciales ---
     D, Sr, tau = to_conserved(rho0, v, p, eos)
 
-    # --- evolución RK3 con compute_rhs (full approach) ---
+    # --- evolución RK4 con compute_rhs (full approach) ---
     t, steps = 0.0, 0
     while t < t_final and steps < 20000:
-        dt, D, Sr, tau, rho0, v, p = rk3_step(
+        dt, D, Sr, tau, rho0, v, p = rk4_step(
             val, D, Sr, tau, rho0, v, p,
             r, grid, eos, recon, rsolve, cfl=cfl,
             spacetime_mode="fixed_minkowski"
@@ -695,7 +720,7 @@ def test_conservation_short():
     m0, e0 = volume_integrals(D, tau, r, grid)
     steps = 0
     while steps < 200:
-        dt, D, Sr, tau, rho0, v, p = rk3_step(val, D, Sr, tau, rho0, v, p, r, grid, eos, recon, rsolve, cfl=0.25)
+        dt, D, Sr, tau, rho0, v, p = rk4_step(val, D, Sr, tau, rho0, v, p, r, grid, eos, recon, rsolve, cfl=0.25)
         steps += 1
     m1, e1 = volume_integrals(D, tau, r, grid)
     dm = abs(m1-m0)/max(m0,1e-15)

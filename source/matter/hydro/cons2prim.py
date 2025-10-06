@@ -319,7 +319,13 @@ class Cons2PrimSolver:
                         eps_ultimate = eps_final[eps_ok]
                         p_ultimate = p_final[eps_ok]
 
-                        h_ultimate = 1.0 + eps_ultimate + p_ultimate / np.maximum(rho0_ultimate, 1e-30)
+                        # Calculate h based on EOS type
+                        if hasattr(self.eos, 'K') and hasattr(self.eos, 'gamma'):
+                            # Polytropic EOS: h = 1 + ε
+                            h_ultimate = 1.0 + eps_ultimate
+                        else:
+                            # Ideal gas: h = 1 + ε + P/ρ
+                            h_ultimate = 1.0 + eps_ultimate + p_ultimate / np.maximum(rho0_ultimate, 1e-30)
                         h_ok = np.isfinite(h_ultimate) & (h_ultimate > 1.0)
 
                         if np.any(h_ok):
@@ -507,7 +513,14 @@ class Cons2PrimSolver:
         if not np.isfinite(eps) or eps < 0.0:
             return False, (0, 0, 0, 1, 1, np.inf)
 
-        h = 1.0 + eps + p / max(rho0, 1e-30)
+        # Calculate h based on EOS type
+        if hasattr(self.eos, 'K') and hasattr(self.eos, 'gamma'):
+            # Polytropic EOS: h = 1 + ε
+            h = 1.0 + eps
+        else:
+            # Ideal gas: h = 1 + ε + P/ρ
+            h = 1.0 + eps + p / max(rho0, 1e-30)
+
         if not np.isfinite(h) or h <= 1.0:
             return False, (0, 0, 0, 1, 1, np.inf)
 
@@ -606,7 +619,14 @@ class Cons2PrimSolver:
             eps = 1e-10
 
         W = 1.0
-        h = 1.0 + eps + p / rho0
+
+        # Calculate h based on EOS type
+        if hasattr(self.eos, 'K') and hasattr(self.eos, 'gamma'):
+            # Polytropic EOS: h = 1 + ε
+            h = 1.0 + eps
+        else:
+            # Ideal gas: h = 1 + ε + P/ρ
+            h = 1.0 + eps + p / rho0
 
         return rho0, vr, p, eps, W, h
 
@@ -652,7 +672,16 @@ def prim_to_cons(rho0, vr, pressure, gamma_rr, eos):
 
     # Thermodynamic quantities from EOS
     eps = eos.eps_from_rho_p(rho0, pressure)
-    h = 1.0 + eps + pressure / np.maximum(rho0, 1e-30)
+
+    # Specific enthalpy depends on EOS type
+    # For POLYTROPIC: P = K ρ^Γ, ε = P/[(Γ-1)ρ], h = 1 + ε
+    # For IDEAL GAS: P = (Γ-1)ρε, h = 1 + ε + P/ρ
+    if hasattr(eos, 'K') and hasattr(eos, 'gamma'):
+        # Polytropic EOS
+        h = 1.0 + eps
+    else:
+        # Ideal gas or other EOS
+        h = 1.0 + eps + pressure / np.maximum(rho0, 1e-30)
 
     # Conservative variables
     D = rho0 * W

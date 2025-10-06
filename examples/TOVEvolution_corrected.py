@@ -11,19 +11,16 @@ Author: Claude + engrenage team
 Date: 2025-10-01
 """
 
-import csv
 import numpy as np
 import sys
 import matplotlib.pyplot as plt
-from pathlib import Path
-from datetime import datetime
 from scipy.integrate import ode, trapezoid
 from scipy.interpolate import interp1d
 
 # Engrenage core
 sys.path.insert(0, '/home/yo/repositories/engrenage')
 from source.core.grid import Grid
-from source.core.spacing import CubicSpacing, LinearSpacing,  NUM_GHOSTS
+from source.core.spacing import LinearSpacing, NUM_GHOSTS
 from source.core.statevector import StateVector
 from source.backgrounds.sphericalbackground import FlatSphericalBackground, i_r
 
@@ -34,722 +31,512 @@ from source.bssn.tensoralgebra import get_bar_gamma_LL
 
 # Hydro
 from source.matter.hydro.perfect_fluid import PerfectFluid
-from source.matter.hydro.eos import IdealGasEOS
+from source.matter.hydro.eos import PolytropicEOS
 from source.matter.hydro.reconstruction import create_reconstruction
 from source.matter.hydro.riemann import HLLERiemannSolver
+from source.matter.hydro.cons2prim import prim_to_cons
 
 
 class TOVSolver:
-    """
-    TOV solver following NRPy+ equations.
-
-    Equations (from nrpy/equations/tov/TOV_equations.py):
-    - dP/dr = -(ρ + P)(2M/r + 8πr²P) / [r(1 - 2M/r)]
-    - dM/dr = 4πr²ρ
-    - dν/dr = (2M/r + 8πr²P) / [r(1 - 2M/r)]
-    - dr_iso/dr = r_iso / [r √(1 - 2M/r)]
-    """
+    """TOV solver in polar (Schwarzschild) coordinates."""
 
     def __init__(self, K, Gamma):
         self.K = K
         self.Gamma = Gamma
 
     def eos_pressure(self, rho_baryon):
-        """P = K * rho_baryon^Gamma"""
         return self.K * rho_baryon**self.Gamma
 
     def eos_rho_baryon(self, P):
-        """rho_baryon = (P/K)^(1/Gamma)"""
         if P <= 0:
             return 0.0
         return (P / self.K)**(1.0 / self.Gamma)
 
     def eos_rho_energy(self, P):
-        """Total energy density: rho_energy = rho_baryon * (1 + eps)"""
         if P <= 0:
-            return 1e-30
+            return 1e-12
         rho_b = self.eos_rho_baryon(P)
         eps = P / ((self.Gamma - 1.0) * rho_b) if rho_b > 0 else 0.0
         return rho_b * (1.0 + eps)
 
-    def tov_rhs(self, r_Schw, y):
-        """
-        RHS of TOV equations matching NRPy+.
+    def tov_rhs(self, r, y):
+        """RHS of TOV equations: y = [P, Phi, M]"""
+        P, Phi, M = y
+        if r < 1e-10:
+            return np.array([0.0, 0.0, 0.0])
 
-        State vector y = [P, nu, M, r_iso]
-        """
-        P, nu, M, r_iso = y
-
-        # Handle center
-        if r_Schw == 0:
-            return np.array([0.0, 0.0, 0.0, 1.0])
-
-        rho_energy = self.eos_rho_energy(P)
-
-        # TOV equations (NRPy+ form)
-        denom = r_Schw * (1.0 - 2.0 * M / r_Schw)
+        rho = self.eos_rho_energy(P)
+        denom = r * (r - 2.0 * M)
         if abs(denom) < 1e-30:
-            return np.array([0.0, 0.0, 0.0, 0.0])
+            return np.array([0.0, 0.0, 0.0])
 
-        numerator = 2.0 * M / r_Schw + 8.0 * np.pi * r_Schw**2 * P
+        numerator = M + 4.0 * np.pi * r**3 * P
+        dP_dr = -(rho + P) * numerator / denom
+        dPhi_dr = numerator / denom
+        dM_dr = 4.0 * np.pi * r**2 * rho
 
-        dP_dr = -(rho_energy + P) * numerator / denom
-        dnu_dr = numerator / denom
-        dM_dr = 4.0 * np.pi * r_Schw**2 * rho_energy
-        dr_iso_dr = r_iso / (r_Schw * np.sqrt(1.0 - 2.0 * M / r_Schw))
+        return np.array([dP_dr, dPhi_dr, dM_dr])
 
-        return np.array([dP_dr, dnu_dr, dM_dr, dr_iso_dr])
+    def solve(self, rho_central, r_max=20.0, dr=0.001):
+        """Solve TOV equations from center outward."""
+        P_c = self.eos_pressure(rho_central)
+        Phi_c = 0.0
+        M_c = 0.0
 
-    def solve(self, rho_central, rtol=1e-10, atol=1e-12):
-        """
-        Integrate TOV equations from center to surface.
+        solver = ode(self.tov_rhs).set_integrator('dopri5')
+        solver.set_initial_value([P_c, Phi_c, M_c], 0.001)
 
-        Returns: dict with TOV solution
-        """
-        # Initial conditions
-        P_central = self.eos_pressure(rho_central)
-        r_start = 1e-6
-        rho_0 = self.eos_rho_energy(P_central)
-        M_start = (4.0 * np.pi / 3.0) * rho_0 * r_start**3
-        nu_start = 0.0
-        r_iso_start = r_start
+        r_arr, P_arr, Phi_arr, M_arr = [0.001], [P_c], [Phi_c], [M_c]
 
-        y0 = np.array([P_central, nu_start, M_start, r_iso_start])
+        while solver.successful() and solver.y[0] > 1e-10 and solver.t < r_max:
+            solver.integrate(solver.t + dr)
+            r_arr.append(solver.t)
+            P_arr.append(solver.y[0])
+            Phi_arr.append(solver.y[1])
+            M_arr.append(solver.y[2])
 
-        # Setup integrator
-        integrator = ode(self.tov_rhs).set_integrator('dopri5', rtol=rtol, atol=atol)
-        integrator.set_initial_value(y0, r_start)
+        r_arr = np.array(r_arr)
+        P_arr = np.array(P_arr)
+        Phi_arr = np.array(Phi_arr)
+        M_arr = np.array(M_arr)
+        rho_arr = np.array([self.eos_rho_baryon(P) for P in P_arr])
 
-        # Storage
-        r_arr = [r_start]
-        P_arr = [P_central]
-        nu_arr = [nu_start]
-        M_arr = [M_start]
-        r_iso_arr = [r_iso_start]
-
-        dr = 1e-4
-        r_current = r_start
-
-        # Integrate until pressure drops to zero
-        while integrator.successful() and r_current < 100.0:
-            integrator.integrate(r_current + dr)
-            P, nu, M, r_iso = integrator.y
-
-            if P <= 1e-15 * P_central:
-                break
-
-            r_current += dr
-            r_arr.append(r_current)
-            P_arr.append(P)
-            nu_arr.append(nu)
-            M_arr.append(M)
-            r_iso_arr.append(r_iso)
-
-        # Convert to arrays
-        r_Schw = np.array(r_arr)
-        P = np.array(P_arr)
-        nu = np.array(nu_arr)
-        M = np.array(M_arr)
-        r_iso = np.array(r_iso_arr)
-
-        # Stellar surface values
-        R_Schw = r_Schw[-1]
-        M_star = M[-1]
-        R_iso = r_iso[-1]
-        nu_surface = nu[-1]
-
-        # Apply boundary conditions (NRPy+ style)
-        # Normalize r_iso
-        r_iso_surface_correct = 0.5 * (np.sqrt(R_Schw * (R_Schw - 2*M_star)) + R_Schw - M_star)
-        normalize = r_iso_surface_correct / R_iso
-        r_iso = r_iso * normalize
-
-        # Normalize nu (lapse)
-        # At surface: alpha = sqrt(1 - 2M/R) => nu = log(alpha) = 0.5*log(1-2M/R)
-        nu_surface_correct = 0.5 * np.log(1.0 - 2.0*M_star/R_Schw)
-        nu = nu - nu_surface + nu_surface_correct
-
-        # Derived quantities
-        rho_baryon = np.array([self.eos_rho_baryon(p) for p in P])
-        rho_energy = np.array([self.eos_rho_energy(p) for p in P])
-
-        alpha = np.exp(nu)  # Lapse function
-        exp4phi = (r_Schw / r_iso)**2  # Conformal factor
-
-        print(f"TOV Solution: M={M_star:.6f}, R={R_Schw:.3f}, C={M_star/R_Schw:.4f}")
+        # Surface radius and metric
+        R_star = r_arr[-1]
+        M_star = M_arr[-1]
+        exp4phi = 1.0 / (1.0 - 2.0 * M_arr / r_arr)
+        alpha = np.exp(Phi_arr) / np.sqrt(1.0 - 2.0 * M_arr / r_arr)
 
         return {
-            'r_Schw': r_Schw,
-            'r_iso': r_iso,
-            'P': P,
-            'rho_baryon': rho_baryon,
-            'rho_energy': rho_energy,
-            'M': M,
-            'alpha': alpha,
-            'exp4phi': exp4phi,
-            'nu': nu,
-            'M_star': M_star,
-            'R_Schw': R_Schw,
-            'R_iso': R_iso
+            'r': r_arr, 'P': P_arr, 'M': M_arr, 'Phi': Phi_arr,
+            'rho_baryon': rho_arr, 'exp4phi': exp4phi, 'alpha': alpha,
+            'R': R_star, 'M_star': M_star, 'C': M_star / R_star
         }
 
 
-def create_tov_initial_state(grid, background, hydro, tov_solution):
-    """
-    Create engrenage initial state from TOV solution.
+def create_initial_data(tov_solution, grid, eos, atmosphere_rho):
+    """Create BSSN + hydro initial data from TOV solution."""
+    r_tov = tov_solution['r']
+    rho_tov_interp = interp1d(r_tov, tov_solution['rho_baryon'], kind='cubic',
+                              bounds_error=False, fill_value=(tov_solution['rho_baryon'][0], 0.0))
+    P_tov_interp = interp1d(r_tov, tov_solution['P'], kind='cubic',
+                            bounds_error=False, fill_value=(tov_solution['P'][0], 0.0))
+    Phi_tov_interp = interp1d(r_tov, tov_solution['Phi'], kind='cubic',
+                              bounds_error=False, fill_value=(tov_solution['Phi'][0], 0.0))
+    M_tov_interp = interp1d(r_tov, tov_solution['M'], kind='cubic',
+                            bounds_error=False, fill_value=(0.0, tov_solution['M'][-1]))
 
-    Interpolates TOV data to grid and constructs full state vector.
-    """
-    r = grid.r
-    N = len(r)
+    # BSSN variables
+    state_2d = np.zeros((grid.NUM_VARS, grid.N))
 
-    # Interpolate TOV solution to grid (use isotropic radius)
-    r_tov = tov_solution['r_iso']
+    for i, r in enumerate(grid.r):
+        M = M_tov_interp(r)
+        Phi = Phi_tov_interp(r)
 
-    def safe_interp(data, fill_value=0.0):
-        return interp1d(r_tov, data, kind='cubic', bounds_error=False,
-                       fill_value=(data[0], fill_value), assume_sorted=True)
+        # Conformal factor: exp(4φ) = (1 - 2M/r)^(-1)
+        exp4phi = 1.0 / (1.0 - 2.0 * M / r) if r > 2.0 * M else 1.0
+        phi = 0.25 * np.log(exp4phi)
 
-    rho_baryon = safe_interp(tov_solution['rho_baryon'], 1e-13)(r)
-    pressure = safe_interp(tov_solution['P'], 1e-15)(r)
-    alpha = safe_interp(tov_solution['alpha'], 1.0)(r)
-    exp4phi = safe_interp(tov_solution['exp4phi'], 1.0)(r)
+        # Lapse: α = exp(Φ) / sqrt(1 - 2M/r)
+        alpha = np.exp(Phi) / np.sqrt(1.0 - 2.0 * M / r) if r > 2.0 * M else 1.0
 
-    # Ensure atmosphere
-    rho_baryon = np.maximum(rho_baryon, hydro.atmosphere_rho)
-    pressure = np.maximum(pressure, 1e-15)
+        # Set BSSN vars (rest are zero for spherical symmetry)
+        state_2d[0, i] = phi  # conformal factor
+        state_2d[idx_lapse, i] = alpha  # lapse
 
-    # Initial velocity = 0 (equilibrium)
-    vr = np.zeros_like(r)
+    # Hydro variables
+    for i, r in enumerate(grid.r):
+        rho = max(rho_tov_interp(r), atmosphere_rho)
+        P = P_tov_interp(r)
+        M = M_tov_interp(r)
 
-    # Lorentz factor and enthalpy
-    W = np.ones_like(r)
-    eps = hydro.eos.eps_from_rho_p(rho_baryon, pressure)
-    h = 1.0 + eps + pressure / np.maximum(rho_baryon, 1e-30)
+        gamma_rr = 1.0 / (1.0 - 2.0 * M / r) if r > 2.0 * M else 1.0
+        D, Sr, tau = prim_to_cons(rho, 0.0, P, gamma_rr, eos)
 
-    # BSSN variables from TOV
-    phi = 0.25 * np.log(exp4phi)  # e^{4φ} => φ = log(e^{4φ})/4
+        state_2d[NUM_BSSN_VARS + 0, i] = D
+        state_2d[NUM_BSSN_VARS + 1, i] = Sr
+        state_2d[NUM_BSSN_VARS + 2, i] = tau
 
-    # Conformal metric deviation h_ij = 0 (spherical)
-    h_rr = np.zeros_like(r)
-    h_tt = np.zeros_like(r)
-    h_pp = np.zeros_like(r)
-
-    # Extrinsic curvature K, A_ij = 0 (static)
-    K = np.zeros_like(r)
-    A_rr = np.zeros_like(r)
-    A_tt = np.zeros_like(r)
-    A_pp = np.zeros_like(r)
-
-    # Conformal connection lambda^r = 0
-    lambda_r = np.zeros_like(r)
-
-    # Shift and auxiliary variable
-    shift_r = np.zeros_like(r)
-    b_r = np.zeros_like(r)
-
-    # Lapse
-    lapse = alpha
-
-    # Conservative hydro variables
-    # For static equilibrium: D = ρ₀ W, S_r = 0, τ = ρ₀ h W² - p - D
-    gamma_rr = exp4phi  # In spherical: γ_rr = e^{4φ} * 1
-
-    D = rho_baryon * W
-    Sr = rho_baryon * h * W * W * vr * gamma_rr  # = 0 since vr=0
-    tau = rho_baryon * h * W * W - pressure - D
-
-    # Pack state vector
-    state = np.zeros((grid.NUM_VARS, N))
-    state[0, :] = phi
-    state[1, :] = h_rr
-    state[2, :] = h_tt
-    state[3, :] = h_pp
-    state[4, :] = K
-    state[5, :] = A_rr
-    state[6, :] = A_tt
-    state[7, :] = A_pp
-    state[8, :] = lambda_r
-    state[9, :] = shift_r
-    state[10, :] = b_r
-    state[11, :] = lapse
-    state[hydro.idx_D, :] = D
-    state[hydro.idx_Sr, :] = Sr
-    state[hydro.idx_tau, :] = tau
-
-    return state
+    return state_2d
 
 
-def get_rhs_cowling(t, y, grid, background, hydro, bssn_fixed, bssn_d1_fixed, diagnostics=None):
-    """RHS for Cowling evolution with diagnostics."""
+def get_rhs_cowling(t, y, grid, background, hydro, bssn_fixed, bssn_d1_fixed):
+    """RHS for Cowling evolution (fixed spacetime)."""
     state = y.reshape((grid.NUM_VARS, grid.N))
     grid.fill_boundaries(state)
 
     bssn_vars = BSSNVars(grid.N)
     bssn_vars.set_bssn_vars(bssn_fixed)
-
     hydro.set_matter_vars(state, bssn_vars, grid)
 
-    # Diagnostics
-    if diagnostics is not None and diagnostics.get('print_interval', 0) > 0:
-        diagnostics['call_count'] += 1
-        should_print = False
-        if not diagnostics.get('printed_initial', False):
-            should_print = True
-            diagnostics['printed_initial'] = True
-        elif diagnostics['call_count'] % diagnostics['print_interval'] == 0:
-            should_print = True
-        if should_print:
-            prim = hydro._get_primitives(bssn_vars, grid.r)
-
-            center_idx = NUM_GHOSTS
-            rho_c = prim['rho0'][center_idx]
-            p_c = prim['p'][center_idx]
-            v_max = np.max(np.abs(prim['vr']))
-            D_c = state[hydro.idx_D, center_idx]
-            Sr_c = state[hydro.idx_Sr, center_idx]
-            tau_c = state[hydro.idx_tau, center_idx]
-            vr_c = prim['vr'][center_idx]
-            eps_c = prim.get('eps', np.zeros_like(prim['rho0']))[center_idx]
-            W_c = prim.get('W', np.ones_like(prim['rho0']))[center_idx]
-            h_c = prim.get('h', np.ones_like(prim['rho0']))[center_idx]
-
-            inner = slice(NUM_GHOSTS, -NUM_GHOSTS) if grid.N > 2*NUM_GHOSTS else slice(0, grid.N)
-            r_inner = grid.r[inner]
-            D_inner = state[hydro.idx_D, inner]
-
-            # Baryon masses: flat (diagnóstico) y física (isotrópica)
-            M_b_flat = 4.0 * np.pi * trapezoid(D_inner * r_inner**2, r_inner)
-            e6phi = np.exp(6.0 * np.asarray(bssn_vars.phi)[inner])
-            M_b_phys = 4.0 * np.pi * trapezoid(D_inner * e6phi * r_inner**2, r_inner)
-
-            # Referencias iniciales
-            M_b_flat_0 = diagnostics.get('M_b_initial_flat', M_b_flat)
-            if 'M_b_initial_flat' not in diagnostics:
-                diagnostics['M_b_initial_flat'] = M_b_flat
-            dM_b_flat = (M_b_flat - M_b_flat_0) / (M_b_flat_0 + 1e-300)
-
-            M_b_phys_0 = diagnostics.get('M_b_initial_phys', M_b_phys)
-            if 'M_b_initial_phys' not in diagnostics:
-                diagnostics['M_b_initial_phys'] = M_b_phys
-            dM_b_phys = (M_b_phys - M_b_phys_0) / (M_b_phys_0 + 1e-300)
-
-            print(
-                f"  t={t:6.3f}  ρ_c={rho_c:.9f}  P_c={p_c:.2e}  v_max={v_max:.2e}  "
-                f"D_c={D_c:.6e}  S_r,c={Sr_c:.6e}  τ_c={tau_c:.6e}  "
-                f"M_b_flat={M_b_flat:.6f}  ΔM_b_flat={dM_b_flat:.2e}  "
-                f"M_b_phys={M_b_phys:.6f}  ΔM_b_phys={dM_b_phys:.2e}"
-            )
-
-            # Persist diagnostics to CSV if requested
-            csv_path = diagnostics.get('csv_path')
-            if csv_path is not None:
-                csv_writer = diagnostics.get('csv_writer')
-                if csv_writer is None:
-                    csv_path.parent.mkdir(parents=True, exist_ok=True)
-                    csv_file = open(csv_path, mode='w', newline='')
-                    writer = csv.writer(csv_file)
-                    writer.writerow([
-                        't', 'rho_c', 'P_c', 'v_max', 'D_c', 'Sr_c', 'tau_c',
-                        'vr_c', 'eps_c', 'W_c', 'h_c',
-                        'M_b_flat', 'delta_M_b_flat', 'M_b_phys', 'delta_M_b_phys'
-                    ])
-                    diagnostics['csv_writer'] = writer
-                    diagnostics['csv_file'] = csv_file
-                else:
-                    writer = csv_writer
-                    csv_file = diagnostics.get('csv_file')
-
-                writer.writerow([
-                    f"{t:.15f}",
-                    f"{rho_c:.15f}",
-                    f"{p_c:.15f}",
-                    f"{v_max:.15f}",
-                    f"{D_c:.15f}",
-                    f"{Sr_c:.15f}",
-                    f"{tau_c:.15f}",
-                    f"{vr_c:.15f}",
-                    f"{eps_c:.15f}",
-                    f"{W_c:.15f}",
-                    f"{h_c:.15f}",
-                    f"{M_b_flat:.15f}",
-                    f"{dM_b_flat:.15f}",
-                    f"{M_b_phys:.15f}",
-                    f"{dM_b_phys:.15f}"
-                ])
-                csv_file.flush()
-
-    # Compute RHS
     hydro_rhs = hydro.get_matter_rhs(grid.r, bssn_vars, bssn_d1_fixed, background)
 
+    # Full RHS (BSSN frozen, only hydro evolves)
     rhs = np.zeros_like(state)
-    rhs[NUM_BSSN_VARS:NUM_BSSN_VARS+3, :] = hydro_rhs
-
+    rhs[NUM_BSSN_VARS:, :] = hydro_rhs
     return rhs.flatten()
 
 
-def rk4_evolve(initial_state, grid, background, hydro,
-               bssn_fixed, bssn_d1_fixed, diagnostics,
-               T_final, min_dr, sample_times, center_idx):
-    state = initial_state.copy()
-    t = 0.0
-    dt_max = 0.5 * min_dr
-    rhs_calls = 0
+def rk4_step(state_flat, dt, grid, background, hydro, bssn_fixed, bssn_d1_fixed):
+    """Single RK4 (classical 4th order Runge-Kutta) timestep."""
+    # Stage 1
+    k1 = get_rhs_cowling(0, state_flat, grid, background, hydro, bssn_fixed, bssn_d1_fixed)
 
-    times_samples = []
-    rho_samples = []
+    # Stage 2
+    state_2 = state_flat + 0.5 * dt * k1
+    k2 = get_rhs_cowling(0, state_2, grid, background, hydro, bssn_fixed, bssn_d1_fixed)
 
-    def record_sample(current_state, current_time):
-        state_2d = current_state.reshape((grid.NUM_VARS, grid.N))
-        bssn_tmp = BSSNVars(grid.N)
-        bssn_tmp.set_bssn_vars(state_2d[:NUM_BSSN_VARS, :])
-        hydro.set_matter_vars(state_2d, bssn_tmp, grid)
-        prim = hydro._get_primitives(bssn_tmp, grid.r)
-        times_samples.append(current_time)
-        rho_samples.append(prim['rho0'][center_idx])
+    # Stage 3
+    state_3 = state_flat + 0.5 * dt * k2
+    k3 = get_rhs_cowling(0, state_3, grid, background, hydro, bssn_fixed, bssn_d1_fixed)
 
-    record_sample(state, t)
-    next_sample_idx = 1
-    total_steps = 0
+    # Stage 4
+    state_4 = state_flat + dt * k3
+    k4 = get_rhs_cowling(0, state_4, grid, background, hydro, bssn_fixed, bssn_d1_fixed)
 
-    while t < T_final - 1e-12:
-        next_sample_time = sample_times[next_sample_idx] if next_sample_idx < len(sample_times) else T_final
-        dt = min(dt_max, next_sample_time - t, T_final - t)
-        if dt <= 0.0:
-            next_sample_idx += 1
-            continue
+    # Combine
+    state_new = state_flat + (dt / 6.0) * (k1 + 2*k2 + 2*k3 + k4)
 
-        k1 = get_rhs_cowling(t, state, grid, background, hydro, bssn_fixed, bssn_d1_fixed, diagnostics)
-        k2 = get_rhs_cowling(t + 0.5 * dt, state + 0.5 * dt * k1, grid, background, hydro, bssn_fixed, bssn_d1_fixed, None)
-        k3 = get_rhs_cowling(t + 0.5 * dt, state + 0.5 * dt * k2, grid, background, hydro, bssn_fixed, bssn_d1_fixed, None)
-        k4 = get_rhs_cowling(t + dt, state + dt * k3, grid, background, hydro, bssn_fixed, bssn_d1_fixed, None)
-
-        state = state + (dt / 6.0) * (k1 + 2.0 * k2 + 2.0 * k3 + k4)
-        t += dt
-        total_steps += 1
-        rhs_calls += 4
-
-        if next_sample_idx < len(sample_times) and t >= sample_times[next_sample_idx] - 1e-12:
-            record_sample(state, t)
-            next_sample_idx += 1
-
-    state_final = state.reshape((grid.NUM_VARS, grid.N))
-    return state_final, np.array(times_samples), np.array(rho_samples), rhs_calls, total_steps
+    return state_new
 
 
-def rk3_evolve(initial_state, grid, background, hydro,
-               bssn_fixed, bssn_d1_fixed, diagnostics,
-               T_final, min_dr, sample_times, center_idx):
-    """SSP RK3 (TVD RK3) time integrator with fixed CFL.
+def evolve_fixed_timestep(state_initial, dt, num_steps, grid, background, hydro,
+                          bssn_fixed, bssn_d1_fixed, method='rk4'):
+    """Evolve with fixed timestep using RK4."""
+    state_flat = state_initial.flatten()
 
-    Returns:
-      state_final (2D), times (1D), rho_c_series (1D), rhs_calls (int), total_steps (int)
-    """
-    state = initial_state.copy()
-    t = 0.0
-    dt_max = 0.5 * min_dr
-    rhs_calls = 0
+    for step in range(num_steps):
+        state_flat = rk4_step(state_flat, dt, grid, background, hydro, bssn_fixed, bssn_d1_fixed)
+        if (step + 1) % 20 == 0:
+            print(f"  Step {step+1}/{num_steps}")
 
-    times_samples = []
-    rho_samples = []
-
-    def record_sample(current_state, current_time):
-        state_2d = current_state.reshape((grid.NUM_VARS, grid.N))
-        bssn_tmp = BSSNVars(grid.N)
-        bssn_tmp.set_bssn_vars(state_2d[:NUM_BSSN_VARS, :])
-        hydro.set_matter_vars(state_2d, bssn_tmp, grid)
-        prim = hydro._get_primitives(bssn_tmp, grid.r)
-        times_samples.append(current_time)
-        rho_samples.append(prim['rho0'][center_idx])
-
-    record_sample(state, t)
-    next_sample_idx = 1
-    total_steps = 0
-
-    while t < T_final - 1e-12:
-        next_sample_time = sample_times[next_sample_idx] if next_sample_idx < len(sample_times) else T_final
-        dt = min(dt_max, next_sample_time - t, T_final - t)
-        if dt <= 0.0:
-            next_sample_idx += 1
-            continue
-
-        # Stage 1
-        k1 = get_rhs_cowling(t, state, grid, background, hydro, bssn_fixed, bssn_d1_fixed, diagnostics)
-        u1 = state + dt * k1
-
-        # Stage 2
-        k2 = get_rhs_cowling(t + dt, u1, grid, background, hydro, bssn_fixed, bssn_d1_fixed, None)
-        u2 = 0.75 * state + 0.25 * (u1 + dt * k2)
-
-        # Stage 3
-        k3 = get_rhs_cowling(t + 0.5 * dt, u2, grid, background, hydro, bssn_fixed, bssn_d1_fixed, None)
-        state = (1.0 / 3.0) * state + (2.0 / 3.0) * (u2 + dt * k3)
-
-        t += dt
-        total_steps += 1
-        rhs_calls += 3
-
-        if next_sample_idx < len(sample_times) and t >= sample_times[next_sample_idx] - 1e-12:
-            record_sample(state, t)
-            next_sample_idx += 1
-
-    state_final = state.reshape((grid.NUM_VARS, grid.N))
-    return state_final, np.array(times_samples), np.array(rho_samples), rhs_calls, total_steps
+    return state_flat.reshape((grid.NUM_VARS, grid.N))
 
 
+def evolve_adaptive(state_initial, t_final, grid, background, hydro,
+                   bssn_fixed, bssn_d1_fixed, method='RK45', rtol=1e-6, atol=1e-8):
+    """Evolve with adaptive timestep using scipy.integrate.solve_ivp."""
+    from scipy.integrate import solve_ivp
 
-def main():
-    """Main execution."""
+    # Wrapper for RHS compatible with solve_ivp
+    def rhs_wrapper(t, y):
+        return get_rhs_cowling(t, y, grid, background, hydro, bssn_fixed, bssn_d1_fixed)
 
-    print("="*70)
-    print("TOV Star Evolution")
-    print("="*70)
+    state_flat = state_initial.flatten()
 
-    # ==================================================================
-    # SETUP
-    # ==================================================================
+    print(f"  Using solve_ivp with method={method}, rtol={rtol}, atol={atol}")
 
-    # Grid
-    r_max = 20.0
-    min_dr = 0.002
-    max_dr = 0.2
-
-    params = CubicSpacing.get_parameters(r_max, min_dr, max_dr)
-    spacing = CubicSpacing(**params)
-
-    # EOS (polytropic)
-    K = 100.0
-    Gamma = 2.0
-    eos = IdealGasEOS(gamma=Gamma)
-
-    # Hydro
-    reconstructor = create_reconstruction("mp5")
-    riemann_solver = HLLERiemannSolver()
-
-    hydro = PerfectFluid(
-        eos=eos,
-        spacetime_mode="dynamic",
-        atmosphere_rho=1e-12,
-        reconstructor=reconstructor,
-        riemann_solver=riemann_solver
+    solution = solve_ivp(
+        rhs_wrapper,
+        t_span=(0, t_final),
+        y0=state_flat,
+        method=method,  # 'RK45', 'RK23', 'DOP853', 'Radau', 'BDF', 'LSODA'
+        rtol=rtol,
+        atol=atol,
+        dense_output=False
     )
 
-    my_state_vector = StateVector(hydro)
-    grid = Grid(spacing, my_state_vector)
-    background = FlatSphericalBackground(grid.r)
-    hydro.background = background
+    print(f"  solve_ivp: {solution.nfev} function evaluations, status={solution.status}")
 
-    print(f"Grid: N={grid.N}, r_max={r_max}, dr_min={min_dr}")
-    print(f"EOS: K={K}, Gamma={Gamma}")
+    return solution.y[:, -1].reshape((grid.NUM_VARS, grid.N))
 
-    # ==================================================================
-    # TOV SOLUTION
-    # ==================================================================
 
-    print("\nSolving TOV equations...")
-    rho_central = 1.28e-3  # Nuclear density scale
-    tov_solver = TOVSolver(K=K, Gamma=Gamma)
-    tov_solution = tov_solver.solve(rho_central)
-
-    # Visualize TOV profiles for diagnostic purposes
-    r_plot = tov_solution['r_iso']
+def plot_tov_diagnostics(tov_solution):
+    """Plot TOV solution diagnostics."""
+    r = tov_solution['r']
     fig, axes = plt.subplots(2, 2, figsize=(12, 8))
-    axes[0, 0].plot(r_plot, tov_solution['rho_baryon'], color='navy')
-    axes[0, 0].set_xlabel(r"$r_{\mathrm{iso}}$")
+
+    axes[0, 0].plot(r, tov_solution['rho_baryon'], color='navy')
+    axes[0, 0].set_xlabel(r"$r$")
     axes[0, 0].set_ylabel(r"$\rho_0$")
     axes[0, 0].set_title('Baryon Density')
     axes[0, 0].grid(True, alpha=0.3)
 
-    axes[0, 1].plot(r_plot, tov_solution['P'], color='darkgreen')
-    axes[0, 1].set_xlabel(r"$r_{\mathrm{iso}}$")
+    axes[0, 1].plot(r, tov_solution['P'], color='darkgreen')
+    axes[0, 1].set_xlabel(r"$r$")
     axes[0, 1].set_ylabel('P')
-    axes[0, 1].set_title('Pressure Profile')
+    axes[0, 1].set_title('Pressure')
     axes[0, 1].grid(True, alpha=0.3)
 
-    axes[1, 0].plot(r_plot, tov_solution['M'], color='maroon')
-    axes[1, 0].set_xlabel(r"$r_{\mathrm{iso}}$")
-    axes[1, 0].set_ylabel('m(r)')
+    axes[1, 0].plot(r, tov_solution['M'], color='maroon')
+    axes[1, 0].set_xlabel(r"$r$")
+    axes[1, 0].set_ylabel('M(r)')
     axes[1, 0].set_title('Enclosed Mass')
     axes[1, 0].grid(True, alpha=0.3)
 
-    axes[1, 1].plot(r_plot, tov_solution['alpha'], color='black')
-    axes[1, 1].set_xlabel(r"$r_{\mathrm{iso}}$")
-    axes[1, 1].set_ylabel('α')
+    axes[1, 1].plot(r, tov_solution['alpha'], color='purple')
+    axes[1, 1].set_xlabel(r"$r$")
+    axes[1, 1].set_ylabel(r'$\alpha$')
     axes[1, 1].set_title('Lapse Function')
     axes[1, 1].grid(True, alpha=0.3)
 
     plt.tight_layout()
-    plt.show(block=True)
+    plt.savefig('tov_solution.png', dpi=150, bbox_inches='tight')
     plt.close(fig)
 
-    print("\nTOV diagnostics displayed. Proceeding to build initial data and evolve...\n")
+
+def plot_initial_comparison(tov_solution, initial_state_2d, grid, hydro):
+    """Plot initial data vs TOV comparison."""
+    # Get primitives from initial data
+    bssn_vars = BSSNVars(grid.N)
+    bssn_vars.set_bssn_vars(initial_state_2d[:NUM_BSSN_VARS, :])
+    hydro.set_matter_vars(initial_state_2d, bssn_vars, grid)
+    prim = hydro._get_primitives(bssn_vars, grid.r)
+
+    r_tov = tov_solution['r']
+    r_grid = grid.r[NUM_GHOSTS:-NUM_GHOSTS]
+    rho_grid = prim['rho0'][NUM_GHOSTS:-NUM_GHOSTS]
+    P_grid = prim['p'][NUM_GHOSTS:-NUM_GHOSTS]
+    v_grid = prim['vr'][NUM_GHOSTS:-NUM_GHOSTS]
+
+    fig, axes = plt.subplots(2, 2, figsize=(14, 10))
+
+    # Density
+    axes[0, 0].semilogy(r_tov, tov_solution['rho_baryon'], 'b-', linewidth=2, label='TOV')
+    axes[0, 0].semilogy(r_grid, rho_grid, 'r--', linewidth=1.5, alpha=0.7, label='Initial data (t=0)')
+    axes[0, 0].axvline(tov_solution['R'], color='gray', linestyle=':', alpha=0.5, label=f"R={tov_solution['R']:.2f}")
+    axes[0, 0].set_xlabel('r')
+    axes[0, 0].set_ylabel(r'$\rho_0$')
+    axes[0, 0].set_title('Baryon Density')
+    axes[0, 0].legend()
+    axes[0, 0].grid(True, alpha=0.3)
+
+    # Pressure
+    axes[0, 1].semilogy(r_tov, np.maximum(tov_solution['P'], 1e-20), 'b-', linewidth=2, label='TOV')
+    axes[0, 1].semilogy(r_grid, np.maximum(P_grid, 1e-20), 'r--', linewidth=1.5, alpha=0.7, label='Initial data (t=0)')
+    axes[0, 1].axvline(tov_solution['R'], color='gray', linestyle=':', alpha=0.5)
+    axes[0, 1].set_xlabel('r')
+    axes[0, 1].set_ylabel('P')
+    axes[0, 1].set_title('Pressure')
+    axes[0, 1].legend()
+    axes[0, 1].grid(True, alpha=0.3)
+
+    # Velocity (should be zero initially)
+    axes[1, 0].plot(r_grid, v_grid, 'r-', linewidth=2, label='Initial data (t=0)')
+    axes[1, 0].axhline(0, color='gray', linestyle='--', alpha=0.5)
+    axes[1, 0].axvline(tov_solution['R'], color='gray', linestyle=':', alpha=0.5)
+    axes[1, 0].set_xlabel('r')
+    axes[1, 0].set_ylabel(r'$v^r$')
+    axes[1, 0].set_title('Radial Velocity')
+    axes[1, 0].legend()
+    axes[1, 0].grid(True, alpha=0.3)
+
+    # Lapse
+    alpha_tov = tov_solution['alpha']
+    alpha_grid = initial_state_2d[idx_lapse, NUM_GHOSTS:-NUM_GHOSTS]
+    axes[1, 1].plot(r_tov, alpha_tov, 'b-', linewidth=2, label='TOV')
+    axes[1, 1].plot(r_grid, alpha_grid, 'r--', linewidth=1.5, alpha=0.7, label='Initial data (t=0)')
+    axes[1, 1].axvline(tov_solution['R'], color='gray', linestyle=':', alpha=0.5)
+    axes[1, 1].set_xlabel('r')
+    axes[1, 1].set_ylabel(r'$\alpha$')
+    axes[1, 1].set_title('Lapse Function')
+    axes[1, 1].legend()
+    axes[1, 1].grid(True, alpha=0.3)
+
+    plt.suptitle('TOV vs Initial Data (t=0)', fontsize=14, y=1.00)
+    plt.tight_layout()
+    plt.savefig('tov_initial_data_comparison.png', dpi=150, bbox_inches='tight')
+    plt.close(fig)
+
+
+def plot_evolution(state_t0, state_t1, state_t100, grid, hydro, dt, num_steps):
+    """Plot evolution snapshots: t=0, t=1*dt, t=100*dt."""
+    bssn_0 = BSSNVars(grid.N)
+    bssn_0.set_bssn_vars(state_t0[:NUM_BSSN_VARS, :])
+    hydro.set_matter_vars(state_t0, bssn_0, grid)
+    prim_0 = hydro._get_primitives(bssn_0, grid.r)
+
+    bssn_1 = BSSNVars(grid.N)
+    bssn_1.set_bssn_vars(state_t1[:NUM_BSSN_VARS, :])
+    hydro.set_matter_vars(state_t1, bssn_1, grid)
+    prim_1 = hydro._get_primitives(bssn_1, grid.r)
+
+    bssn_100 = BSSNVars(grid.N)
+    bssn_100.set_bssn_vars(state_t100[:NUM_BSSN_VARS, :])
+    hydro.set_matter_vars(state_t100, bssn_100, grid)
+    prim_100 = hydro._get_primitives(bssn_100, grid.r)
+
+    r_int = grid.r[NUM_GHOSTS:-NUM_GHOSTS]
+    t_final = num_steps * dt
+
+    fig, axes = plt.subplots(2, 2, figsize=(14, 10))
+
+    # Density
+    axes[0, 0].plot(r_int, prim_0['rho0'][NUM_GHOSTS:-NUM_GHOSTS], 'b-', linewidth=2, label='t=0')
+    axes[0, 0].plot(r_int, prim_1['rho0'][NUM_GHOSTS:-NUM_GHOSTS], 'orange', linestyle='--', linewidth=1.5, label=f't=1×dt')
+    axes[0, 0].plot(r_int, prim_100['rho0'][NUM_GHOSTS:-NUM_GHOSTS], 'red', linestyle=':', linewidth=1.5, label=f't={num_steps}×dt')
+    axes[0, 0].set_xlabel('r')
+    axes[0, 0].set_ylabel(r'$\rho_0$')
+    axes[0, 0].set_title('Baryon Density Evolution')
+    axes[0, 0].legend()
+    axes[0, 0].grid(True, alpha=0.3)
+
+    # Pressure
+    axes[0, 1].semilogy(r_int, np.maximum(prim_0['p'][NUM_GHOSTS:-NUM_GHOSTS], 1e-20), 'b-', linewidth=2, label='t=0')
+    axes[0, 1].semilogy(r_int, np.maximum(prim_1['p'][NUM_GHOSTS:-NUM_GHOSTS], 1e-20), 'orange', linestyle='--', linewidth=1.5, label=f't=1×dt')
+    axes[0, 1].semilogy(r_int, np.maximum(prim_100['p'][NUM_GHOSTS:-NUM_GHOSTS], 1e-20), 'red', linestyle=':', linewidth=1.5, label=f't={num_steps}×dt')
+    axes[0, 1].set_xlabel('r')
+    axes[0, 1].set_ylabel('P')
+    axes[0, 1].set_title('Pressure Evolution')
+    axes[0, 1].legend()
+    axes[0, 1].grid(True, alpha=0.3)
+
+    # Velocity
+    axes[1, 0].plot(r_int, prim_0['vr'][NUM_GHOSTS:-NUM_GHOSTS], 'b-', linewidth=2, label='t=0')
+    axes[1, 0].plot(r_int, prim_1['vr'][NUM_GHOSTS:-NUM_GHOSTS], 'orange', linestyle='--', linewidth=1.5, label=f't=1×dt')
+    axes[1, 0].plot(r_int, prim_100['vr'][NUM_GHOSTS:-NUM_GHOSTS], 'red', linestyle=':', linewidth=1.5, label=f't={num_steps}×dt')
+    axes[1, 0].set_xlabel('r')
+    axes[1, 0].set_ylabel(r'$v^r$')
+    axes[1, 0].set_title('Radial Velocity Evolution')
+    axes[1, 0].legend()
+    axes[1, 0].grid(True, alpha=0.3)
+
+    # Relative density error
+    delta_rho_1 = np.abs(prim_1['rho0'][NUM_GHOSTS:-NUM_GHOSTS] - prim_0['rho0'][NUM_GHOSTS:-NUM_GHOSTS]) / (np.abs(prim_0['rho0'][NUM_GHOSTS:-NUM_GHOSTS]) + 1e-20)
+    delta_rho_100 = np.abs(prim_100['rho0'][NUM_GHOSTS:-NUM_GHOSTS] - prim_0['rho0'][NUM_GHOSTS:-NUM_GHOSTS]) / (np.abs(prim_0['rho0'][NUM_GHOSTS:-NUM_GHOSTS]) + 1e-20)
+
+    axes[1, 1].semilogy(r_int, delta_rho_1, 'orange', linestyle='--', linewidth=1.5, label=f't=1×dt')
+    axes[1, 1].semilogy(r_int, delta_rho_100, 'red', linestyle=':', linewidth=1.5, label=f't={num_steps}×dt')
+    axes[1, 1].set_xlabel('r')
+    axes[1, 1].set_ylabel(r'$|\Delta\rho|/\rho$')
+    axes[1, 1].set_title('Relative Density Error')
+    axes[1, 1].legend()
+    axes[1, 1].grid(True, alpha=0.3)
+
+    plt.suptitle(f'Evolution: t=0 → t={dt:.4f} → t={t_final:.4f}', fontsize=14, y=1.00)
+    plt.tight_layout()
+    plt.savefig('tov_evolution.png', dpi=150, bbox_inches='tight')
+    plt.close(fig)
+
+
+def main():
+    """Main execution."""
+    print("="*70)
+    print("TOV Star Evolution - Cowling Approximation")
+    print("="*70)
+
+    # ==================================================================
+    # CONFIGURATION
+    # ==================================================================
+    r_max = 11.0
+    num_points = 1000  # Use 4000+ for production runs
+    K = 500.0
+    Gamma = 2.5  # NOTE: Gamma=2.0 is pathological (tau→0)
+    rho_central = 1.28e-3
+    atmosphere_rho = 1.0e-10
+
+    # Time integration method
+    # 'fixed': RK4 with fixed timestep (fast, stable)
+    # 'adaptive': solve_ivp with adaptive timestep (slower, more accurate)
+    integration_method = 'fixed'
+
+    # ==================================================================
+    # SETUP
+    # ==================================================================
+    spacing = LinearSpacing(num_points, r_max)
+    eos = PolytropicEOS(K=K, gamma=Gamma)
+    hydro = PerfectFluid(
+        eos=eos,
+        spacetime_mode="dynamic",
+        atmosphere_rho=atmosphere_rho,
+        reconstructor=create_reconstruction("mp5"),
+        riemann_solver=HLLERiemannSolver()
+    )
+
+    state_vector = StateVector(hydro)
+    grid = Grid(spacing, state_vector)
+    background = FlatSphericalBackground(grid.r)
+    hydro.background = background
+
+    print(f"Grid: N={grid.N}, r_max={r_max}, dr_min={grid.min_dr}")
+    print(f"EOS: K={K}, Gamma={Gamma}\n")
+
+    # ==================================================================
+    # SOLVE TOV
+    # ==================================================================
+    print("Solving TOV equations...")
+    tov_solver = TOVSolver(K=K, Gamma=Gamma)
+    tov_solution = tov_solver.solve(rho_central, r_max=r_max)
+    print(f"TOV Solution: M={tov_solution['M_star']:.6f}, R={tov_solution['R']:.3f}, C={tov_solution['C']:.4f}\n")
+
+    plot_tov_diagnostics(tov_solution)
 
     # ==================================================================
     # INITIAL DATA
     # ==================================================================
+    print("Creating initial data...")
+    initial_state_2d = create_initial_data(tov_solution, grid, eos, atmosphere_rho)
 
-    print("\nCreating initial data from TOV solution...")
-    initial_state_2d = create_tov_initial_state(grid, background, hydro, tov_solution)
-    initial_state = initial_state_2d.flatten()
-
-    # Verify initial state
-    bssn_vars_init = BSSNVars(grid.N)
-    bssn_vars_init.set_bssn_vars(initial_state_2d[:NUM_BSSN_VARS, :])
-    hydro.set_matter_vars(initial_state_2d, bssn_vars_init, grid)
-    prim0 = hydro._get_primitives(bssn_vars_init, grid.r)
-
-    center_idx = NUM_GHOSTS
-    D0_center = initial_state_2d[hydro.idx_D, center_idx]
-    Sr0_center = initial_state_2d[hydro.idx_Sr, center_idx]
-    tau0_center = initial_state_2d[hydro.idx_tau, center_idx]
-    print(f"Initial ρ_c = {prim0['rho0'][center_idx]:.4f}")
-    print(f"Initial P_c = {prim0['p'][center_idx]:.2e}")
-    print(f"Initial max|v^r| = {np.max(np.abs(prim0['vr'])):.2e}")
-    print(f"Initial conserved: D={D0_center:.3e}, S_r={Sr0_center:.3e}, τ={tau0_center:.3e}")
+    plot_initial_comparison(tov_solution, initial_state_2d, grid, hydro)
 
     # ==================================================================
     # EVOLUTION
     # ==================================================================
-
     bssn_fixed = initial_state_2d[:NUM_BSSN_VARS, :].copy()
     bssn_d1_fixed = grid.get_d1_metric_quantities(initial_state_2d)
 
-    T_final = 1000.0
-    num_outputs = 1000
-    t_eval = np.linspace(0, T_final, num_outputs)
+    if integration_method == 'fixed':
+        dt = 0.5 * grid.min_dr  # CFL condition
+        num_steps = 100
+        print(f"\nEvolving with fixed dt={dt:.6f} (CFL=0.5) for {num_steps} steps using RK4")
 
-    print(f"\nEvolving for T={T_final} (Cowling approximation)")
-    print("Diagnostics every 1000 RHS calls:")
-    print("  " + "-"*90)
+        # Single step for comparison
+        state_t1 = rk4_step(initial_state_2d.flatten(), dt, grid, background, hydro,
+                           bssn_fixed, bssn_d1_fixed).reshape((grid.NUM_VARS, grid.N))
 
-    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-    log_dir = Path('tov_diagnostics')
-    log_path = log_dir / f'tov_diagnostics_{timestamp}.csv'
+        # Multiple steps
+        state_t100 = evolve_fixed_timestep(initial_state_2d, dt, num_steps, grid, background,
+                                          hydro, bssn_fixed, bssn_d1_fixed, method='rk4')
 
-    diagnostics = {
-        'call_count': 0,
-        'print_interval': 100,
-        'csv_path': log_path,
-        'csv_writer': None,
-        'csv_file': None
-    }
+    elif integration_method == 'adaptive':
+        # NOTE: Adaptive methods are slower but can be more accurate
+        # Available methods: 'RK45', 'RK23', 'DOP853', 'Radau', 'BDF', 'LSODA'
+        t_final = 0.5  # Final time
+        print(f"\nEvolving to t={t_final} using solve_ivp (adaptive)")
 
-    # Select integrator: 'ivp' (solve_ivp RK45), 'rk4', or 'rk3'
-    method = 'rk4'  # options: 'ivp', 'rk4', 'rk3'
-    sample_times = np.linspace(0.0, T_final, num_outputs)
+        # For single step comparison, use small fixed dt
+        dt = 0.5 * grid.min_dr
+        state_t1 = rk4_step(initial_state_2d.flatten(), dt, grid, background, hydro,
+                           bssn_fixed, bssn_d1_fixed).reshape((grid.NUM_VARS, grid.N))
 
-    if method == 'ivp':
-        from scipy.integrate import solve_ivp
-        solution = solve_ivp(
-            get_rhs_cowling,
-            [0, T_final],
-            initial_state,
-            args=(grid, background, hydro, bssn_fixed, bssn_d1_fixed, diagnostics),
-            method='RK45',
-            t_eval=sample_times,
-            max_step=0.3 * min_dr
-        )
+        # Adaptive evolution
+        state_t100 = evolve_adaptive(initial_state_2d, t_final, grid, background, hydro,
+                                    bssn_fixed, bssn_d1_fixed, method='DOP853', rtol=1e-5, atol=1e-7)
 
-        if not solution.success:
-            print(f"\n  Evolution failed: {solution.message}")
-            csv_file = diagnostics.get('csv_file')
-            if csv_file is not None:
-                csv_file.close()
-            return
+    # ==================================================================
+    # DIAGNOSTICS
+    # ==================================================================
+    plot_evolution(initial_state_2d, state_t1, state_t100, grid, hydro, dt, num_steps)
 
-        state_final = solution.y[:, -1].reshape((grid.NUM_VARS, grid.N))
-        times = solution.t
-        rho_c_series = []
-        bssn_tmp = BSSNVars(grid.N)
-        for column in solution.y.T:
-            state_snapshot = column.reshape((grid.NUM_VARS, grid.N))
-            bssn_tmp.set_bssn_vars(state_snapshot[:NUM_BSSN_VARS, :])
-            hydro.set_matter_vars(state_snapshot, bssn_tmp, grid)
-            prim_snapshot = hydro._get_primitives(bssn_tmp, grid.r)
-            rho_c_series.append(prim_snapshot['rho0'][center_idx])
-        rho_c_series = np.array(rho_c_series)
-        rhs_calls = solution.nfev
-        print(f"\n✓ Evolution completed: {rhs_calls} RHS evaluations (solve_ivp)")
+    # Print statistics
+    bssn_0 = BSSNVars(grid.N)
+    bssn_0.set_bssn_vars(initial_state_2d[:NUM_BSSN_VARS, :])
+    hydro.set_matter_vars(initial_state_2d, bssn_0, grid)
+    prim_0 = hydro._get_primitives(bssn_0, grid.r)
 
-    elif method == 'rk4':
-        state_final, times, rho_c_series, rhs_calls, total_steps = rk4_evolve(
-            initial_state, grid, background, hydro,
-            bssn_fixed, bssn_d1_fixed, diagnostics,
-            T_final, min_dr, sample_times, center_idx
-        )
-        print(f"\n✓ Evolution completed: {rhs_calls} RHS evaluations ({total_steps} RK4 steps)")
-    elif method == 'rk3':
-        state_final, times, rho_c_series, rhs_calls, total_steps = rk3_evolve(
-            initial_state, grid, background, hydro,
-            bssn_fixed, bssn_d1_fixed, diagnostics,
-            T_final, min_dr, sample_times, center_idx
-        )
-        print(f"\n✓ Evolution completed: {rhs_calls} RHS evaluations ({total_steps} RK3 steps)")
+    bssn_100 = BSSNVars(grid.N)
+    bssn_100.set_bssn_vars(state_t100[:NUM_BSSN_VARS, :])
+    hydro.set_matter_vars(state_t100, bssn_100, grid)
+    prim_100 = hydro._get_primitives(bssn_100, grid.r)
+
+    # Calculate actual final time
+    if integration_method == 'fixed':
+        t_final_actual = num_steps * dt
     else:
-        raise ValueError(f"Unknown evolution method: {method}")
+        t_final_actual = t_final
 
-    # ==================================================================
-    # FINAL DIAGNOSTICS
-    # ==================================================================
-
-    bssn_final = BSSNVars(grid.N)
-    bssn_final.set_bssn_vars(state_final[:NUM_BSSN_VARS, :])
-    hydro.set_matter_vars(state_final, bssn_final, grid)
-    prim_final = hydro._get_primitives(bssn_final, grid.r)
-
-    print(f"\nFinal state (t={T_final}):")
-    print(f"  ρ_c = {prim_final['rho0'][center_idx]:.6f} (initial: {prim0['rho0'][center_idx]:.6f})")
-    print(f"  P_c = {prim_final['p'][center_idx]:.2e} (initial: {prim0['p'][center_idx]:.2e})")
-    print(f"  max|v^r| = {np.max(np.abs(prim_final['vr'])):.2e}")
-    Df_center = state_final[hydro.idx_D, center_idx]
-    Srf_center = state_final[hydro.idx_Sr, center_idx]
-    tauf_center = state_final[hydro.idx_tau, center_idx]
-    print(f"  Conserved center: D={Df_center:.6e} (initial {D0_center:.6e})")
-    print(f"                     S_r={Srf_center:.6e} (initial {Sr0_center:.6e})")
-    print(f"                     τ={tauf_center:.6e} (initial {tau0_center:.6e})")
-
-    # Plot central density evolution over time
-    if len(times) == len(rho_c_series) and len(times) > 1:
-        plt.figure(figsize=(8, 4))
-        plt.plot(times, rho_c_series, color='black', linewidth=2)
-        plt.xlabel('t')
-        plt.ylabel('ρ_c(t)')
-        plt.title('Central Density Evolution')
-        plt.grid(True, alpha=0.3)
-        plt.tight_layout()
-        plt.show()
-
-    # Fig. 1: time evolution of |ρ_c(t) − ρ_c(0)|
-    if len(times) == len(rho_c_series) and len(times) > 1:
-        delta_rhoc = np.abs(rho_c_series - rho_c_series[0])
-        plt.figure(figsize=(8, 4))
-        plt.semilogy(times, delta_rhoc, 'b-', linewidth=2)
-        plt.xlabel('t')
-        plt.ylabel('|ρ_c(t) − ρ_c(0)|')
-        plt.title('Time evolution of |ρ_c(t) − ρ_c(0)|')
-        plt.grid(True, which='both', alpha=0.3)
-        plt.tight_layout()
-        plt.show()
-
-    # Relative drift of central density scaled by 1e-3
-    if len(times) == len(rho_c_series) and len(times) > 1:
-        delta_rel = (rho_c_series - rho_c_series[0]) / (rho_c_series[0] + 1e-30) * 1e3
-        times_ms = times * 1.0e3
-        plt.figure(figsize=(8, 4))
-        plt.plot(times_ms, delta_rel, color='darkred', linewidth=2)
-        plt.xlabel('t [ms]')
-        plt.ylabel(r'$\Delta\rho_c/\rho_{c,0} \times 10^{-3}$')
-        plt.title('Central Density Drift (Relative)')
-        plt.grid(True, alpha=0.3)
-        plt.tight_layout()
-        plt.show()
-
-    csv_file = diagnostics.get('csv_file')
-    if csv_file is not None:
-        csv_file.close()
+    print(f"\nFinal statistics (t={t_final_actual:.6f}):")
+    print(f"  Max |v^r| at t=0:     {np.max(np.abs(prim_0['vr'])):.3e}")
+    print(f"  Max |v^r| at t_final: {np.max(np.abs(prim_100['vr'])):.3e}")
+    print(f"  ρ_c at t=0:     {prim_0['rho0'][NUM_GHOSTS]:.6e}")
+    print(f"  ρ_c at t_final: {prim_100['rho0'][NUM_GHOSTS]:.6e}")
+    print(f"  Δρ_c/ρ_c: {abs(prim_100['rho0'][NUM_GHOSTS] - prim_0['rho0'][NUM_GHOSTS])/prim_0['rho0'][NUM_GHOSTS]:.3e}")
 
     print("\n" + "="*70)
-    print("Evolution complete!")
+    print("Evolution complete. Plots saved:")
+    print("  1. tov_solution.png              - TOV solution (ρ, P, M, α)")
+    print("  2. tov_initial_data_comparison.png - TOV vs Initial data at t=0")
+    print("  3. tov_evolution.png             - Evolution: t=0 → t=dt → t=100×dt")
     print("="*70)
 
 
