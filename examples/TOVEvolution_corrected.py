@@ -219,8 +219,8 @@ def plot_first_step(state_t0, state_t1, grid, hydro):
     fig, axes = plt.subplots(1, 3, figsize=(15, 4.5))
 
     # Density
-    axes[0].semilogy(r_int, prim_0['rho0'][NUM_GHOSTS:-NUM_GHOSTS], 'b-', linewidth=2, label='t=0')
-    axes[0].semilogy(r_int, prim_1['rho0'][NUM_GHOSTS:-NUM_GHOSTS], 'r--', linewidth=1.7, label='t=1×dt')
+    axes[0].plot(r_int, prim_0['rho0'][NUM_GHOSTS:-NUM_GHOSTS], 'b-', linewidth=2, label='t=0')
+    axes[0].plot(r_int, prim_1['rho0'][NUM_GHOSTS:-NUM_GHOSTS], 'r--', linewidth=1.7, label='t=1×dt')
     axes[0].set_xlabel('r')
     axes[0].set_ylabel(r'$\rho_0$')
     axes[0].set_title('Density: first step')
@@ -228,8 +228,8 @@ def plot_first_step(state_t0, state_t1, grid, hydro):
     axes[0].grid(True, alpha=0.3)
 
     # Pressure
-    axes[1].semilogy(r_int, np.maximum(prim_0['p'][NUM_GHOSTS:-NUM_GHOSTS], 1e-20), 'b-', linewidth=2, label='t=0')
-    axes[1].semilogy(r_int, np.maximum(prim_1['p'][NUM_GHOSTS:-NUM_GHOSTS], 1e-20), 'r--', linewidth=1.7, label='t=1×dt')
+    axes[1].plot(r_int, np.maximum(prim_0['p'][NUM_GHOSTS:-NUM_GHOSTS], 1e-20), 'b-', linewidth=2, label='t=0')
+    axes[1].plot(r_int, np.maximum(prim_1['p'][NUM_GHOSTS:-NUM_GHOSTS], 1e-20), 'r--', linewidth=1.7, label='t=1×dt')
     axes[1].set_xlabel('r')
     axes[1].set_ylabel('P')
     axes[1].set_title('Pressure: first step')
@@ -453,8 +453,8 @@ def plot_initial_comparison(tov_solution, initial_state_2d, grid, hydro):
     fig, axes = plt.subplots(2, 2, figsize=(14, 10))
 
     # Density
-    axes[0, 0].semilogy(r_tov, tov_solution['rho_baryon'], 'b-', linewidth=2, label='TOV')
-    axes[0, 0].semilogy(r_grid, np.maximum(rho_grid, 1e-20), 'r--', linewidth=1.5, alpha=0.7, label='Initial data (t=0)')
+    axes[0, 0].plot(r_tov, tov_solution['rho_baryon'], 'b-', linewidth=2, label='TOV')
+    axes[0, 0].plot(r_grid, np.maximum(rho_grid, 1e-20), 'r--', linewidth=1.5, alpha=0.7, label='Initial data (t=0)')
     axes[0, 0].axvline(tov_solution['R'], color='gray', linestyle=':', alpha=0.5, label=f"R={tov_solution['R']:.2f}")
     axes[0, 0].set_xlabel('r')
     axes[0, 0].set_ylabel(r'$\rho_0$')
@@ -463,8 +463,8 @@ def plot_initial_comparison(tov_solution, initial_state_2d, grid, hydro):
     axes[0, 0].grid(True, alpha=0.3)
 
     # Pressure
-    axes[0, 1].semilogy(r_tov, tov_solution['P'], 'b-', linewidth=2, label='TOV')
-    axes[0, 1].semilogy(r_grid, np.maximum(P_grid, 1e-20), 'r--', linewidth=1.5, alpha=0.7, label='Initial data (t=0)')
+    axes[0, 1].plot(r_tov, tov_solution['P'], 'b-', linewidth=2, label='TOV')
+    axes[0, 1].plot(r_grid, np.maximum(P_grid, 1e-20), 'r--', linewidth=1.5, alpha=0.7, label='Initial data (t=0)')
     axes[0, 1].axvline(tov_solution['R'], color='gray', linestyle=':', alpha=0.5)
     axes[0, 1].set_xlabel('r')
     axes[0, 1].set_ylabel('P')
@@ -532,9 +532,9 @@ def plot_evolution(state_t0, state_t1, state_t100, grid, hydro, dt, num_steps):
     axes[0, 0].grid(True, alpha=0.3)
 
     # Pressure
-    axes[0, 1].semilogy(r_int, np.maximum(prim_0['p'][NUM_GHOSTS:-NUM_GHOSTS], 1e-20), 'b-', linewidth=2, label='t=0')
-    axes[0, 1].semilogy(r_int, np.maximum(prim_1['p'][NUM_GHOSTS:-NUM_GHOSTS], 1e-20), 'orange', linestyle='--', linewidth=1.5, label=f't=1×dt')
-    axes[0, 1].semilogy(r_int, np.maximum(prim_100['p'][NUM_GHOSTS:-NUM_GHOSTS], 1e-20), 'red', linestyle=':', linewidth=1.5, label=f't={num_steps}×dt')
+    axes[0, 1].plot(r_int, np.maximum(prim_0['p'][NUM_GHOSTS:-NUM_GHOSTS], 1e-20), 'b-', linewidth=2, label='t=0')
+    axes[0, 1].plot(r_int, np.maximum(prim_1['p'][NUM_GHOSTS:-NUM_GHOSTS], 1e-20), 'orange', linestyle='--', linewidth=1.5, label=f't=1×dt')
+    axes[0, 1].plot(r_int, np.maximum(prim_100['p'][NUM_GHOSTS:-NUM_GHOSTS], 1e-20), 'red', linestyle=':', linewidth=1.5, label=f't={num_steps}×dt')
     axes[0, 1].set_xlabel('r')
     axes[0, 1].set_ylabel('P')
     axes[0, 1].set_title('Pressure Evolution')
