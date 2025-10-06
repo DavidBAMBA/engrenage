@@ -67,16 +67,22 @@ def create_initial_data(tov_solution, grid, background, eos, atmosphere_rho):
         P_grid = np.zeros(grid.N)
         nu_grid = np.zeros(grid.N)
         M_grid = np.zeros(grid.N)
+        exp4phi_grid = np.ones(grid.N)
+        alpha_grid = np.ones(grid.N)
 
         # Find indices where grid.r > 0 (these match TOV grid)
         positive_mask = grid.r > 0
         positive_indices = np.where(positive_mask)[0]
 
-        # Copy TOV values to corresponding positive-r grid points
+        # Copy TOV values to corresponding positive-r grid points (no interpolation)
         rho_grid[positive_indices[:n_tov]] = rho_tov_vals
         P_grid[positive_indices[:n_tov]] = P_tov_vals
         nu_grid[positive_indices[:n_tov]] = nu_tov_vals
         M_grid[positive_indices[:n_tov]] = M_tov_vals
+        if 'exp4phi' in tov_solution:
+            exp4phi_grid[positive_indices[:n_tov]] = tov_solution['exp4phi']
+        if 'alpha' in tov_solution:
+            alpha_grid[positive_indices[:n_tov]] = tov_solution['alpha']
 
         # Atmosphere: negative radii and beyond stellar surface
         rho_grid[~positive_mask] = atmosphere_rho  # Negative radii
@@ -85,6 +91,13 @@ def create_initial_data(tov_solution, grid, background, eos, atmosphere_rho):
         P_grid[positive_indices[n_tov:]] = p_atm
         nu_grid[positive_indices[n_tov:]] = nu_tov_vals[-1]
         M_grid[positive_indices[n_tov:]] = M_tov_vals[-1]
+        # For metric/lapse outside copied region, apply exterior values; negative r mirror central values
+        if 'exp4phi' in tov_solution:
+            exp4phi_grid[positive_indices[n_tov:]] = tov_solution['exp4phi'][-1]
+            exp4phi_grid[~positive_mask] = tov_solution['exp4phi'][0]
+        if 'alpha' in tov_solution:
+            alpha_grid[positive_indices[n_tov:]] = tov_solution['alpha'][-1]
+            alpha_grid[~positive_mask] = tov_solution['alpha'][0]
     else:
         # Need interpolation (less accurate)
         print("  TOV and evolution grids differ - using interpolation")
@@ -102,14 +115,15 @@ def create_initial_data(tov_solution, grid, background, eos, atmosphere_rho):
         nu_grid = nu_tov_interp(grid.r)
         M_grid = M_tov_interp(grid.r)
 
-    # Interpolate exp4phi and alpha to grid
-    exp4phi_interp = interp1d(r_tov, tov_solution['exp4phi'], kind='cubic',
-                              bounds_error=False, fill_value=(1.0, tov_solution['exp4phi'][-1]))
-    alpha_interp = interp1d(r_tov, tov_solution['alpha'], kind='cubic',
-                            bounds_error=False, fill_value=(1.0, tov_solution['alpha'][-1]))
-
-    exp4phi_grid = exp4phi_interp(grid.r)
-    alpha_grid = alpha_interp(grid.r)
+    # exp4phi/alpha: if not already set (same_grid False), interpolate once
+    if 'exp4phi_grid' not in locals():
+        exp4phi_interp = interp1d(r_tov, tov_solution['exp4phi'], kind='cubic',
+                                  bounds_error=False, fill_value=(1.0, tov_solution['exp4phi'][-1]))
+        exp4phi_grid = exp4phi_interp(grid.r)
+    if 'alpha_grid' not in locals():
+        alpha_interp = interp1d(r_tov, tov_solution['alpha'], kind='cubic',
+                                bounds_error=False, fill_value=(1.0, tov_solution['alpha'][-1]))
+        alpha_grid = alpha_interp(grid.r)
 
     # Get reference metric from background (ĝ_ij)
     ghatDD = background.hat_gamma_LL  # Shape: [N, 3, 3]
@@ -180,6 +194,83 @@ def create_initial_data(tov_solution, grid, background, eos, atmosphere_rho):
     grid.fill_boundaries(state_2d)
 
     return state_2d
+
+
+def plot_first_step(state_t0, state_t1, grid, hydro):
+    """Plot only t=0 vs t=1×dt to inspect the first update."""
+    bssn_0 = BSSNVars(grid.N)
+    bssn_0.set_bssn_vars(state_t0[:NUM_BSSN_VARS, :])
+    hydro.set_matter_vars(state_t0, bssn_0, grid)
+    prim_0 = hydro._get_primitives(bssn_0, grid.r)
+
+    bssn_1 = BSSNVars(grid.N)
+    bssn_1.set_bssn_vars(state_t1[:NUM_BSSN_VARS, :])
+    hydro.set_matter_vars(state_t1, bssn_1, grid)
+    prim_1 = hydro._get_primitives(bssn_1, grid.r)
+
+    r_int = grid.r[NUM_GHOSTS:-NUM_GHOSTS]
+
+    fig, axes = plt.subplots(1, 3, figsize=(15, 4.5))
+
+    # Density
+    axes[0].semilogy(r_int, prim_0['rho0'][NUM_GHOSTS:-NUM_GHOSTS], 'b-', linewidth=2, label='t=0')
+    axes[0].semilogy(r_int, prim_1['rho0'][NUM_GHOSTS:-NUM_GHOSTS], 'r--', linewidth=1.7, label='t=1×dt')
+    axes[0].set_xlabel('r')
+    axes[0].set_ylabel(r'$\rho_0$')
+    axes[0].set_title('Density: first step')
+    axes[0].legend()
+    axes[0].grid(True, alpha=0.3)
+
+    # Pressure
+    axes[1].semilogy(r_int, np.maximum(prim_0['p'][NUM_GHOSTS:-NUM_GHOSTS], 1e-20), 'b-', linewidth=2, label='t=0')
+    axes[1].semilogy(r_int, np.maximum(prim_1['p'][NUM_GHOSTS:-NUM_GHOSTS], 1e-20), 'r--', linewidth=1.7, label='t=1×dt')
+    axes[1].set_xlabel('r')
+    axes[1].set_ylabel('P')
+    axes[1].set_title('Pressure: first step')
+    axes[1].legend()
+    axes[1].grid(True, alpha=0.3)
+
+    # Velocity
+    axes[2].plot(r_int, prim_0['vr'][NUM_GHOSTS:-NUM_GHOSTS], 'b-', linewidth=2, label='t=0')
+    axes[2].plot(r_int, prim_1['vr'][NUM_GHOSTS:-NUM_GHOSTS], 'r--', linewidth=1.7, label='t=1×dt')
+    axes[2].set_xlabel('r')
+    axes[2].set_ylabel(r'$v^r$')
+    axes[2].set_title('Velocity: first step')
+    axes[2].legend()
+    axes[2].grid(True, alpha=0.3)
+
+    plt.tight_layout()
+    plt.savefig('tov_first_step.png', dpi=150, bbox_inches='tight')
+    plt.close(fig)
+
+
+def plot_lapse_first_step(tov_solution, state_t0, state_t1, grid):
+    """Plot lapse alpha for TOV vs t=0 vs t=1×dt (interior only)."""
+    r_int = grid.r[NUM_GHOSTS:-NUM_GHOSTS]
+    alpha_t0 = state_t0[idx_lapse, NUM_GHOSTS:-NUM_GHOSTS]
+    alpha_t1 = state_t1[idx_lapse, NUM_GHOSTS:-NUM_GHOSTS]
+
+    # Restrict TOV to interior radii for one-to-one overlay
+    r0 = r_int[0]
+    r1 = r_int[-1]
+    mask = (tov_solution['r'] >= r0 - 1e-14) & (tov_solution['r'] <= r1 + 1e-14)
+    r_tov_int = tov_solution['r'][mask]
+    alpha_tov_int = tov_solution['alpha'][mask]
+
+    import matplotlib.pyplot as plt
+    fig, ax = plt.subplots(1, 1, figsize=(7, 4.5))
+    ax.plot(r_tov_int, alpha_tov_int, 'b-', linewidth=2, label='TOV')
+    ax.plot(r_int, alpha_t0, 'r--', linewidth=1.7, label='Initial data (t=0)')
+    ax.plot(r_int, alpha_t1, 'g-.', linewidth=1.7, label='After 1 step (t=1×dt)')
+    ax.axvline(tov_solution['R'], color='gray', linestyle=':', alpha=0.5)
+    ax.set_xlabel('r')
+    ax.set_ylabel(r'$\alpha$')
+    ax.set_title('Lapse Function: first step')
+    ax.legend()
+    ax.grid(True, alpha=0.3)
+    plt.tight_layout()
+    plt.savefig('tov_lapse_first_step.png', dpi=150, bbox_inches='tight')
+    plt.close(fig)
 
 
 def get_rhs_cowling(t, y, grid, background, hydro, bssn_fixed, bssn_d1_fixed):
@@ -477,8 +568,8 @@ def main():
     # ==================================================================
     # CONFIGURATION
     # ==================================================================
-    r_max = 11.0
-    num_points = 1000  # Use 4000+ for production runs
+    r_max = 20.0
+    num_points = 3000  # Use 4000+ for production runs
     K = 100.0
     Gamma = 2.0  # NOTE: Gamma=2.0 is pathological (tau→0)
     rho_central = 1.28e-3
@@ -545,13 +636,16 @@ def main():
     gc.collect()
 
     if integration_method == 'fixed':
-        dt = 0.5 * grid.min_dr  # CFL condition
+        dt = 0.15 * grid.min_dr  # CFL condition
         num_steps = 100
-        print(f"\nEvolving with fixed dt={dt:.6f} (CFL=0.5) for {num_steps} steps using RK4")
+        print(f"\nEvolving with fixed dt={dt:.6f} (CFL=0.15) for {num_steps} steps using RK4")
 
         # Single step for comparison
         state_t1 = rk4_step(initial_state_2d.flatten(), dt, grid, background, hydro,
                            bssn_fixed, bssn_d1_fixed).reshape((grid.NUM_VARS, grid.N))
+        # Plot only the first step changes
+        plot_first_step(initial_state_2d, state_t1, grid, hydro)
+        plot_lapse_first_step(tov_solution, initial_state_2d, state_t1, grid)
 
         # Multiple steps
         state_t100 = evolve_fixed_timestep(initial_state_2d, dt, num_steps, grid, background,

@@ -159,7 +159,7 @@ class PerfectFluid:
         metric = {
             "alpha": g['alpha'],
             "beta_r": g['beta_r'],
-            "gamma_rr": g['gamma_rr'] if self.spacetime_mode != "fixed_minkowski" else np.ones(len(r))
+            "gamma_rr": g['gamma_rr']
         }
 
         # Use pressure cache if available
