@@ -652,7 +652,7 @@ def main():
     # Time integration method
     # 'fixed': RK4 with fixed timestep (fast, stable)
     # 'adaptive': solve_ivp with adaptive timestep (slower, more accurate)
-    integration_method = 'fixed'
+    integration_method = 'adaptive'  # 'fixed' or 'adaptive'
 
     # ==================================================================
     # SETUP
@@ -730,17 +730,20 @@ def main():
     elif integration_method == 'adaptive':
         # NOTE: Adaptive methods are slower but can be more accurate
         # Available methods: 'RK45', 'RK23', 'DOP853', 'Radau', 'BDF', 'LSODA'
-        t_final = 0.5  # Final time
+        t_final = 0.005  # Final time
         print(f"\nEvolving to t={t_final} using solve_ivp (adaptive)")
 
         # For single step comparison, use small fixed dt
         dt = 0.5 * grid.min_dr
+        # Define an effective number of steps for labeling/plots
+        # so code paths that expect 'num_steps' still work.
+        num_steps = max(1, int(round(t_final / dt)))
         state_t1 = rk4_step(initial_state_2d.flatten(), dt, grid, background, hydro,
                            bssn_fixed, bssn_d1_fixed).reshape((grid.NUM_VARS, grid.N))
 
         # Adaptive evolution
         state_t100 = evolve_adaptive(initial_state_2d, t_final, grid, background, hydro,
-                                    bssn_fixed, bssn_d1_fixed, method='DOP853', rtol=1e-5, atol=1e-7)
+                                    bssn_fixed, bssn_d1_fixed, method='RK45', rtol=1e-5, atol=1e-7)
 
     # ==================================================================
     # DIAGNOSTICS
