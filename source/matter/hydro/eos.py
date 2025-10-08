@@ -204,18 +204,3 @@ def create_eos(eos_type: str = "ideal", **kwargs):
         raise ValueError(f"Unknown EOS type: {eos_type}")
 
 
-# Common presets used in tests and examples
-COMMON_EOS = {
-    "air": IdealGasEOS(gamma=1.4),            # Diatomic gas
-    "monatomic": IdealGasEOS(gamma=5.0 / 3.0),
-    "radiation": IdealGasEOS(gamma=4.0 / 3.0),
-    "stiff": IdealGasEOS(gamma=2.0),          # Causal limit for ideal gas
-    "ns_polytrope": PolytropicEOS(K=100.0, gamma=2.0),
-}
-
-
-def get_common_eos(name: str):
-    """Retrieve a predefined EOS configuration by name."""
-    if name not in COMMON_EOS:
-        raise ValueError(f"Unknown EOS name '{name}'. Available: {list(COMMON_EOS.keys())}")
-    return COMMON_EOS[name]

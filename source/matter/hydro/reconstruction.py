@@ -143,26 +143,45 @@ class MinmodReconstruction:
         return (rL, vL, pL), (rR, vR, pR)
 
     def apply_physical_limiters(self, left_tuple, right_tuple,
-                                atmosphere_rho=1e-13, p_floor=1e-15, v_max=0.999,
-                                gamma_rr=None):
+                                atmosphere=None, gamma_rr=None,
+                                atmosphere_rho=None, p_floor=None, v_max=None):
+        """
+        Apply physical floors/limits to reconstructed states.
+
+        Args:
+            atmosphere: AtmosphereParams (preferred)
+            atmosphere_rho, p_floor, v_max: Deprecated - use atmosphere instead
+        """
+        # Handle backward compatibility
+        if atmosphere is None:
+            from source.matter.hydro.atmosphere import AtmosphereParams
+            if atmosphere_rho is not None or p_floor is not None or v_max is not None:
+                atmosphere = AtmosphereParams(
+                    rho_floor=atmosphere_rho if atmosphere_rho is not None else 1e-13,
+                    p_floor=p_floor if p_floor is not None else 1e-15,
+                    v_max=v_max if v_max is not None else 0.999
+                )
+            else:
+                atmosphere = AtmosphereParams()
+
         rho0_L, vr_L, p_L = left_tuple
         rho0_R, vr_R, p_R = right_tuple
 
         # Límites de densidad y presión
-        rho0_L = np.maximum(rho0_L, atmosphere_rho)
-        rho0_R = np.maximum(rho0_R, atmosphere_rho)
-        p_L = np.maximum(p_L, p_floor)
-        p_R = np.maximum(p_R, p_floor)
+        rho0_L = np.maximum(rho0_L, atmosphere.rho_floor)
+        rho0_R = np.maximum(rho0_R, atmosphere.rho_floor)
+        p_L = np.maximum(p_L, atmosphere.p_floor)
+        p_R = np.maximum(p_R, atmosphere.p_floor)
 
         # Límite de velocidad considerando la métrica
         if gamma_rr is not None:
             # v² = γ_rr (v^r)² < v_max²  -> |v^r| < v_max / sqrt(γ_rr)
-            v_limit = v_max / np.sqrt(np.maximum(gamma_rr, 1.0))
+            v_limit = atmosphere.v_max / np.sqrt(np.maximum(gamma_rr, 1.0))
             vr_L = np.clip(vr_L, -v_limit, v_limit)
             vr_R = np.clip(vr_R, -v_limit, v_limit)
         else:
-            vr_L = np.clip(vr_L, -v_max, v_max)
-            vr_R = np.clip(vr_R, -v_max, v_max)
+            vr_L = np.clip(vr_L, -atmosphere.v_max, atmosphere.v_max)
+            vr_R = np.clip(vr_R, -atmosphere.v_max, atmosphere.v_max)
 
         return (rho0_L, vr_L, p_L), (rho0_R, vr_R, p_R)
 
@@ -448,26 +467,44 @@ class HighOrderReconstruction:
         return (rL, vL, pL), (rR, vR, pR)
 
     def apply_physical_limiters(self, left_tuple, right_tuple,
-                                atmosphere_rho=1e-13, p_floor=1e-15, v_max=0.999,
-                                gamma_rr=None):
-        """Apply physical limiters to reconstructed states."""
+                                atmosphere=None, gamma_rr=None,
+                                atmosphere_rho=None, p_floor=None, v_max=None):
+        """
+        Apply physical floors/limits to reconstructed states.
+
+        Args:
+            atmosphere: AtmosphereParams (preferred)
+            atmosphere_rho, p_floor, v_max: Deprecated - use atmosphere instead
+        """
+        # Handle backward compatibility
+        if atmosphere is None:
+            from source.matter.hydro.atmosphere import AtmosphereParams
+            if atmosphere_rho is not None or p_floor is not None or v_max is not None:
+                atmosphere = AtmosphereParams(
+                    rho_floor=atmosphere_rho if atmosphere_rho is not None else 1e-13,
+                    p_floor=p_floor if p_floor is not None else 1e-15,
+                    v_max=v_max if v_max is not None else 0.999
+                )
+            else:
+                atmosphere = AtmosphereParams()
+
         rho0_L, vr_L, p_L = left_tuple
         rho0_R, vr_R, p_R = right_tuple
 
         # Density and pressure floors
-        rho0_L = np.maximum(rho0_L, atmosphere_rho)
-        rho0_R = np.maximum(rho0_R, atmosphere_rho)
-        p_L = np.maximum(p_L, p_floor)
-        p_R = np.maximum(p_R, p_floor)
+        rho0_L = np.maximum(rho0_L, atmosphere.rho_floor)
+        rho0_R = np.maximum(rho0_R, atmosphere.rho_floor)
+        p_L = np.maximum(p_L, atmosphere.p_floor)
+        p_R = np.maximum(p_R, atmosphere.p_floor)
 
         # Velocity limiting
         if gamma_rr is not None:
-            v_limit = v_max / np.sqrt(np.maximum(gamma_rr, 1.0))
+            v_limit = atmosphere.v_max / np.sqrt(np.maximum(gamma_rr, 1.0))
             vr_L = np.clip(vr_L, -v_limit, v_limit)
             vr_R = np.clip(vr_R, -v_limit, v_limit)
         else:
-            vr_L = np.clip(vr_L, -v_max, v_max)
-            vr_R = np.clip(vr_R, -v_max, v_max)
+            vr_L = np.clip(vr_L, -atmosphere.v_max, atmosphere.v_max)
+            vr_R = np.clip(vr_R, -atmosphere.v_max, atmosphere.v_max)
 
         return (rho0_L, vr_L, p_L), (rho0_R, vr_R, p_R)
 

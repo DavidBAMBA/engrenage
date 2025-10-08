@@ -75,9 +75,7 @@ class PerfectFluid:
         # Numerical methods for Valencia evolution
         self.valencia = ValenciaReferenceMetric(
             boundary_mode="parity",
-            atmosphere_rho=self.atmosphere.rho_floor,
-            p_floor=self.atmosphere.p_floor,
-            v_max=self.atmosphere.v_max,
+            atmosphere=self.atmosphere  # Pass centralized atmosphere
         )
         self.reconstructor = reconstructor
         self.riemann_solver = riemann_solver

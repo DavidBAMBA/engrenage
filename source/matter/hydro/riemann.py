@@ -1,6 +1,7 @@
 # matter/hydro/riemann.py
 
 import numpy as np
+from .atmosphere import AtmosphereParams
 
 
 class HLLERiemannSolver:
@@ -27,20 +28,26 @@ class HLLERiemannSolver:
     * For Minkowski (α=1, β=0, γ_rr=1), λ± reduce to SR eigenvalues.
     """
 
-    def __init__(self, name: str = "HLLE"):
+    def __init__(self, name: str = "HLLE", atmosphere=None):
+        """
+        Args:
+            name: Solver name
+            atmosphere: AtmosphereParams for floor values (optional, uses defaults if None)
+        """
         self.name = name
         self.solver_type = "approximate"
+
+        # Centralized atmosphere configuration
+        self.atmosphere = atmosphere if atmosphere is not None else AtmosphereParams()
 
         # Stats
         self.total_calls = 0
         self.superluminal_detections = 0  # kept for compatibility (not used actively)
         self.negative_pressure_fixes = 0  # incremented if validate_input_states is used
 
-        # Tunables
-        self._eps_floor = 0.0
-        self._p_floor = 1e-15
-        self._v_cap = 0.999999
-        self._speed_eps = 1e-12  # to avoid exact-zero denominators
+        # Tunables (derived from atmosphere or kept separate if solver-specific)
+        self._eps_floor = 0.0  # EOS-dependent, can stay here
+        self._speed_eps = 1e-12  # Numerical safety, solver-specific
 
     # ----------------------------------------------------------------------
     # Public APIs
@@ -69,11 +76,11 @@ class HLLERiemannSolver:
         rho0L, vrL, pL = primL
         rho0R, vrR, pR = primR
 
-        # Floors / safety for primitives
-        pL = float(max(pL, self._p_floor))
-        pR = float(max(pR, self._p_floor))
-        vrL = float(np.clip(vrL, -self._v_cap, self._v_cap))
-        vrR = float(np.clip(vrR, -self._v_cap, self._v_cap))
+        # Floors / safety for primitives (using centralized atmosphere)
+        pL = float(max(pL, self.atmosphere.p_floor))
+        pR = float(max(pR, self.atmosphere.p_floor))
+        vrL = float(np.clip(vrL, -self.atmosphere.v_max, self.atmosphere.v_max))
+        vrR = float(np.clip(vrR, -self.atmosphere.v_max, self.atmosphere.v_max))
         gamma_rr = float(max(gamma_rr, 1e-30))
         alpha = float(max(alpha, 1e-30))
         beta_r = float(beta_r)
@@ -147,7 +154,7 @@ class HLLERiemannSolver:
 
         max_speed = 0.0
         for i in range(N):
-            eps = max(eos.eps_from_rho_p(rho0[i], max(p[i], self._p_floor)), self._eps_floor)
+            eps = max(eos.eps_from_rho_p(rho0[i], max(p[i], self.atmosphere.p_floor)), self._eps_floor)
             lam_min, lam_max = self._wave_speeds_banyuls(
                 float(vr[i]), float(rho0[i]), float(p[i]), eps,
                 float(gamma_rr[i]), float(alpha[i]), 0.0, eos
@@ -235,7 +242,7 @@ class HLLERiemannSolver:
         beta_r   = float(beta_r)
 
         # Sound speed squared (clip)
-        cs2 = float(eos.sound_speed_squared(rho0, max(p, self._p_floor), max(eps, self._eps_floor)))
+        cs2 = float(eos.sound_speed_squared(rho0, max(p, self.atmosphere.p_floor), max(eps, self._eps_floor)))
         cs2 = float(np.clip(cs2, 0.0, 1.0 - 1e-12))
 
         v2 = gamma_rr * vr * vr

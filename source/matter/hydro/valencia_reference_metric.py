@@ -31,33 +31,47 @@ from source.bssn.tensoralgebra import (
 from source.backgrounds.sphericalbackground import i_r, i_t, i_p
 from source.core.spacing import NUM_GHOSTS
 from source.matter.hydro.cons2prim import prim_to_cons
+from source.matter.hydro.atmosphere import AtmosphereParams
 
 
 class ValenciaReferenceMetric:
     """Valencia formulation - full 3D tensor algebra following BSSN pattern."""
 
-    def __init__(self, boundary_mode="parity", *, atmosphere_rho: float = 1e-13,
-                 p_floor: float = 1e-15, v_max: float = 0.999999):
+    def __init__(self, boundary_mode="parity", *, atmosphere=None,
+                 atmosphere_rho=None, p_floor=None, v_max=None):
         """
         Initialize Valencia formulation.
 
-        Parameters:
+        Parameters
         -----------
         boundary_mode : str
             "parity" - Parity boundary conditions at inner boundary (r=0)
             "outflow" - Outflow (zero-gradient) at both boundaries
-        atmosphere_rho : float
-            Atmosphere density floor used to stabilize reconstruction near the surface.
-        p_floor : float
-            Minimum pressure used by physical limiters at interfaces.
-        v_max : float
-            Maximum allowed |v^r| used by physical limiters at interfaces.
+        atmosphere : AtmosphereParams, optional
+            Centralized atmosphere configuration (preferred)
+        atmosphere_rho : float, optional
+            Deprecated - use atmosphere instead
+        p_floor : float, optional
+            Deprecated - use atmosphere instead
+        v_max : float, optional
+            Deprecated - use atmosphere instead
         """
         self.boundary_mode = boundary_mode
-        # Near-surface stabilization parameters (kept in sync with PerfectFluid/cons2prim)
-        self.atmosphere_rho = float(atmosphere_rho)
-        self.p_floor = float(p_floor)
-        self.v_max = float(v_max)
+
+        # Handle backward compatibility with old parameter names
+        if atmosphere is None:
+            # Old-style: individual parameters
+            if atmosphere_rho is not None or p_floor is not None or v_max is not None:
+                atmosphere = AtmosphereParams(
+                    rho_floor=atmosphere_rho if atmosphere_rho is not None else 1e-13,
+                    p_floor=p_floor if p_floor is not None else 1e-15,
+                    v_max=v_max if v_max is not None else 0.999999
+                )
+            else:
+                # No parameters provided - use defaults
+                atmosphere = AtmosphereParams()
+
+        self.atmosphere = atmosphere
 
     def compute_rhs(self, D, Sr, tau, rho0, vr, pressure, W, h,
                     r, bssn_vars, bssn_d1, background, spacetime_mode,
@@ -502,14 +516,14 @@ class ValenciaReferenceMetric:
         # Surface/atmosphere flattening: in interfaces where density is near the configured
         # atmosphere, switch to first-order (average) and force v=0 to avoid overshoots.
         # Use a threshold relative to the chosen atmosphere density.
-        dens_floor = max(self.atmosphere_rho, 1e-20)
+        dens_floor = max(self.atmosphere.rho_floor, 1e-20)
         thr = 30.0 * dens_floor
         if len(rhoL) > 0:
             import numpy as _np
             mask = (rhoL < thr) | (rhoR < thr)
             if _np.any(mask):
                 rho_avg = 0.5 * (rhoL + rhoR)
-                p_avg = _np.maximum(0.5 * (pL + pR), self.p_floor)
+                p_avg = _np.maximum(0.5 * (pL + pR), self.atmosphere.p_floor)
                 rhoL[mask] = rho_avg[mask]
                 rhoR[mask] = rho_avg[mask]
                 pL[mask] = p_avg[mask]
@@ -521,9 +535,7 @@ class ValenciaReferenceMetric:
         if hasattr(reconstructor, "apply_physical_limiters"):
             (rhoL, vL, pL), (rhoR, vR, pR) = reconstructor.apply_physical_limiters(
                 (rhoL, vL, pL), (rhoR, vR, pR),
-                atmosphere_rho=self.atmosphere_rho,
-                p_floor=self.p_floor,
-                v_max=self.v_max,
+                atmosphere=self.atmosphere,  # Pass centralized atmosphere
                 gamma_rr=gamma_rr_f
             )
 
