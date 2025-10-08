@@ -203,20 +203,6 @@ class MinmodReconstruction:
                 vio += 1
         return vio
 
-    def compute_total_variation(self, u):
-        """
-        TV(u) = sum_i |u[i+1]-u[i]|
-        """
-        u = np.asarray(u, dtype=float)
-        if u.size < 2:
-            return 0.0
-        return np.sum(np.abs(np.diff(u)))
-
-    def reconstruct_with_boundaries(self, u, dx=None, x=None, boundary_type="outflow"):
-        """
-        Thin wrapper kept for API compatibility. Same as reconstruct().
-        """
-        return self.reconstruct(u, dx=dx, x=x, boundary_type=boundary_type)
 
     # -------------------------
     # Limiters (vectorized)
@@ -740,7 +726,6 @@ def create_reconstruction(method: str = "minmod"):
 
     else:
         raise ValueError(f"Unknown reconstruction method: {method}")
-
 
 # Convenience aliases for backward compatibility
 def get_reconstruction_minmod():
