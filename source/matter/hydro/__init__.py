@@ -22,6 +22,8 @@ __all__ = [
     'EOS_TYPES',
     'RECONSTRUCTION_TYPES',
     'RIEMANN_SOLVERS',
+    'AtmosphereParams',  # New: centralized floor management
+    'create_default_atmosphere',
 ]
 
 # -------- Lazy attribute loading (PEP 562) --------
@@ -42,6 +44,10 @@ def __getattr__(name):
         # Opcional: si existe una clase así, exponla; si no, no rompas.
         mod = import_module('.cons2prim', __name__)
         return getattr(mod, 'ConservativeToPrimitive', None)
+    if name == 'AtmosphereParams':
+        return import_module('.atmosphere', __name__).AtmosphereParams
+    if name == 'create_default_atmosphere':
+        return import_module('.atmosphere', __name__).create_default_atmosphere
     if name == 'EOS_TYPES':
         eos = import_module('.eos', __name__)
         return {'ideal': eos.IdealGasEOS, 'polytropic': eos.PolytropicEOS}
@@ -54,8 +60,19 @@ def __getattr__(name):
     if name == 'create_perfect_fluid':
         # Devuelve la factory como función cerrada para que los imports sean internos
         def _factory(gamma=1.4, spacetime_mode="fixed_minkowski",
-                    atmosphere_rho=1e-13, reconstruction="minmod",
+                    atmosphere_rho=1e-13, atmosphere=None, reconstruction="minmod",
                     riemann_solver="hlle"):
+            """
+            Create PerfectFluid with default configuration.
+
+            Args:
+                gamma: Adiabatic index (default: 1.4)
+                spacetime_mode: "fixed_minkowski" or "dynamic" (default: "fixed_minkowski")
+                atmosphere_rho: Atmosphere density (backward compat, use atmosphere instead)
+                atmosphere: AtmosphereParams object (preferred over atmosphere_rho)
+                reconstruction: Reconstruction method (default: "minmod")
+                riemann_solver: Riemann solver (default: "hlle")
+            """
             eos_mod  = import_module('.eos', __name__)
             rec_mod  = import_module('.reconstruction', __name__)
             rie_mod  = import_module('.riemann', __name__)
@@ -71,10 +88,14 @@ def __getattr__(name):
             reconstructor = rec_mod.MinmodReconstruction()
             riemann = rie_mod.HLLERiemannSolver()
 
+            # Atmosphere: prefer explicit AtmosphereParams, fallback to atmosphere_rho
+            if atmosphere is None and atmosphere_rho is not None:
+                atmosphere = atmosphere_rho  # PerfectFluid handles float conversion
+
             fluid = pf_mod.PerfectFluid(
                 eos=eos,
                 spacetime_mode=spacetime_mode,
-                atmosphere_rho=atmosphere_rho,
+                atmosphere=atmosphere,
                 reconstructor=reconstructor,
                 riemann_solver=riemann
             )

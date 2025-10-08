@@ -7,8 +7,9 @@ from source.bssn.tensoralgebra import SPACEDIM, EMTensor
 from source.backgrounds.sphericalbackground import i_r
 
 from .valencia_reference_metric import ValenciaReferenceMetric
-from .cons2prim import cons_to_prim
+from .cons2prim import Cons2PrimSolver
 from .eos import IdealGasEOS
+from .atmosphere import AtmosphereParams, create_default_atmosphere
 
 
 class PerfectFluid:
@@ -23,7 +24,17 @@ class PerfectFluid:
     """
 
     def __init__(self, eos=None, spacetime_mode="dynamic",
-                 atmosphere_rho=1e-13, reconstructor=None, riemann_solver=None):
+                 atmosphere=None, reconstructor=None, riemann_solver=None):
+        """
+        Initialize relativistic perfect fluid matter.
+
+        Args:
+            eos: Equation of state (default: IdealGasEOS)
+            spacetime_mode: "dynamic" or "fixed" (default: "dynamic")
+            atmosphere: AtmosphereParams object or float (rho_floor). If None, uses default.
+            reconstructor: Reconstruction method (optional)
+            riemann_solver: Riemann solver (optional)
+        """
 
         # engrenage BaseMatter interface requirements
         self.NUM_MATTER_VARS = 3
@@ -41,21 +52,35 @@ class PerfectFluid:
         # Physics
         self.eos = eos if eos is not None else IdealGasEOS()
         self.spacetime_mode = spacetime_mode
-        self.atmosphere_rho = atmosphere_rho
+
+        # Atmosphere configuration (centralized)
+        if atmosphere is None:
+            self.atmosphere = AtmosphereParams()  # Default
+        elif isinstance(atmosphere, (int, float)):
+            # Convenience: just specify rho_floor
+            self.atmosphere = create_default_atmosphere(rho_floor=float(atmosphere))
+        elif isinstance(atmosphere, AtmosphereParams):
+            self.atmosphere = atmosphere
+        else:
+            raise TypeError(f"atmosphere must be AtmosphereParams, float, or None, got {type(atmosphere)}")
+
+        # Create cons2prim solver with centralized atmosphere
+        self.cons2prim_solver = Cons2PrimSolver(
+            self.eos,
+            atmosphere=self.atmosphere,
+            tol=1e-10,
+            max_iter=200
+        )
 
         # Numerical methods for Valencia evolution
-        self.valencia = ValenciaReferenceMetric()
+        self.valencia = ValenciaReferenceMetric(
+            boundary_mode="parity",
+            atmosphere_rho=self.atmosphere.rho_floor,
+            p_floor=self.atmosphere.p_floor,
+            v_max=self.atmosphere.v_max,
+        )
         self.reconstructor = reconstructor
         self.riemann_solver = riemann_solver
-
-        # cons2prim configuration
-        self.cons2prim_params = {
-            "rho_floor": atmosphere_rho,
-            "p_floor": 1e-15,
-            "v_max": 0.999999,
-            "tol": 1e-10,
-            "max_iter": 200
-        }
 
         # State variables (engrenage pattern)
         self.matter_vars_set = False
@@ -165,30 +190,19 @@ class PerfectFluid:
         # Use pressure cache if available
         p_guess = self.pressure_cache
 
-        # Call cons2prim module with pressure guess
-        primitives = cons_to_prim(
-            U=(self.D, self.Sr, self.tau),
-            eos=self.eos,
-            params=self.cons2prim_params,
+        # Call cons2prim solver (now with intelligent floor application)
+        U = {"D": self.D, "Sr": self.Sr, "tau": self.tau}
+        primitives = self.cons2prim_solver.convert(
+            U=U,
             metric=metric,
-            p_guess=p_guess
+            p_guess=p_guess,
+            apply_conservative_floors=True  # Apply tau and S_i floors
         )
 
         # Update pressure cache for next timestep
         self.pressure_cache = primitives['p'].copy()
 
-        # Handle conversion failures
-        if not np.all(primitives['success']):
-            failed = np.where(~primitives['success'])[0]
-            # Suprimir warnings para test rápido
-            # print(f"Warning: cons2prim failed at {len(failed)} points, setting to atmosphere")
-
-            # Set failed points to atmosphere
-            primitives['rho0'][failed] = self.atmosphere_rho
-            primitives['vr'][failed] = 0.0
-            primitives['p'][failed] = 1e-15
-            primitives['eps'][failed] = self.eos.eps_from_rho_p(self.atmosphere_rho, 1e-15)
-            primitives['W'][failed] = 1.0
-            primitives['h'][failed] = 1.0 + primitives['eps'][failed] + primitives['p'][failed] / primitives['rho0'][failed]
+        # Note: Failed points are already handled by cons2prim_solver with atmosphere fallback
+        # No need for additional manual handling here
 
         return primitives

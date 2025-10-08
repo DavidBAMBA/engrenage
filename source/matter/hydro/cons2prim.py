@@ -4,9 +4,12 @@ Conservative to primitive variable conversion for relativistic hydrodynamics.
 
 This module provides a clean, extensible architecture for cons2prim conversion
 that supports current ideal gas EOS and is ready for future EOS implementations.
+
+Floor application follows IllinoisGRMHD strategy (see atmosphere.py).
 """
 
 import numpy as np
+from .atmosphere import AtmosphereParams, FloorApplicator
 
 # ============================================================================
 # MAIN SOLVER CLASS
@@ -22,13 +25,29 @@ class Cons2PrimSolver:
 
     Args:
         eos: Equation of state object with eps_from_rho_p(rho0, p) method
-        **params: Solver parameters (tolerance, max_iter, floors, etc.)
+        atmosphere: AtmosphereParams object (optional, creates default if None)
+        **params: Additional solver parameters (tolerance, max_iter, etc.)
     """
 
-    def __init__(self, eos, **params):
+    def __init__(self, eos, atmosphere=None, **params):
         self.eos = eos
+
+        # Atmosphere parameters (centralized floor management)
+        if atmosphere is None:
+            atmosphere = AtmosphereParams()
+        elif isinstance(atmosphere, dict):
+            # Backward compatibility: convert dict to AtmosphereParams
+            atmosphere = AtmosphereParams(**atmosphere)
+        self.atmosphere = atmosphere
+
+        # Floor applicator
+        self.floor_applicator = FloorApplicator(self.atmosphere, eos)
+
+        # Solver-specific parameters (not floor-related)
         self.params = self._get_default_params()
         self.params.update(params)
+        # Override with atmosphere parameters
+        self.params.update(self.atmosphere.to_cons2prim_params())
 
         # Statistics tracking
         self.stats = {
@@ -36,10 +55,11 @@ class Cons2PrimSolver:
             "successful_conversions": 0,
             "newton_successes": 0,
             "bisection_fallbacks": 0,
-            "atmosphere_fallbacks": 0
+            "atmosphere_fallbacks": 0,
+            "conservative_floors_applied": 0
         }
 
-    def convert(self, U, metric=None, p_guess=None):
+    def convert(self, U, metric=None, p_guess=None, apply_conservative_floors=True):
         """
         Convert conservative to primitive variables using vectorized approach.
 
@@ -47,6 +67,7 @@ class Cons2PrimSolver:
             U: Conservative variables - dict {'D','Sr','tau'}, tuple (D,Sr,tau), or array
             metric: Metric components - dict or tuple (alpha, beta_r, gamma_rr) (optional)
             p_guess: Pressure guess array from previous timestep (optional)
+            apply_conservative_floors: Apply tau and S_i floors before solve (default: True)
 
         Returns:
             dict: {'rho0', 'vr', 'p', 'eps', 'W', 'h', 'success'}
@@ -57,6 +78,15 @@ class Cons2PrimSolver:
         N = len(D)
         _, _, gamma_rr = self._ensure_metric_arrays(metric, N)
         p_guess = self._validate_pressure_guess(p_guess, N)
+
+        # Apply conservative variable floors (IllinoisGRMHD strategy)
+        # This prevents many cons2prim failures by ensuring physical consistency
+        if apply_conservative_floors:
+            D, Sr, tau, floor_mask = self.floor_applicator.apply_conservative_floors(
+                D, Sr, tau, gamma_rr
+            )
+            if np.any(floor_mask):
+                self.stats["conservative_floors_applied"] += np.sum(floor_mask)
 
         # Allocate output arrays
         rho0, vr, p, eps, W, h = (np.zeros(N) for _ in range(6))
@@ -447,8 +477,8 @@ class Cons2PrimSolver:
         p_lo = max(self.params["p_floor"], abs(Sr) / max(gamma_rr, 1e-30) - E + 1e-15)
         p_hi = max(p_lo * 2.0, 0.1 * (E + abs(Sr)))
 
-        # Expand bracket if needed
-        for _ in range(10):
+        # Expand bracket if needed (more aggressive to handle near-surface states)
+        for _ in range(25):
             ok_lo, state_lo = self._evaluate_pressure(D, Sr, tau, p_lo, gamma_rr)
             ok_hi, state_hi = self._evaluate_pressure(D, Sr, tau, p_hi, gamma_rr)
 
@@ -457,7 +487,33 @@ class Cons2PrimSolver:
             p_hi *= 10.0
 
         if not (ok_lo and ok_hi and state_lo[5] * state_hi[5] <= 0):
-            return False, None
+            # Secondary attempt: coarse log sweep to locate sign change
+            try:
+                import numpy as _np
+                Pmin = max(self.params["p_floor"], 1e-20)
+                Pmax = max(1e4 * (abs(E) + abs(Sr) + 1.0), 10.0)
+                grid = _np.geomspace(Pmin, Pmax, num=50)
+                vals = []
+                oks = []
+                for pg in grid:
+                    ok_g, st_g = self._evaluate_pressure(D, Sr, tau, float(pg), gamma_rr)
+                    vals.append(st_g[5])
+                    oks.append(ok_g)
+                vals = _np.array(vals)
+                oks = _np.array(oks, dtype=bool)
+                # find first adjacent pair with ok and opposite sign
+                found = False
+                for i in range(len(grid)-1):
+                    if oks[i] and oks[i+1] and _np.isfinite(vals[i]) and _np.isfinite(vals[i+1]) and vals[i]*vals[i+1] <= 0:
+                        p_lo, p_hi = float(grid[i]), float(grid[i+1])
+                        state_lo = (0,0,0,1,1,vals[i])
+                        state_hi = (0,0,0,1,1,vals[i+1])
+                        found = True
+                        break
+                if not found:
+                    return False, None
+            except Exception:
+                return False, None
 
         # Bisection iterations
         for _ in range(self.params["max_iter"]):
@@ -609,9 +665,9 @@ class Cons2PrimSolver:
 
     def _atmosphere_fallback(self):
         """Return atmosphere values when conversion fails."""
-        rho0 = self.params["rho_floor"]
+        rho0 = self.atmosphere.rho_floor
         vr = 0.0
-        p = self.params["p_floor"]
+        p = self.atmosphere.p_floor
 
         try:
             eps = self.eos.eps_from_rho_p(rho0, p)

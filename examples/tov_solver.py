@@ -69,7 +69,7 @@ class TOVSolver:
         else:
             return np.array([dP_dr, dnu_dr, dM_dr])
 
-    def solve(self, rho_central, r_grid=None, r_max=20.0, dr=0.001):
+    def solve(self, rho_central, r_grid=None, r_max=20.0, dr=0.0001):
         P_c = self.eos_pressure(rho_central)
         nu_c = 0.0
         M_c = 0.0
@@ -77,9 +77,9 @@ class TOVSolver:
 
         solver = ode(self.tov_rhs).set_integrator('dopri5')
         if self.use_isotropic:
-            solver.set_initial_value([P_c, nu_c, M_c, r_iso_c], 0.001)
+            solver.set_initial_value([P_c, nu_c, M_c, r_iso_c], 0.0001)
         else:
-            solver.set_initial_value([P_c, nu_c, M_c], 0.001)
+            solver.set_initial_value([P_c, nu_c, M_c], 0.0001)
 
         if r_grid is not None:
             r_schw_arr = []
@@ -240,8 +240,14 @@ class TOVSolver:
             r_coord = r_iso_normalized
             R_star = R_iso_surface * normalize
         else:
+            # Schwarzschild radial coordinate branch.
+            # Normalize the lapse so that α→1 as r→∞ and α is continuous at the surface:
+            # α_int(r) = exp( (ν(r) - ν(R)) / 2 ) * sqrt(1 - 2M/R),
+            # α_ext(r) = sqrt(1 - 2M/r)
             exp4phi = 1.0 / (1.0 - 2.0 * M_arr / r_schw_arr)
-            alpha = np.sqrt(np.exp(nu_arr))
+            nu_surface = nu_arr[surface_idx[0]] if len(surface_idx) > 0 else nu_arr[-1]
+            expnu = np.exp(nu_arr - nu_surface + np.log(1.0 - 2.0 * M_star / R_star_schw))
+            alpha = np.sqrt(expnu)
             r_coord = r_schw_arr
             R_star = R_star_schw
 

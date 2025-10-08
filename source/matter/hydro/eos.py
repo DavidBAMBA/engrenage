@@ -200,8 +200,6 @@ def create_eos(eos_type: str = "ideal", **kwargs):
         return IdealGasEOS(kwargs.get("gamma", 1.4))
     elif eos_type == "polytropic":
         return PolytropicEOS(kwargs.get("K", 1.0), kwargs.get("gamma", 2.0))
-    elif eos_type == "tabulated":
-        return TabulatedEOS(kwargs.get("table_file"))
     else:
         raise ValueError(f"Unknown EOS type: {eos_type}")
 

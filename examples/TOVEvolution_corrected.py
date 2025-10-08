@@ -36,179 +36,14 @@ from source.matter.hydro.eos import PolytropicEOS, IdealGasEOS
 from source.matter.hydro.reconstruction import create_reconstruction
 from source.matter.hydro.riemann import HLLERiemannSolver
 from source.matter.hydro.cons2prim import prim_to_cons
+from source.matter.hydro.atmosphere import AtmosphereParams  # Centralized floor management
 from source.bssn.tensoralgebra import get_bar_gamma_LL
 
-# ------------------------------------------------------------------
-# Toggle: freeze the energy equation (tau) – barotropic/Cowling helper
-# When True, sets d(tau)/dt = 0 in the hydro RHS (no energy evolution).
-# ------------------------------------------------------------------
-FREEZE_TAU = False
 from examples.tov_solver import TOVSolver
-
-def create_initial_data(tov_solution, grid, background, eos, atmosphere_rho):
-    """Create BSSN + hydro initial data from TOV solution."""
-    r_tov = tov_solution['r']
-
-    # Check if TOV is on same grid (no interpolation needed!)
-    # TOV is solved on positive radii only, so compare with positive portion of grid
-    r_grid_positive = grid.r[grid.r > 0]
-    same_grid = len(r_tov) <= len(r_grid_positive) and np.allclose(r_tov, r_grid_positive[:len(r_tov)])
-
-    # Atmosphere pressure consistent with EOS (polytropic if available)
-    if hasattr(eos, 'K') and hasattr(eos, 'gamma'):
-        p_atm = eos.K * (atmosphere_rho ** eos.gamma)
-    else:
-        # Ideal gas or other: use a tiny floor consistent with cons2prim
-        p_atm = 1.0e-15
-
-    if same_grid:
-        # Direct copy - no interpolation errors!
-        print("  TOV and evolution grids match - using direct values (no interpolation)")
-        rho_tov_vals = tov_solution['rho_baryon']
-        P_tov_vals = tov_solution['P']
-        nu_tov_vals = tov_solution['nu']
-        M_tov_vals = tov_solution['M']
-
-        # Initialize arrays
-        n_tov = len(r_tov)
-        rho_grid = np.zeros(grid.N)
-        P_grid = np.zeros(grid.N)
-        nu_grid = np.zeros(grid.N)
-        M_grid = np.zeros(grid.N)
-        exp4phi_grid = np.ones(grid.N)
-        alpha_grid = np.ones(grid.N)
-
-        # Find indices where grid.r > 0 (these match TOV grid)
-        positive_mask = grid.r > 0
-        positive_indices = np.where(positive_mask)[0]
-
-        # Copy TOV values to corresponding positive-r grid points (no interpolation)
-        rho_grid[positive_indices[:n_tov]] = rho_tov_vals
-        P_grid[positive_indices[:n_tov]] = P_tov_vals
-        nu_grid[positive_indices[:n_tov]] = nu_tov_vals
-        M_grid[positive_indices[:n_tov]] = M_tov_vals
-        if 'exp4phi' in tov_solution:
-            exp4phi_grid[positive_indices[:n_tov]] = tov_solution['exp4phi']
-        if 'alpha' in tov_solution:
-            alpha_grid[positive_indices[:n_tov]] = tov_solution['alpha']
-
-        # Atmosphere: negative radii and beyond stellar surface
-        rho_grid[~positive_mask] = atmosphere_rho  # Negative radii
-        rho_grid[positive_indices[n_tov:]] = atmosphere_rho  # Beyond surface
-        P_grid[~positive_mask] = p_atm
-        P_grid[positive_indices[n_tov:]] = p_atm
-        nu_grid[positive_indices[n_tov:]] = nu_tov_vals[-1]
-        M_grid[positive_indices[n_tov:]] = M_tov_vals[-1]
-        # For metric/lapse outside copied region, apply exterior values; negative r mirror central values
-        if 'exp4phi' in tov_solution:
-            exp4phi_grid[positive_indices[n_tov:]] = tov_solution['exp4phi'][-1]
-            exp4phi_grid[~positive_mask] = tov_solution['exp4phi'][0]
-        if 'alpha' in tov_solution:
-            alpha_grid[positive_indices[n_tov:]] = tov_solution['alpha'][-1]
-            alpha_grid[~positive_mask] = tov_solution['alpha'][0]
-    else:
-        # Need interpolation (less accurate)
-        print("  TOV and evolution grids differ - using interpolation")
-        rho_tov_interp = interp1d(r_tov, tov_solution['rho_baryon'], kind='cubic',
-                                  bounds_error=False, fill_value=(tov_solution['rho_baryon'][0], atmosphere_rho))
-        P_tov_interp = interp1d(r_tov, tov_solution['P'], kind='cubic',
-                                bounds_error=False, fill_value=(tov_solution['P'][0], p_atm))
-        nu_tov_interp = interp1d(r_tov, tov_solution['nu'], kind='cubic',
-                                  bounds_error=False, fill_value=(tov_solution['nu'][0], 0.0))
-        M_tov_interp = interp1d(r_tov, tov_solution['M'], kind='cubic',
-                                bounds_error=False, fill_value=(0.0, tov_solution['M'][-1]))
-
-        rho_grid = rho_tov_interp(grid.r)
-        P_grid = P_tov_interp(grid.r)
-        nu_grid = nu_tov_interp(grid.r)
-        M_grid = M_tov_interp(grid.r)
-
-    # exp4phi/alpha: if not already set (same_grid False), interpolate once
-    if 'exp4phi_grid' not in locals():
-        exp4phi_interp = interp1d(r_tov, tov_solution['exp4phi'], kind='cubic',
-                                  bounds_error=False, fill_value=(1.0, tov_solution['exp4phi'][-1]))
-        exp4phi_grid = exp4phi_interp(grid.r)
-    if 'alpha_grid' not in locals():
-        alpha_interp = interp1d(r_tov, tov_solution['alpha'], kind='cubic',
-                                bounds_error=False, fill_value=(1.0, tov_solution['alpha'][-1]))
-        alpha_grid = alpha_interp(grid.r)
-
-    # Get reference metric from background (ĝ_ij)
-    ghatDD = background.hat_gamma_LL  # Shape: [N, 3, 3]
-    ReDD = background.scaling_matrix  # Rescaling matrix s_i s_j
-
-    # BSSN variables
-    state_2d = np.zeros((grid.NUM_VARS, grid.N))
-
-    for i, r in enumerate(grid.r):
-        # Physical metric from TOV (in Schwarzschild/polar coordinates)
-        # γ_rr = exp(4φ_TOV) = 1/(1-2M/r), γ_θθ = r², γ_φφ = r² sin²θ
-        exp4phi_tov = exp4phi_grid[i]
-        gamma_phys_rr = exp4phi_tov
-        gamma_phys_thth = r**2
-        gamma_phys_phph = r**2  # sin²θ = 1 in equatorial plane
-
-        # BSSN conformal factor: det(γ̄_ij) = det(ĝ_ij) with γ̄_ij = e^(-4φ) γ_ij
-        # det(γ̄) = e^(-12φ) det(γ) = det(ĝ)
-        # In Schwarzschild: det(γ) = exp4phi_tov * r⁴, det(ĝ) = r⁴
-        # Therefore: e^(-12φ) * exp4phi_tov * r⁴ = r⁴ → e^(12φ) = exp4phi_tov
-        phi = np.log(max(exp4phi_tov, 1e-300)) / 12.0
-
-        # Conformal metric: γ̄_ij = e^(-4φ) γ_ij
-        exp_minus_4phi = np.exp(-4.0 * phi)
-        gammabar_rr = exp_minus_4phi * gamma_phys_rr
-        gammabar_thth = exp_minus_4phi * gamma_phys_thth
-        gammabar_phph = exp_minus_4phi * gamma_phys_phph
-
-        # Deviation from reference: h_ij = (γ̄_ij - ĝ_ij) / ReDD_ij
-        # Following engrenage convention (bssnstatevariables.py line 18-20)
-        h_rr = (gammabar_rr - ghatDD[i, i_r, i_r]) / ReDD[i, i_r, i_r] if ReDD[i, i_r, i_r] != 0 else 0.0
-        h_tt = (gammabar_thth - ghatDD[i, i_t, i_t]) / ReDD[i, i_t, i_t] if ReDD[i, i_t, i_t] != 0 else 0.0
-        h_pp = (gammabar_phph - ghatDD[i, i_p, i_p]) / ReDD[i, i_p, i_p] if ReDD[i, i_p, i_p] != 0 else 0.0
-
-        # TOV is static equilibrium: K_ij = 0 everywhere
-        # Following NRPy+ prescription for static initial data
-        trK = 0.0
-        a_rr = 0.0
-        a_tt = 0.0
-        a_pp = 0.0
-
-        # Lapse from TOV
-        alpha = alpha_grid[i]
-
-        # Assign BSSN variables to state vector
-        state_2d[idx_phi, i] = phi
-        state_2d[idx_hrr, i] = h_rr
-        state_2d[idx_htt, i] = h_tt
-        state_2d[idx_hpp, i] = h_pp
-        state_2d[idx_K, i] = trK
-        state_2d[idx_arr, i] = a_rr
-        state_2d[idx_att, i] = a_tt
-        state_2d[idx_app, i] = a_pp
-        state_2d[idx_lapse, i] = alpha
-        # lambdar, shiftr, br remain zero (will be computed from FD derivatives)
-
-    # Hydro variables
-    for i, r in enumerate(grid.r):
-        rho = max(rho_grid[i], atmosphere_rho)
-        P = max(P_grid[i], p_atm)
-
-        # Use physical metric from TOV for prim_to_cons (Schwarzschild coordinates)
-        # γ_rr = exp4phi = 1/(1-2M/r) in Schwarzschild
-        gamma_rr_phys = exp4phi_grid[i]
-        D, Sr, tau = prim_to_cons(rho, 0.0, P, gamma_rr_phys, eos)
-
-        state_2d[NUM_BSSN_VARS + 0, i] = D
-        state_2d[NUM_BSSN_VARS + 1, i] = Sr
-        state_2d[NUM_BSSN_VARS + 2, i] = tau
-
-    # Fill ghost zones using Engrenage parities/outflow rules
-    grid.fill_boundaries(state_2d)
-
-    return state_2d
+import examples.tov_initial_data as tov_id
 
 
-def plot_first_step(state_t0, state_t1, grid, hydro):
+def plot_first_step(state_t0, state_t1, grid, hydro, tov_solution=None):
     """Plot only t=0 vs t=1×dt to inspect the first update."""
     bssn_0 = BSSNVars(grid.N)
     bssn_0.set_bssn_vars(state_t0[:NUM_BSSN_VARS, :])
@@ -222,66 +57,273 @@ def plot_first_step(state_t0, state_t1, grid, hydro):
 
     r_int = grid.r[NUM_GHOSTS:-NUM_GHOSTS]
 
-    fig, axes = plt.subplots(1, 3, figsize=(15, 4.5))
+    # Compute mass using integral M(r) = 4π ∫_0^r ρ r^2 dr
+    from scipy.integrate import cumulative_trapezoid
+    rho_0 = prim_0['rho0']
+    rho_1 = prim_1['rho0']
+    # Full grid mass calculation
+    M_0_full = 4.0 * np.pi * cumulative_trapezoid(rho_0 * grid.r**2, grid.r, initial=0.0)
+    M_1_full = 4.0 * np.pi * cumulative_trapezoid(rho_1 * grid.r**2, grid.r, initial=0.0)
+
+    # ========================================================================
+    # ANALYSIS: Print values at key locations
+    # ========================================================================
+    print("\n" + "="*80)
+    print("FIRST STEP ANALYSIS: Changes from t=0 to t=1×dt")
+    print("="*80)
+
+    # Find indices for key locations
+    idx_center = NUM_GHOSTS  # First interior point (center)
+    idx_left = NUM_GHOSTS + 10  # Near left boundary (interior)
+
+    # Find index closest to stellar radius (if TOV solution provided)
+    if tov_solution is not None:
+        R_star = tov_solution['R']
+        idx_star = np.argmin(np.abs(grid.r - R_star))
+        print(f"\nStellar radius R = {R_star:.4f} at grid index {idx_star} (r = {grid.r[idx_star]:.4f})")
+    else:
+        # Estimate stellar surface as where density drops below threshold
+        rho_threshold = 1e-6
+        interior_mask = rho_0 > rho_threshold
+        if np.any(interior_mask):
+            idx_star = np.where(interior_mask)[0][-1]
+            R_star = grid.r[idx_star]
+            print(f"\nEstimated stellar surface at r = {R_star:.4f} (ρ < {rho_threshold})")
+        else:
+            idx_star = len(grid.r) // 2
+            R_star = grid.r[idx_star]
+            print(f"\nUsing midpoint as reference: r = {R_star:.4f}")
+
+    idx_right = -NUM_GHOSTS - 1  # Last interior point (far boundary)
+
+    def analyze_point(idx, label):
+        """Analyze all quantities at a given index."""
+        r = grid.r[idx]
+        print(f"\n{'-'*80}")
+        print(f"{label}: r = {r:.6f} (index {idx})")
+        print(f"{'-'*80}")
+
+        # Hydro primitives
+        rho0_0, rho0_1 = rho_0[idx], rho_1[idx]
+        p0, p1 = prim_0['p'][idx], prim_1['p'][idx]
+        vr0, vr1 = prim_0['vr'][idx], prim_1['vr'][idx]
+
+        # BSSN variables
+        phi0, phi1 = state_t0[idx_phi, idx], state_t1[idx_phi, idx]
+        alpha0, alpha1 = state_t0[idx_lapse, idx], state_t1[idx_lapse, idx]
+        hrr0, hrr1 = state_t0[idx_hrr, idx], state_t1[idx_hrr, idx]
+        K0, K1 = state_t0[idx_K, idx], state_t1[idx_K, idx]
+        arr0, arr1 = state_t0[idx_arr, idx], state_t1[idx_arr, idx]
+
+        # Mass
+        M0, M1 = M_0_full[idx], M_1_full[idx]
+
+        # Conservative variables
+        D0 = state_t0[NUM_BSSN_VARS + 0, idx]
+        D1 = state_t1[NUM_BSSN_VARS + 0, idx]
+        Sr0 = state_t0[NUM_BSSN_VARS + 1, idx]
+        Sr1 = state_t1[NUM_BSSN_VARS + 1, idx]
+        tau0 = state_t0[NUM_BSSN_VARS + 2, idx]
+        tau1 = state_t1[NUM_BSSN_VARS + 2, idx]
+
+        def rel_change(v0, v1):
+            """Relative change with safe division."""
+            if abs(v0) < 1e-30:
+                return f"{v1:.6e}" if abs(v1) > 1e-30 else "0"
+            return f"{(v1-v0)/v0:.6e}"
+
+        def abs_change(v0, v1):
+            """Absolute change."""
+            return f"{v1-v0:.6e}"
+
+        print(f"\nPRIMITIVE VARIABLES:")
+        print(f"  ρ₀:     {rho0_0:.8e} → {rho0_1:.8e}   Δrel = {rel_change(rho0_0, rho0_1)}")
+        print(f"  P:      {p0:.8e} → {p1:.8e}   Δrel = {rel_change(p0, p1)}")
+        print(f"  vʳ:     {vr0:.8e} → {vr1:.8e}   Δabs = {abs_change(vr0, vr1)}")
+
+        print(f"\nCONSERVATIVE VARIABLES:")
+        print(f"  D:      {D0:.8e} → {D1:.8e}   Δrel = {rel_change(D0, D1)}")
+        print(f"  Sʳ:     {Sr0:.8e} → {Sr1:.8e}   Δabs = {abs_change(Sr0, Sr1)}")
+        print(f"  τ:      {tau0:.8e} → {tau1:.8e}   Δrel = {rel_change(tau0, tau1)}")
+
+        print(f"\nBSSN VARIABLES:")
+        print(f"  φ:      {phi0:.8e} → {phi1:.8e}   Δrel = {rel_change(phi0, phi1)}")
+        print(f"  α:      {alpha0:.8e} → {alpha1:.8e}   Δrel = {rel_change(alpha0, alpha1)}")
+        print(f"  hʳʳ:    {hrr0:.8e} → {hrr1:.8e}   Δrel = {rel_change(hrr0, hrr1)}")
+        print(f"  K:      {K0:.8e} → {K1:.8e}   Δabs = {abs_change(K0, K1)}")
+        print(f"  aʳʳ:    {arr0:.8e} → {arr1:.8e}   Δabs = {abs_change(arr0, arr1)}")
+
+        print(f"\nDERIVED QUANTITIES:")
+        print(f"  M(r):   {M0:.8e} → {M1:.8e}   Δrel = {rel_change(M0, M1)}")
+
+        # Compute specific internal energy and enthalpy
+        eps0 = hydro.eos.eps_from_rho_p(rho0_0, p0)
+        eps1 = hydro.eos.eps_from_rho_p(rho0_1, p1)
+        h0 = 1.0 + eps0 + p0/max(rho0_0, 1e-30)
+        h1 = 1.0 + eps1 + p1/max(rho0_1, 1e-30)
+        print(f"  ε:      {eps0:.8e} → {eps1:.8e}   Δrel = {rel_change(eps0, eps1)}")
+        print(f"  h:      {h0:.8e} → {h1:.8e}   Δrel = {rel_change(h0, h1)}")
+
+    # Analyze key points
+    analyze_point(idx_center, "CENTER (r≈0)")
+    analyze_point(idx_left, "LEFT INTERIOR")
+    analyze_point(idx_star, "STELLAR SURFACE")
+    analyze_point(idx_right, "FAR BOUNDARY")
+
+    # Global statistics
+    print(f"\n{'='*80}")
+    print("GLOBAL STATISTICS:")
+    print(f"{'='*80}")
+
+    interior = slice(NUM_GHOSTS, -NUM_GHOSTS)
+
+    def safe_rel_error(arr0, arr1):
+        """Compute relative error safely."""
+        mask = np.abs(arr0) > 1e-30
+        rel_err = np.zeros_like(arr0)
+        rel_err[mask] = np.abs((arr1[mask] - arr0[mask]) / arr0[mask])
+        return rel_err
+
+    rho_rel_err = safe_rel_error(rho_0[interior], rho_1[interior])
+    p_rel_err = safe_rel_error(prim_0['p'][interior], prim_1['p'][interior])
+    phi_rel_err = safe_rel_error(state_t0[idx_phi, interior], state_t1[idx_phi, interior])
+    alpha_rel_err = safe_rel_error(state_t0[idx_lapse, interior], state_t1[idx_lapse, interior])
+
+    print(f"\nMax relative changes (interior points):")
+    print(f"  ρ₀:     {np.max(rho_rel_err):.6e}")
+    print(f"  P:      {np.max(p_rel_err):.6e}")
+    print(f"  φ:      {np.max(phi_rel_err):.6e}")
+    print(f"  α:      {np.max(alpha_rel_err):.6e}")
+    print(f"  |vʳ|:   {np.max(np.abs(prim_1['vr'][interior])):.6e}")
+
+    print(f"\nLocations of maximum changes:")
+    idx_max_rho = NUM_GHOSTS + np.argmax(rho_rel_err)
+    idx_max_p = NUM_GHOSTS + np.argmax(p_rel_err)
+    idx_max_v = NUM_GHOSTS + np.argmax(np.abs(prim_1['vr'][interior]))
+    print(f"  Max Δρ/ρ at r = {grid.r[idx_max_rho]:.6f} (index {idx_max_rho})")
+    print(f"  Max ΔP/P at r = {grid.r[idx_max_p]:.6f} (index {idx_max_p})")
+    print(f"  Max |vʳ| at r = {grid.r[idx_max_v]:.6f} (index {idx_max_v})")
+
+    print("="*80 + "\n")
+
+    fig, axes = plt.subplots(2, 3, figsize=(15, 9))
 
     # Density
-    axes[0].plot(r_int, prim_0['rho0'][NUM_GHOSTS:-NUM_GHOSTS], 'b-', linewidth=2, label='t=0')
-    axes[0].plot(r_int, prim_1['rho0'][NUM_GHOSTS:-NUM_GHOSTS], 'r--', linewidth=1.7, label='t=1×dt')
-    axes[0].set_xlabel('r')
-    axes[0].set_ylabel(r'$\rho_0$')
-    axes[0].set_title('Density: first step')
-    axes[0].legend()
-    axes[0].grid(True, alpha=0.3)
+    axes[0, 0].semilogy(r_int, prim_0['rho0'][NUM_GHOSTS:-NUM_GHOSTS], 'b-', linewidth=2, label='t=0')
+    axes[0, 0].semilogy(r_int, prim_1['rho0'][NUM_GHOSTS:-NUM_GHOSTS], 'r--', linewidth=1.7, label='t=1×dt')
+    axes[0, 0].set_xlabel('r')
+    axes[0, 0].set_ylabel(r'$\rho_0$')
+    axes[0, 0].set_title('Density: first step')
+    axes[0, 0].legend()
+    axes[0, 0].grid(True, alpha=0.3)
 
     # Pressure
-    axes[1].plot(r_int, np.maximum(prim_0['p'][NUM_GHOSTS:-NUM_GHOSTS], 1e-20), 'b-', linewidth=2, label='t=0')
-    axes[1].plot(r_int, np.maximum(prim_1['p'][NUM_GHOSTS:-NUM_GHOSTS], 1e-20), 'r--', linewidth=1.7, label='t=1×dt')
-    axes[1].set_xlabel('r')
-    axes[1].set_ylabel('P')
-    axes[1].set_title('Pressure: first step')
-    axes[1].legend()
-    axes[1].grid(True, alpha=0.3)
+    axes[0, 1].semilogy(r_int, np.maximum(prim_0['p'][NUM_GHOSTS:-NUM_GHOSTS], 1e-20), 'b-', linewidth=2, label='t=0')
+    axes[0, 1].semilogy(r_int, np.maximum(prim_1['p'][NUM_GHOSTS:-NUM_GHOSTS], 1e-20), 'r--', linewidth=1.7, label='t=1×dt')
+    axes[0, 1].set_xlabel('r')
+    axes[0, 1].set_ylabel('P')
+    axes[0, 1].set_title('Pressure: first step')
+    axes[0, 1].legend()
+    axes[0, 1].grid(True, alpha=0.3)
 
     # Velocity
-    axes[2].plot(r_int, prim_0['vr'][NUM_GHOSTS:-NUM_GHOSTS], 'b-', linewidth=2, label='t=0')
-    axes[2].plot(r_int, prim_1['vr'][NUM_GHOSTS:-NUM_GHOSTS], 'r--', linewidth=1.7, label='t=1×dt')
-    axes[2].set_xlabel('r')
-    axes[2].set_ylabel(r'$v^r$')
-    axes[2].set_title('Velocity: first step')
-    axes[2].legend()
-    axes[2].grid(True, alpha=0.3)
+    axes[0, 2].plot(r_int, prim_0['vr'][NUM_GHOSTS:-NUM_GHOSTS], 'b-', linewidth=2, label='t=0')
+    axes[0, 2].plot(r_int, prim_1['vr'][NUM_GHOSTS:-NUM_GHOSTS], 'r--', linewidth=1.7, label='t=1×dt')
+    axes[0, 2].set_xlabel('r')
+    axes[0, 2].set_ylabel(r'$v^r$')
+    axes[0, 2].set_title('Velocity: first step')
+    axes[0, 2].legend()
+    axes[0, 2].grid(True, alpha=0.3)
+
+    # Lapse
+    axes[1, 0].plot(r_int, state_t0[idx_lapse, NUM_GHOSTS:-NUM_GHOSTS], 'b-', linewidth=2, label='t=0')
+    axes[1, 0].plot(r_int, state_t1[idx_lapse, NUM_GHOSTS:-NUM_GHOSTS], 'r--', linewidth=1.7, label='t=1×dt')
+    axes[1, 0].set_xlabel('r')
+    axes[1, 0].set_ylabel(r'$\alpha$')
+    axes[1, 0].set_title('Lapse: first step')
+    axes[1, 0].legend()
+    axes[1, 0].grid(True, alpha=0.3)
+
+    # Mass
+    axes[1, 1].plot(r_int, M_0_full[NUM_GHOSTS:-NUM_GHOSTS], 'b-', linewidth=2, label='t=0')
+    axes[1, 1].plot(r_int, M_1_full[NUM_GHOSTS:-NUM_GHOSTS], 'r--', linewidth=1.7, label='t=1×dt')
+    axes[1, 1].set_xlabel('r')
+    axes[1, 1].set_ylabel('M(r)')
+    axes[1, 1].set_title('Enclosed Mass: first step')
+    axes[1, 1].legend()
+    axes[1, 1].grid(True, alpha=0.3)
+
+    # Phi
+    axes[1, 2].plot(r_int, state_t0[idx_phi, NUM_GHOSTS:-NUM_GHOSTS], 'b-', linewidth=2, label='t=0')
+    axes[1, 2].plot(r_int, state_t1[idx_phi, NUM_GHOSTS:-NUM_GHOSTS], 'r--', linewidth=1.7, label='t=1×dt')
+    axes[1, 2].set_xlabel('r')
+    axes[1, 2].set_ylabel(r'$\phi$')
+    axes[1, 2].set_title('Conformal Factor: first step')
+    axes[1, 2].legend()
+    axes[1, 2].grid(True, alpha=0.3)
 
     plt.tight_layout()
     plt.savefig('tov_first_step.png', dpi=150, bbox_inches='tight')
     plt.close(fig)
 
 
-def plot_lapse_first_step(tov_solution, state_t0, state_t1, grid):
-    """Plot lapse alpha for TOV vs t=0 vs t=1×dt (interior only)."""
-    r_int = grid.r[NUM_GHOSTS:-NUM_GHOSTS]
-    alpha_t0 = state_t0[idx_lapse, NUM_GHOSTS:-NUM_GHOSTS]
-    alpha_t1 = state_t1[idx_lapse, NUM_GHOSTS:-NUM_GHOSTS]
+def plot_surface_zoom(tov_solution, state_t0, state_t1, grid, hydro, window=0.5):
+    """Zoom near the stellar surface R to compare t=0 vs t=1×dt.
 
-    # Restrict TOV to interior radii for one-to-one overlay
-    r0 = r_int[0]
-    r1 = r_int[-1]
-    mask = (tov_solution['r'] >= r0 - 1e-14) & (tov_solution['r'] <= r1 + 1e-14)
-    r_tov_int = tov_solution['r'][mask]
-    alpha_tov_int = tov_solution['alpha'][mask]
+    Plots overlays for (ρ0, P, v^r, D, S_r, τ) in a window [R−window, R+window].
+    """
+    R = float(tov_solution['R'])
+    r = grid.r
+    mask = (r >= R - window) & (r <= R + window)
+    if not np.any(mask):
+        return
 
-    import matplotlib.pyplot as plt
-    fig, ax = plt.subplots(1, 1, figsize=(7, 4.5))
-    ax.plot(r_tov_int, alpha_tov_int, 'b-', linewidth=2, label='TOV')
-    ax.plot(r_int, alpha_t0, 'r--', linewidth=1.7, label='Initial data (t=0)')
-    ax.plot(r_int, alpha_t1, 'g-.', linewidth=1.7, label='After 1 step (t=1×dt)')
-    ax.axvline(tov_solution['R'], color='gray', linestyle=':', alpha=0.5)
-    ax.set_xlabel('r')
-    ax.set_ylabel(r'$\alpha$')
-    ax.set_title('Lapse Function: first step')
-    ax.legend()
-    ax.grid(True, alpha=0.3)
+    bssn0 = BSSNVars(grid.N)
+    bssn0.set_bssn_vars(state_t0[:NUM_BSSN_VARS, :])
+    hydro.set_matter_vars(state_t0, bssn0, grid)
+    prim0 = hydro._get_primitives(bssn0, r)
+
+    bssn1 = BSSNVars(grid.N)
+    bssn1.set_bssn_vars(state_t1[:NUM_BSSN_VARS, :])
+    hydro.set_matter_vars(state_t1, bssn1, grid)
+    prim1 = hydro._get_primitives(bssn1, r)
+
+    D0, Sr0, tau0 = state_t0[NUM_BSSN_VARS + 0, :], state_t0[NUM_BSSN_VARS + 1, :], state_t0[NUM_BSSN_VARS + 2, :]
+    D1, Sr1, tau1 = state_t1[NUM_BSSN_VARS + 0, :], state_t1[NUM_BSSN_VARS + 1, :], state_t1[NUM_BSSN_VARS + 2, :]
+
+    rZ = r[mask]
+    fig, ax = plt.subplots(2, 3, figsize=(12, 7))
+    # Row 1: rho0, P, vr
+    ax[0, 0].semilogy(rZ, np.maximum(prim0['rho0'][mask], 1e-20), 'b-', label='t=0')
+    ax[0, 0].semilogy(rZ, np.maximum(prim1['rho0'][mask], 1e-20), 'r--', label='t=1×dt')
+    ax[0, 0].axvline(R, color='gray', ls=':'); ax[0, 0].set_title('ρ0 (zoom)'); ax[0, 0].legend(); ax[0, 0].grid(True, alpha=0.3)
+
+    ax[0, 1].semilogy(rZ, np.maximum(prim0['p'][mask], 1e-20), 'b-')
+    ax[0, 1].semilogy(rZ, np.maximum(prim1['p'][mask], 1e-20), 'r--')
+    ax[0, 1].axvline(R, color='gray', ls=':'); ax[0, 1].set_title('P (zoom)'); ax[0, 1].grid(True, alpha=0.3)
+
+    ax[0, 2].plot(rZ, prim0['vr'][mask], 'b-')
+    ax[0, 2].plot(rZ, prim1['vr'][mask], 'r--')
+    ax[0, 2].axvline(R, color='gray', ls=':'); ax[0, 2].set_title('v^r (zoom)'); ax[0, 2].grid(True, alpha=0.3)
+
+    # Row 2: D, Sr, tau
+    ax[1, 0].semilogy(rZ, np.maximum(D0[mask], 1e-22), 'b-')
+    ax[1, 0].semilogy(rZ, np.maximum(D1[mask], 1e-22), 'r--')
+    ax[1, 0].axvline(R, color='gray', ls=':'); ax[1, 0].set_title('D (zoom)'); ax[1, 0].grid(True, alpha=0.3)
+
+    ax[1, 1].plot(rZ, Sr0[mask], 'b-')
+    ax[1, 1].plot(rZ, Sr1[mask], 'r--')
+    ax[1, 1].axvline(R, color='gray', ls=':'); ax[1, 1].set_title('S_r (zoom)'); ax[1, 1].grid(True, alpha=0.3)
+
+    ax[1, 2].semilogy(rZ, np.maximum(np.abs(tau0[mask]), 1e-22), 'b-')
+    ax[1, 2].semilogy(rZ, np.maximum(np.abs(tau1[mask]), 1e-22), 'r--')
+    ax[1, 2].axvline(R, color='gray', ls=':'); ax[1, 2].set_title('τ (zoom)'); ax[1, 2].grid(True, alpha=0.3)
+
+    for a in ax.ravel():
+        a.set_xlabel('r')
+
     plt.tight_layout()
-    plt.savefig('tov_lapse_first_step.png', dpi=150, bbox_inches='tight')
+    plt.savefig('tov_surface_zoom.png', dpi=150, bbox_inches='tight')
     plt.close(fig)
 
 
@@ -295,10 +337,6 @@ def get_rhs_cowling(t, y, grid, background, hydro, bssn_fixed, bssn_d1_fixed):
     hydro.set_matter_vars(state, bssn_vars, grid)
 
     hydro_rhs = hydro.get_matter_rhs(grid.r, bssn_vars, bssn_d1_fixed, background)
-    # Optionally freeze energy equation (barotropic Cowling test)
-    if FREEZE_TAU:
-        # hydro_rhs shape: (3, N) ordering [dD/dt, dS_r/dt, dτ/dt]
-        hydro_rhs[2, :] = 0.0
 
     # Full RHS (BSSN frozen, only hydro evolves)
     rhs = np.zeros_like(state)
@@ -306,94 +344,82 @@ def get_rhs_cowling(t, y, grid, background, hydro, bssn_fixed, bssn_d1_fixed):
     return rhs.flatten()
 
 
-def _reproject_tau_barotropic(state_2d, grid, background, hydro):
-    """Recompute tau from (rho0, v^r, p) assuming barotropic EOS.
+## removed _reproject_tau_barotropic (unused)
 
-    Keeps D fixed; sets tau = rho h W^2 - p - D with
-    h = 1 + eps(rho), eps from EOS (barotropic path ignores p).
+
+def _apply_atmosphere_reset(state_2d, grid, hydro, atmosphere, rho_threshold=None):
     """
-    # Build BSSN vars to extract metric
-    bssn_vars = BSSNVars(grid.N)
-    bssn_vars.set_bssn_vars(state_2d[:NUM_BSSN_VARS, :])
+    Apply atmosphere reset: set atmosphere values where density is below threshold.
 
-    # Primitives from current conservative state
-    hydro.set_matter_vars(state_2d, bssn_vars, grid)
-    prim = hydro._get_primitives(bssn_vars, grid.r)
+    Following IllinoisGRMHD atmosphere handling with centralized AtmosphereParams.
 
-    rho0 = prim['rho0']
-    vr = prim['vr']
-    p = prim['p']
+    Args:
+        state_2d: State vector (2D array)
+        grid: Grid object
+        hydro: Hydrodynamics object
+        atmosphere: AtmosphereParams object
+        rho_threshold: Threshold below which to reset (default: 10 * rho_floor)
+    """
+    if rho_threshold is None:
+        rho_threshold = 10.0 * atmosphere.rho_floor
 
-    # Metric γ_rr = e^{4φ} γ̄_rr
-    e4phi = np.exp(4.0 * state_2d[idx_phi, :])
-    bar_gamma_LL = get_bar_gamma_LL(grid.r, bssn_vars.h_LL, background)
-    gamma_rr = e4phi * bar_gamma_LL[:, i_r, i_r]
-
-    # Lorentz factor and enthalpy for barotropic EOS
-    v2 = np.clip(gamma_rr * vr * vr, 0.0, 1.0 - 1e-12)
-    W = 1.0 / np.sqrt(1.0 - v2)
-
-    eos = hydro.eos
-    # For polytropic EOS, eps_from_rho_p ignores p and uses rho only
-    eps = eos.eps_from_rho_p(rho0, p)
-    if hasattr(eos, 'K') and hasattr(eos, 'gamma'):
-        h = 1.0 + eps
-    else:
-        h = 1.0 + eps + p / np.maximum(rho0, 1e-30)
-
+    # Direct check using D (conserved density)
     D = state_2d[NUM_BSSN_VARS + 0, :]
-    tau_new = rho0 * h * W * W - p - D
+    atm_mask = D < rho_threshold
 
-    state_2d[NUM_BSSN_VARS + 2, :] = tau_new
+    # Reset conservative variables in atmosphere
+    if np.any(atm_mask):
+        # Use centralized atmosphere values
+        state_2d[NUM_BSSN_VARS + 0, atm_mask] = atmosphere.rho_floor
+        state_2d[NUM_BSSN_VARS + 1, atm_mask] = 0.0  # Zero momentum
+        state_2d[NUM_BSSN_VARS + 2, atm_mask] = atmosphere.tau_atm  # Consistent tau
+
     return state_2d
 
 
-def rk4_step(state_flat, dt, grid, background, hydro, bssn_fixed, bssn_d1_fixed):
-    """Single RK4 (classical 4th order Runge-Kutta) timestep."""
+def rk4_step(state_flat, dt, grid, background, hydro, bssn_fixed, bssn_d1_fixed, atmosphere):
+    """
+    Single RK4 (classical 4th order Runge-Kutta) timestep with atmosphere reset.
+
+    Args:
+        atmosphere: AtmosphereParams object
+    """
     # Stage 1
     k1 = get_rhs_cowling(0, state_flat, grid, background, hydro, bssn_fixed, bssn_d1_fixed)
 
     # Stage 2
     state_2 = state_flat + 0.5 * dt * k1
-    if FREEZE_TAU:
-        s2 = state_2.reshape((grid.NUM_VARS, grid.N))
-        _reproject_tau_barotropic(s2, grid, background, hydro)
-        state_2 = s2.flatten()
     k2 = get_rhs_cowling(0, state_2, grid, background, hydro, bssn_fixed, bssn_d1_fixed)
 
     # Stage 3
     state_3 = state_flat + 0.5 * dt * k2
-    if FREEZE_TAU:
-        s3 = state_3.reshape((grid.NUM_VARS, grid.N))
-        _reproject_tau_barotropic(s3, grid, background, hydro)
-        state_3 = s3.flatten()
     k3 = get_rhs_cowling(0, state_3, grid, background, hydro, bssn_fixed, bssn_d1_fixed)
 
     # Stage 4
     state_4 = state_flat + dt * k3
-    if FREEZE_TAU:
-        s4 = state_4.reshape((grid.NUM_VARS, grid.N))
-        _reproject_tau_barotropic(s4, grid, background, hydro)
-        state_4 = s4.flatten()
     k4 = get_rhs_cowling(0, state_4, grid, background, hydro, bssn_fixed, bssn_d1_fixed)
 
     # Combine
     state_new = state_flat + (dt / 6.0) * (k1 + 2*k2 + 2*k3 + k4)
-    if FREEZE_TAU:
-        snew = state_new.reshape((grid.NUM_VARS, grid.N))
-        _reproject_tau_barotropic(snew, grid, background, hydro)
-        state_new = snew
+    snew = state_new.reshape((grid.NUM_VARS, grid.N))
 
-    return state_new
+    # Apply atmosphere reset after full step
+    snew_reset = _apply_atmosphere_reset(snew, grid, hydro, atmosphere)
+
+    return snew_reset.flatten()
 
 
 def evolve_fixed_timestep(state_initial, dt, num_steps, grid, background, hydro,
-                          bssn_fixed, bssn_d1_fixed, method='rk4'):
-    """Evolve with fixed timestep using RK4."""
+                          bssn_fixed, bssn_d1_fixed, atmosphere, method='rk4'):
+    """Evolve with fixed timestep using RK4.
+
+    Args:
+        atmosphere: AtmosphereParams object
+    """
     state_flat = state_initial.flatten()
 
     for step in range(num_steps):
-        state_flat = rk4_step(state_flat, dt, grid, background, hydro, bssn_fixed, bssn_d1_fixed)
+        state_flat = rk4_step(state_flat, dt, grid, background, hydro, bssn_fixed, bssn_d1_fixed, atmosphere)
         if (step + 1) % 20 == 0:
             print(f"  Step {step+1}/{num_steps}")
 
@@ -437,7 +463,7 @@ def plot_tov_diagnostics(tov_solution, r_max):
     fig, axes = plt.subplots(2, 3, figsize=(16, 8))
 
     # Density
-    axes[0, 0].plot(r, tov_solution['rho_baryon'], color='navy')
+    axes[0, 0].semilogy(r, tov_solution['rho_baryon'], color='navy')
     axes[0, 0].axvline(R_star, color='gray', linestyle=':', alpha=0.5, label=f'R={R_star:.2f}')
     axes[0, 0].set_xlabel(r"$r$")
     axes[0, 0].set_ylabel(r"$\rho_0$")
@@ -447,7 +473,7 @@ def plot_tov_diagnostics(tov_solution, r_max):
     axes[0, 0].grid(True, alpha=0.3)
 
     # Pressure
-    axes[0, 1].plot(r, tov_solution['P'], color='darkgreen')
+    axes[0, 1].semilogy(r, tov_solution['P'], color='darkgreen')
     axes[0, 1].axvline(R_star, color='gray', linestyle=':', alpha=0.5)
     axes[0, 1].set_xlabel(r"$r$")
     axes[0, 1].set_ylabel('P')
@@ -500,67 +526,7 @@ def plot_tov_diagnostics(tov_solution, r_max):
     plt.close(fig)
 
 
-def plot_initial_comparison(tov_solution, initial_state_2d, grid, hydro):
-    """Plot initial data vs TOV comparison."""
-    # Get primitives from initial data
-    bssn_vars = BSSNVars(grid.N)
-    bssn_vars.set_bssn_vars(initial_state_2d[:NUM_BSSN_VARS, :])
-    hydro.set_matter_vars(initial_state_2d, bssn_vars, grid)
-    prim = hydro._get_primitives(bssn_vars, grid.r)
-
-    r_tov = tov_solution['r']
-    r_grid = grid.r[NUM_GHOSTS:-NUM_GHOSTS]
-    rho_grid = prim['rho0'][NUM_GHOSTS:-NUM_GHOSTS]
-    P_grid = prim['p'][NUM_GHOSTS:-NUM_GHOSTS]
-    v_grid = prim['vr'][NUM_GHOSTS:-NUM_GHOSTS]
-
-    fig, axes = plt.subplots(2, 2, figsize=(14, 10))
-
-    # Density
-    axes[0, 0].plot(r_tov, tov_solution['rho_baryon'], 'b-', linewidth=2, label='TOV')
-    axes[0, 0].plot(r_grid, np.maximum(rho_grid, 1e-20), 'r--', linewidth=1.5, alpha=0.7, label='Initial data (t=0)')
-    axes[0, 0].axvline(tov_solution['R'], color='gray', linestyle=':', alpha=0.5, label=f"R={tov_solution['R']:.2f}")
-    axes[0, 0].set_xlabel('r')
-    axes[0, 0].set_ylabel(r'$\rho_0$')
-    axes[0, 0].set_title('Baryon Density')
-    axes[0, 0].legend()
-    axes[0, 0].grid(True, alpha=0.3)
-
-    # Pressure
-    axes[0, 1].plot(r_tov, tov_solution['P'], 'b-', linewidth=2, label='TOV')
-    axes[0, 1].plot(r_grid, np.maximum(P_grid, 1e-20), 'r--', linewidth=1.5, alpha=0.7, label='Initial data (t=0)')
-    axes[0, 1].axvline(tov_solution['R'], color='gray', linestyle=':', alpha=0.5)
-    axes[0, 1].set_xlabel('r')
-    axes[0, 1].set_ylabel('P')
-    axes[0, 1].set_title('Pressure')
-    axes[0, 1].legend()
-    axes[0, 1].grid(True, alpha=0.3)
-
-    # Velocity (should be zero initially)
-    axes[1, 0].plot(r_grid, v_grid, 'r-', linewidth=2, label='Initial data (t=0)')
-    axes[1, 0].axhline(0, color='gray', linestyle='--', alpha=0.5)
-    axes[1, 0].axvline(tov_solution['R'], color='gray', linestyle=':', alpha=0.5)
-    axes[1, 0].set_xlabel('r')
-    axes[1, 0].set_ylabel(r'$v^r$')
-    axes[1, 0].set_title('Radial Velocity')
-    axes[1, 0].legend()
-    axes[1, 0].grid(True, alpha=0.3)
-
-    # Lapse
-    alpha_grid = initial_state_2d[idx_lapse, NUM_GHOSTS:-NUM_GHOSTS]
-    axes[1, 1].plot(r_tov, tov_solution['alpha'], 'b-', linewidth=2, label='TOV')
-    axes[1, 1].plot(r_grid, alpha_grid, 'r--', linewidth=1.5, alpha=0.7, label='Initial data (t=0)')
-    axes[1, 1].axvline(tov_solution['R'], color='gray', linestyle=':', alpha=0.5)
-    axes[1, 1].set_xlabel('r')
-    axes[1, 1].set_ylabel(r'$\alpha$')
-    axes[1, 1].set_title('Lapse Function')
-    axes[1, 1].legend()
-    axes[1, 1].grid(True, alpha=0.3)
-
-    plt.suptitle('TOV vs Initial Data (t=0)', fontsize=14, y=1.00)
-    plt.tight_layout()
-    plt.savefig('tov_initial_data_comparison.png', dpi=150, bbox_inches='tight')
-    plt.close(fig)
+## plot_initial_comparison moved to examples/tov_initial_data.py
 
 
 def plot_evolution(state_t0, state_t1, state_t100, grid, hydro, dt, num_steps):
@@ -643,16 +609,37 @@ def main():
     # CONFIGURATION
     # ==================================================================
     r_max = 20.0
-    num_points = 3000 
+    num_points = 3000
     K = 100.0
-    Gamma = 2.0 
+    Gamma = 2.0
     rho_central = 1.28e-3
-    atmosphere_rho = 1.0e-10
+
+    # ==================================================================
+    # ATMOSPHERE CONFIGURATION (Centralized floor management)
+    # ==================================================================
+    # Define atmosphere parameters ONCE - all subsystems will use these
+    ATMOSPHERE = AtmosphereParams(
+        rho_floor=1.0e-12,      # Rest mass density floor
+        p_floor=1.0e-14,        # Pressure floor
+        v_max=0.9999,           # Maximum velocity
+        W_max=100.0,            # Maximum Lorentz factor
+        tau_atm_factor=1.0,     # tau_atm = tau_atm_factor * p_floor
+        conservative_floor_safety=0.999999  # Safety factor for S^2 constraint
+    )
+
+    print("=" * 70)
+    print("ATMOSPHERE CONFIGURATION")
+    print("=" * 70)
+    print(f"  rho_floor = {ATMOSPHERE.rho_floor:.2e}")
+    print(f"  p_floor   = {ATMOSPHERE.p_floor:.2e}")
+    print(f"  tau_atm   = {ATMOSPHERE.tau_atm:.2e}")
+    print(f"  v_max     = {ATMOSPHERE.v_max}")
+    print()
 
     # Time integration method
     # 'fixed': RK4 with fixed timestep (fast, stable)
     # 'adaptive': solve_ivp with adaptive timestep (slower, more accurate)
-    integration_method = 'adaptive'  # 'fixed' or 'adaptive'
+    integration_method = 'fixed'  # 'fixed' or 'adaptive'
 
     # ==================================================================
     # SETUP
@@ -663,8 +650,8 @@ def main():
     hydro = PerfectFluid(
         eos=eos,
         spacetime_mode="dynamic",
-        atmosphere_rho=atmosphere_rho,
-        reconstructor=create_reconstruction("minmod"),
+        atmosphere=ATMOSPHERE,  # Use centralized atmosphere
+        reconstructor=create_reconstruction("mp5"),
         riemann_solver=HLLERiemannSolver()
     )
 
@@ -693,9 +680,17 @@ def main():
     # INITIAL DATA
     # ==================================================================
     print("Creating initial data...")
-    initial_state_2d = create_initial_data(tov_solution, grid, background, eos, atmosphere_rho)
+    initial_state_2d = tov_id.create_initial_data(
+        tov_solution, grid, background, eos,
+        atmosphere=ATMOSPHERE,  # Use centralized atmosphere
+        polytrope_K=K, polytrope_Gamma=Gamma
+    )
 
-    plot_initial_comparison(tov_solution, initial_state_2d, grid, hydro)
+    # Initial-data diagnostics
+    tov_id.plot_initial_comparison(tov_solution, initial_state_2d, grid, hydro)
+    tov_id.plot_initial_geometry_comparison(tov_solution, initial_state_2d, grid)
+    tov_id.plot_hydrostatic_equilibrium_residual(initial_state_2d, grid, hydro, background)
+    tov_id.plot_cons2prim_consistency(initial_state_2d, grid, hydro, background)
 
     # ==================================================================
     # EVOLUTION
@@ -712,20 +707,20 @@ def main():
     gc.collect()
 
     if integration_method == 'fixed':
-        dt = 0.15 * grid.min_dr  # CFL condition
+        dt = 0.1 * grid.min_dr  # CFL condition
         num_steps = 100
-        print(f"\nEvolving with fixed dt={dt:.6f} (CFL=0.15) for {num_steps} steps using RK4")
+        print(f"\nEvolving with fixed dt={dt:.6f} (CFL=0.1) for {num_steps} steps using RK4")
 
         # Single step for comparison
         state_t1 = rk4_step(initial_state_2d.flatten(), dt, grid, background, hydro,
-                           bssn_fixed, bssn_d1_fixed).reshape((grid.NUM_VARS, grid.N))
+                           bssn_fixed, bssn_d1_fixed, ATMOSPHERE).reshape((grid.NUM_VARS, grid.N))
         # Plot only the first step changes
-        plot_first_step(initial_state_2d, state_t1, grid, hydro)
-        plot_lapse_first_step(tov_solution, initial_state_2d, state_t1, grid)
+        plot_first_step(initial_state_2d, state_t1, grid, hydro, tov_solution)
+        plot_surface_zoom(tov_solution, initial_state_2d, state_t1, grid, hydro, window=0.1)
 
         # Multiple steps
         state_t100 = evolve_fixed_timestep(initial_state_2d, dt, num_steps, grid, background,
-                                          hydro, bssn_fixed, bssn_d1_fixed, method='rk4')
+                                          hydro, bssn_fixed, bssn_d1_fixed, ATMOSPHERE, method='rk4')
 
     elif integration_method == 'adaptive':
         # NOTE: Adaptive methods are slower but can be more accurate
@@ -739,7 +734,7 @@ def main():
         # so code paths that expect 'num_steps' still work.
         num_steps = max(1, int(round(t_final / dt)))
         state_t1 = rk4_step(initial_state_2d.flatten(), dt, grid, background, hydro,
-                           bssn_fixed, bssn_d1_fixed).reshape((grid.NUM_VARS, grid.N))
+                           bssn_fixed, bssn_d1_fixed, ATMOSPHERE).reshape((grid.NUM_VARS, grid.N))
 
         # Adaptive evolution
         state_t100 = evolve_adaptive(initial_state_2d, t_final, grid, background, hydro,

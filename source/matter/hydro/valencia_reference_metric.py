@@ -36,7 +36,8 @@ from source.matter.hydro.cons2prim import prim_to_cons
 class ValenciaReferenceMetric:
     """Valencia formulation - full 3D tensor algebra following BSSN pattern."""
 
-    def __init__(self, boundary_mode="parity"):
+    def __init__(self, boundary_mode="parity", *, atmosphere_rho: float = 1e-13,
+                 p_floor: float = 1e-15, v_max: float = 0.999999):
         """
         Initialize Valencia formulation.
 
@@ -45,8 +46,18 @@ class ValenciaReferenceMetric:
         boundary_mode : str
             "parity" - Parity boundary conditions at inner boundary (r=0)
             "outflow" - Outflow (zero-gradient) at both boundaries
+        atmosphere_rho : float
+            Atmosphere density floor used to stabilize reconstruction near the surface.
+        p_floor : float
+            Minimum pressure used by physical limiters at interfaces.
+        v_max : float
+            Maximum allowed |v^r| used by physical limiters at interfaces.
         """
         self.boundary_mode = boundary_mode
+        # Near-surface stabilization parameters (kept in sync with PerfectFluid/cons2prim)
+        self.atmosphere_rho = float(atmosphere_rho)
+        self.p_floor = float(p_floor)
+        self.v_max = float(v_max)
 
     def compute_rhs(self, D, Sr, tau, rho0, vr, pressure, W, h,
                     r, bssn_vars, bssn_d1, background, spacetime_mode,
@@ -488,17 +499,17 @@ class ValenciaReferenceMetric:
                 pL[k0] = p_ref
                 pR[k0] = p_ref
 
-        # Surface/atmosphere flattening: in interfaces where density is near atmosphere,
-        # switch to first-order (average) and force v=0 to avoid overshoots.
-        # Threshold based on a small floor (~1e-13) times a factor.
-        dens_floor = 1.0e-13
-        thr = 10.0 * dens_floor
+        # Surface/atmosphere flattening: in interfaces where density is near the configured
+        # atmosphere, switch to first-order (average) and force v=0 to avoid overshoots.
+        # Use a threshold relative to the chosen atmosphere density.
+        dens_floor = max(self.atmosphere_rho, 1e-20)
+        thr = 30.0 * dens_floor
         if len(rhoL) > 0:
             import numpy as _np
             mask = (rhoL < thr) | (rhoR < thr)
             if _np.any(mask):
                 rho_avg = 0.5 * (rhoL + rhoR)
-                p_avg = _np.maximum(0.5 * (pL + pR), 1.0e-15)
+                p_avg = _np.maximum(0.5 * (pL + pR), self.p_floor)
                 rhoL[mask] = rho_avg[mask]
                 rhoR[mask] = rho_avg[mask]
                 pL[mask] = p_avg[mask]
@@ -510,7 +521,9 @@ class ValenciaReferenceMetric:
         if hasattr(reconstructor, "apply_physical_limiters"):
             (rhoL, vL, pL), (rhoR, vR, pR) = reconstructor.apply_physical_limiters(
                 (rhoL, vL, pL), (rhoR, vR, pR),
-                atmosphere_rho=1e-13, p_floor=1e-15, v_max=0.999999,
+                atmosphere_rho=self.atmosphere_rho,
+                p_floor=self.p_floor,
+                v_max=self.v_max,
                 gamma_rr=gamma_rr_f
             )
 
@@ -625,4 +638,3 @@ class ValenciaReferenceMetric:
                     rhs_tau[-NUM_GHOSTS:] = rhs_tau[last]
 
         return rhs_D, rhs_Sr, rhs_tau
-
