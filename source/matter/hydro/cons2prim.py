@@ -349,13 +349,17 @@ class Cons2PrimSolver:
                         eps_ultimate = eps_final[eps_ok]
                         p_ultimate = p_final[eps_ok]
 
-                        # Calculate h based on EOS type
-                        if hasattr(self.eos, 'K') and hasattr(self.eos, 'gamma'):
-                            # Polytropic EOS: h = 1 + ε
-                            h_ultimate = 1.0 + eps_ultimate
-                        else:
-                            # Ideal gas: h = 1 + ε + P/ρ
-                            h_ultimate = 1.0 + eps_ultimate + p_ultimate / np.maximum(rho0_ultimate, 1e-30)
+                        # Calculate enthalpy h using EOS interface when available
+                        try:
+                            # Ideal-gas style signature
+                            h_ultimate = self.eos.enthalpy(rho0_ultimate, p_ultimate, eps_ultimate)
+                        except TypeError:
+                            try:
+                                # Barotropic/polytropic signature
+                                h_ultimate = self.eos.enthalpy(rho0_ultimate)
+                            except Exception:
+                                # Fallback (ideal-gas-like)
+                                h_ultimate = 1.0 + eps_ultimate + p_ultimate / np.maximum(rho0_ultimate, 1e-30)
                         h_ok = np.isfinite(h_ultimate) & (h_ultimate > 1.0)
 
                         if np.any(h_ok):
@@ -569,13 +573,14 @@ class Cons2PrimSolver:
         if not np.isfinite(eps) or eps < 0.0:
             return False, (0, 0, 0, 1, 1, np.inf)
 
-        # Calculate h based on EOS type
-        if hasattr(self.eos, 'K') and hasattr(self.eos, 'gamma'):
-            # Polytropic EOS: h = 1 + ε
-            h = 1.0 + eps
-        else:
-            # Ideal gas: h = 1 + ε + P/ρ
-            h = 1.0 + eps + p / max(rho0, 1e-30)
+        # Calculate enthalpy using EOS when possible
+        try:
+            h = self.eos.enthalpy(rho0, p, eps)
+        except TypeError:
+            try:
+                h = self.eos.enthalpy(rho0)
+            except Exception:
+                h = 1.0 + eps + p / max(rho0, 1e-30)
 
         if not np.isfinite(h) or h <= 1.0:
             return False, (0, 0, 0, 1, 1, np.inf)
@@ -676,13 +681,14 @@ class Cons2PrimSolver:
 
         W = 1.0
 
-        # Calculate h based on EOS type
-        if hasattr(self.eos, 'K') and hasattr(self.eos, 'gamma'):
-            # Polytropic EOS: h = 1 + ε
-            h = 1.0 + eps
-        else:
-            # Ideal gas: h = 1 + ε + P/ρ
-            h = 1.0 + eps + p / rho0
+        # Calculate enthalpy using EOS when possible
+        try:
+            h = self.eos.enthalpy(rho0, p, eps)
+        except TypeError:
+            try:
+                h = self.eos.enthalpy(rho0)
+            except Exception:
+                h = 1.0 + eps + p / np.maximum(rho0, 1e-30)
 
         return rho0, vr, p, eps, W, h
 
@@ -729,15 +735,14 @@ def prim_to_cons(rho0, vr, pressure, gamma_rr, eos):
     # Thermodynamic quantities from EOS
     eps = eos.eps_from_rho_p(rho0, pressure)
 
-    # Specific enthalpy depends on EOS type
-    # For POLYTROPIC: P = K ρ^Γ, ε = P/[(Γ-1)ρ], h = 1 + ε
-    # For IDEAL GAS: P = (Γ-1)ρε, h = 1 + ε + P/ρ
-    if hasattr(eos, 'K') and hasattr(eos, 'gamma'):
-        # Polytropic EOS
-        h = 1.0 + eps
-    else:
-        # Ideal gas or other EOS
-        h = 1.0 + eps + pressure / np.maximum(rho0, 1e-30)
+    # Specific enthalpy via EOS interface
+    try:
+        h = eos.enthalpy(rho0, pressure, eps)
+    except TypeError:
+        try:
+            h = eos.enthalpy(rho0)
+        except Exception:
+            h = 1.0 + eps + pressure / np.maximum(rho0, 1e-30)
 
     # Conservative variables
     D = rho0 * W

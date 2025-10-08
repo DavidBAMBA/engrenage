@@ -418,10 +418,121 @@ def evolve_fixed_timestep(state_initial, dt, num_steps, grid, background, hydro,
     """
     state_flat = state_initial.flatten()
 
+    # Prebuild BSSN container for primitives computation (Cowling)
+    bssn_vars_fixed = BSSNVars(grid.N)
+    bssn_vars_fixed.set_bssn_vars(bssn_fixed)
+
+    def primitives_from_state(state_flattened):
+        s2d = state_flattened.reshape((grid.NUM_VARS, grid.N))
+        hydro.set_matter_vars(s2d, bssn_vars_fixed, grid)
+        return hydro._get_primitives(bssn_vars_fixed, grid.r), s2d
+
+    # Diagnostics at start
+    prim_prev, s_prev = primitives_from_state(state_flat)
+
+    print("\n===== Evolution diagnostics (per step) =====")
+    print("Columns: step | min/max rho0 | min/max P | max|vr| | min D | min(tau+D) | cons2prim fails")
+
     for step in range(num_steps):
-        state_flat = rk4_step(state_flat, dt, grid, background, hydro, bssn_fixed, bssn_d1_fixed, atmosphere)
+        # Advance one RK4 step
+        state_flat_next = rk4_step(state_flat, dt, grid, background, hydro, bssn_fixed, bssn_d1_fixed, atmosphere)
+
+        # Compute primitives BEFORE and AFTER to measure change
+        prim_next, s_next = primitives_from_state(state_flat_next)
+
+        # Interior slice (exclude ghosts)
+        interior = slice(NUM_GHOSTS, -NUM_GHOSTS)
+
+        rho_prev = prim_prev['rho0'][interior]
+        rho_next = prim_next['rho0'][interior]
+        p_prev = prim_prev['p'][interior]
+        p_next = prim_next['p'][interior]
+        v_prev = prim_prev['vr'][interior]
+        v_next = prim_next['vr'][interior]
+
+        D_prev = s_prev[NUM_BSSN_VARS + 0, interior]
+        Sr_prev = s_prev[NUM_BSSN_VARS + 1, interior]
+        tau_prev = s_prev[NUM_BSSN_VARS + 2, interior]
+        D_next = s_next[NUM_BSSN_VARS + 0, interior]
+        Sr_next = s_next[NUM_BSSN_VARS + 1, interior]
+        tau_next = s_next[NUM_BSSN_VARS + 2, interior]
+
+        # Summary stats
+        min_rho = float(np.min(rho_next))
+        max_rho = float(np.max(rho_next))
+        min_p = float(np.min(p_next))
+        max_p = float(np.max(p_next))
+        max_abs_v = float(np.max(np.abs(v_next)))
+        min_D = float(np.min(D_next))
+        min_tau_plus_D = float(np.min(tau_next + D_next))
+        c2p_fail_count = int(np.sum(~prim_next['success']))
+
+        print(f"step {step+1:4d}:  rho0[{min_rho:.3e},{max_rho:.3e}]  P[{min_p:.3e},{max_p:.3e}]  "
+              f"max|vr|={max_abs_v:.3e}  min D={min_D:.3e}  min(tau+D)={min_tau_plus_D:.3e}  "
+              f"c2p_fail={c2p_fail_count}")
+
+        # Detect first signs of instability / non-physical values
+        issues = []
+        if not np.all(np.isfinite(rho_next)) or not np.all(np.isfinite(p_next)):
+            issues.append("NaN/Inf in primitives")
+        if np.any(rho_next < 0):
+            issues.append("negative rho0")
+        if np.any(p_next < 0):
+            issues.append("negative pressure")
+        if np.any(np.abs(v_next) >= 1.0):
+            issues.append("superluminal v")
+        if min_D < 0:
+            issues.append("negative D")
+        if min_tau_plus_D < 0:
+            issues.append("tau + D < 0")
+
+        # If problems detected, print focused context (location and local values)
+        if issues:
+            print("  -> Detected issues:", ", ".join(issues))
+            # Locate worst offenders
+            try:
+                idx_v = NUM_GHOSTS + int(np.argmax(np.abs(prim_next['vr'][interior])))
+            except Exception:
+                idx_v = NUM_GHOSTS
+            try:
+                idx_rho_min = NUM_GHOSTS + int(np.argmin(prim_next['rho0'][interior]))
+            except Exception:
+                idx_rho_min = NUM_GHOSTS
+            try:
+                idx_tauD_min = NUM_GHOSTS + int(np.argmin((s_next[NUM_BSSN_VARS+2, interior] + s_next[NUM_BSSN_VARS+0, interior])))
+            except Exception:
+                idx_tauD_min = NUM_GHOSTS
+
+            idxs = sorted(set([idx_v, idx_rho_min, idx_tauD_min]))
+            for ii in idxs:
+                rloc = grid.r[ii]
+                print(f"     at r={rloc:.6f} (i={ii}): "
+                      f"rho0={prim_next['rho0'][ii]:.6e}, P={prim_next['p'][ii]:.6e}, vr={prim_next['vr'][ii]:.6e}, "
+                      f"D={s_next[NUM_BSSN_VARS+0, ii]:.6e}, Sr={s_next[NUM_BSSN_VARS+1, ii]:.6e}, tau={s_next[NUM_BSSN_VARS+2, ii]:.6e}")
+
+            # Also report relative changes at those points (prev -> next)
+            def rel(a, b):
+                return (b - a) / (np.abs(a) + 1e-30)
+            for ii in idxs:
+                print(f"       Δrel:  Δrho0={rel(prim_prev['rho0'][ii], prim_next['rho0'][ii]):.3e}, "
+                      f"ΔP={rel(prim_prev['p'][ii], prim_next['p'][ii]):.3e}, "
+                      f"Δvr={prim_next['vr'][ii]-prim_prev['vr'][ii]:.3e}, "
+                      f"ΔD={rel(s_prev[NUM_BSSN_VARS+0, ii], s_next[NUM_BSSN_VARS+0, ii]):.3e}, "
+                      f"ΔSr={s_next[NUM_BSSN_VARS+1, ii]-s_prev[NUM_BSSN_VARS+1, ii]:.3e}, "
+                      f"Δtau={rel(s_prev[NUM_BSSN_VARS+2, ii], s_next[NUM_BSSN_VARS+2, ii]):.3e}")
+
+            # Stop early so we can inspect before blow-up cascades
+            print("  -> Halting evolution early due to detected instability.")
+            state_flat = state_flat_next  # return the last state
+            return state_flat.reshape((grid.NUM_VARS, grid.N))
+
+        # Prepare next step
+        state_flat = state_flat_next
+        prim_prev, s_prev = prim_next, s_next
+
+        # Light progress marker
         if (step + 1) % 20 == 0:
-            print(f"  Step {step+1}/{num_steps}")
+            print(f"  Step {step+1}/{num_steps} OK")
 
     return state_flat.reshape((grid.NUM_VARS, grid.N))
 
