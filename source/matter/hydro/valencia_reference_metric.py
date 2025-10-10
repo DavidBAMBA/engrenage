@@ -319,13 +319,12 @@ class ValenciaReferenceMetric:
         """
         N = len(r)
 
-        # Handle Minkowski case separately
+        # Handle Minkowski case separately: no explicit hoop-stress sources here.
+        # In the NRPy formulation, geometric effects (e.g., 2p/r) arise from connection terms,
+        # not explicit sources. So in fixed_minkowski we set sources to zero and rely on
+        # the connection block in compute_rhs.
         if spacetime_mode == "fixed_minkowski":
-            # In Minkowski with spherical coordinates, hoop stress affects only radial direction
-            # For general 3D Cartesian Minkowski, sources would be zero
             src_S_vector = np.zeros((N, SPACEDIM))
-            # Hoop stress in radial direction only
-            src_S_vector[:, 0] = 2.0 * pressure / (r + 1e-30)
             src_tau = np.zeros(N)
             return src_S_vector, src_tau
 
@@ -479,6 +478,39 @@ class ValenciaReferenceMetric:
         dr = self._get_mesh_spacing(grid, r)
         N = len(r)
 
+        # Track original momentum dimensionality to preserve caller-facing API
+        _S_input = np.asarray(S_tildeD)
+        _return_radial_only = (_S_input.ndim == 1) or (_S_input.ndim == 2 and _S_input.shape[1] == 1)
+
+        # Coerce inputs to 3D vector form where appropriate (general 3D API)
+        # v_U: allow 1D (radial) input; expand to (N,3) with zeros in angular comps
+        if v_U is None:
+            v_U = np.zeros((N, SPACEDIM))
+        else:
+            v_arr = np.asarray(v_U)
+            if v_arr.ndim == 1:
+                v_U = np.zeros((N, SPACEDIM), dtype=float)
+                v_U[:, 0] = v_arr
+            elif v_arr.ndim == 2 and v_arr.shape[1] != SPACEDIM:
+                # Treat as radial-only if second dim mismatched
+                v_U = np.zeros((N, SPACEDIM), dtype=float)
+                v_U[:, 0] = v_arr[:, 0]
+            else:
+                v_U = v_arr
+
+        # S_tildeD: allow 1D (radial) input; expand to (N,3)
+        S_arr = np.asarray(S_tildeD)
+        if S_arr.ndim == 1:
+            S_new = np.zeros((N, SPACEDIM), dtype=float)
+            S_new[:, 0] = S_arr
+            S_tildeD = S_new
+        elif S_arr.ndim == 2 and S_arr.shape[1] != SPACEDIM:
+            S_new = np.zeros((N, SPACEDIM), dtype=float)
+            S_new[:, 0] = S_arr[:, 0]
+            S_tildeD = S_new
+        else:
+            S_tildeD = S_arr
+
             # Convert velocity to (N, 3) if needed
         v_U = np.asarray(v_U)
         if v_U.ndim == 1:
@@ -489,15 +521,14 @@ class ValenciaReferenceMetric:
             raise ValueError(f"Velocity shape {v_U.shape} incompatible with SPACEDIM={SPACEDIM}")
         
 
+        # Extract geometry (α, β^i, γ_ij, √γ, √ĝ, etc.) early, as W may need γ_ij
+        g = self._extract_geometry(r, bssn_vars, spacetime_mode, background)
+
         # Compute W and h from primitives if not provided
         if W is None:
-            # Compute v² = γ_ij v^i v^j using the PHYSICAL metric
-            # This is the CORRECT way in curved spacetime
-            gamma_LL = g['gamma_LL']  # (N, 3, 3)
-        
             # v² = γ_ij v^i v^j
+            gamma_LL = g['gamma_LL']  # (N, 3, 3)
             v_squared = np.einsum('xij,xi,xj->x', gamma_LL, v_U, v_U)
-        
             # Lorentz factor: W = 1/√(1 - v²)
             W = 1.0 / np.sqrt(np.maximum(1.0 - v_squared, 1e-16))
 
@@ -510,9 +541,6 @@ class ValenciaReferenceMetric:
         S_tildeD = S_tildeD.copy()
         tau = tau.copy()
         D, S_tildeD, tau = self._apply_ghost_cell_boundaries(D, S_tildeD, tau, r)
-
-        # Extract geometry (α, β^i, γ_ij, √γ, √ĝ, etc.)
-        g = self._extract_geometry(r, bssn_vars, spacetime_mode, background)
 
         # Compute NRPy-style partial fluxes at interfaces: α_face √γ_face F_phys
         flux_hat = self._compute_interface_fluxes(
@@ -552,73 +580,55 @@ class ValenciaReferenceMetric:
         # CONNECTION TERMS (NRPy form):
         #   D, τ:      -Γ̂^k_{kr} F̃^r
         #   S_i:       -Γ̂^k_{kr} F̃^r_i + Γ̂^l_{ri} F̃^r_l
-        #   All F̃ use α √γ and no √ĝ.
         # ====================================================================
         
-        if spacetime_mode != "fixed_minkowski":
-            # Compute conservative variables at cell centers for flux calculation
-            # Following NRPy+ lines 223, 228, 283, 300-301
-            
-            alpha = g['alpha']
+        # Build sqrt_gamma consistently: use hat determinant in Minkowski, bar determinant otherwise.
+        alpha = g['alpha']
+        if spacetime_mode == "fixed_minkowski":
+            sqrt_gamma = g['sqrt_gamma']
+        else:
             phi = np.asarray(bssn_vars.phi, dtype=float)
             e6phi = np.exp(6.0 * phi)
             det_bar_gamma = get_det_bar_gamma(r, bssn_vars.h_LL, background)
             sqrt_det_bar_gamma = np.sqrt(np.abs(det_bar_gamma) + 1e-30)
             sqrt_gamma = e6phi * sqrt_det_bar_gamma
-            
-            # Compute 4-velocity at cells with full 3D velocity
-            u4U = self._compute_4velocity(rho0, v_U, W, g)
-            
-            # Compute T^{μν} at cells with full 3D velocity
-            T4UU = self._compute_T4UU(rho0, v_U, pressure, W, h, g)
-            
-            # Compute conservative densities (NRPy+ lines 223, 228)
-            rho_star = alpha * sqrt_gamma * rho0 * u4U[:, 0]  # α √γ ρ₀ u^0
-            
-            # Compute PHYSICAL fluxes at cells (NOT densitized yet)
-            # Density flux: F^j_D = ρ_* v^j (NRPy+ line 283)
-            # Now for ALL three spatial components
-            fD_U = np.zeros((N, SPACEDIM))
-            for j in range(SPACEDIM):
-                fD_U[:, j] = rho_star * v_U[:, j]
-            
-            # Energy flux: F^j_τ = α² √γ T^{0j} - ρ_* v^j (NRPy+ line 300-301)
-            # Now for ALL three spatial components
-            fTau_U = np.zeros((N, SPACEDIM))
-            for j in range(SPACEDIM):
-                fTau_U[:, j] = (
-                    alpha ** 2 * sqrt_gamma * T4UU['0i'][:, j]
-                    - rho_star * v_U[:, j]
-                )
 
-            # For momentum, build full T^j_i flux tensor
-            T4UD = self._compute_T4UD(T4UU, g)
+        # Compute 4-velocity and stress-energy
+        u4U = self._compute_4velocity(rho0, v_U, W, g)
+        T4UU = self._compute_T4UU(rho0, v_U, pressure, W, h, g)
 
-            # Momentum partial-flux tensor (no √ĝ): F̃^j_i = α √γ T^j_i
-            # Full 3x3 spatial tensor
-            F_S_no_ghat = np.zeros((N, SPACEDIM, SPACEDIM))
-            for j in range(SPACEDIM):
-                for i in range(SPACEDIM):
-                    # T4UD['i_j'] stores T^i_j; we need T^j_i, so swap indices [j, i]
-                    F_S_no_ghat[:, j, i] = alpha * sqrt_gamma * T4UD['i_j'][:, j, i]
+        # Conservative density
+        rho_star = alpha * sqrt_gamma * rho0 * u4U[:, 0]
 
-            # Connection term trace: Γ̂^k_{kj}
-            Gamma_trace = np.einsum('xkkj->xj', hat_chris)
+        # Physical fluxes at cell centers
+        fD_U = np.zeros((N, SPACEDIM))
+        for j in range(SPACEDIM):
+            fD_U[:, j] = rho_star * v_U[:, j]
 
-            # Scalar connection terms (NRPy form, using partial fluxes F̃ with no √ĝ)
-            conn_D = -np.einsum('xj,xj->x', Gamma_trace, fD_U)
-            conn_tau = -np.einsum('xj,xj->x', Gamma_trace, fTau_U)
+        fTau_U = np.zeros((N, SPACEDIM))
+        for j in range(SPACEDIM):
+            fTau_U[:, j] = alpha ** 2 * sqrt_gamma * T4UU['0i'][:, j] - rho_star * v_U[:, j]
 
-            # Vector connection term (NRPy form): -Γ̂^k_{kl} F̃^l_i + Γ̂^l_{ji} F̃^j_l
-            conn_S_tildeD = (
-                -np.einsum('xl,xli->xi', Gamma_trace, F_S_no_ghat)
-                + np.einsum('xlji,xjl->xi', hat_chris, F_S_no_ghat)
-            )
+        # Momentum partial flux tensor F̃^j_i = α √γ T^j_i
+        T4UD = self._compute_T4UD(T4UU, g)
+        F_S_no_ghat = np.zeros((N, SPACEDIM, SPACEDIM))
+        for j in range(SPACEDIM):
+            for i in range(SPACEDIM):
+                F_S_no_ghat[:, j, i] = alpha * sqrt_gamma * T4UD['i_j'][:, j, i]
 
-            # Add connection terms to RHS
-            rhs_D += conn_D
-            rhs_tau += conn_tau
-            rhs_S_tildeD += conn_S_tildeD  # Now adds to all three components
+        # Connection contributions
+        Gamma_trace = np.einsum('xkkj->xj', hat_chris)
+        conn_D = -np.einsum('xj,xj->x', Gamma_trace, fD_U)
+        conn_tau = -np.einsum('xj,xj->x', Gamma_trace, fTau_U)
+        conn_S_tildeD = (
+            -np.einsum('xl,xli->xi', Gamma_trace, F_S_no_ghat)
+            + np.einsum('xlji,xjl->xi', hat_chris, F_S_no_ghat)
+        )
+
+        # Add connection terms to RHS
+        rhs_D += conn_D
+        rhs_tau += conn_tau
+        rhs_S_tildeD += conn_S_tildeD  # Now adds to all three components
 
         # ====================================================================
         # SOURCE TERMS (geometric couplings - NRPy+ style)
@@ -631,7 +641,13 @@ class ValenciaReferenceMetric:
         rhs_S_tildeD += src_S_tildeD  # Vector addition - all three components
         rhs_tau += src_tau
 
-        return rhs_D, rhs_S_tildeD, rhs_tau  # (N,), (N,3), (N,)
+        # Preserve backward-compatible shape: if input momentum was 1D, return RHS radial as (N,)
+        if _return_radial_only:
+            rhs_S_out = rhs_S_tildeD[:, 0]
+        else:
+            rhs_S_out = rhs_S_tildeD
+
+        return rhs_D, rhs_S_out, rhs_tau  # (N,), (N,) or (N,3), (N,)
 
     def _compute_interface_fluxes(self, rho0, v_U, pressure, g, r,
                                 eos, reconstructor, riemann_solver):

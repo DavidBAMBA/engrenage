@@ -179,10 +179,28 @@ class PerfectFluid:
         # Build metric for cons2prim
         # Use geometry from valencia (eliminate duplication)
         g = self.valencia._extract_geometry(r, bssn_vars, self.spacetime_mode, self.background)
+        # Map general 3D geometry to 1D radial metric expected by cons2prim
+        alpha = g.get('alpha')
+        # Prefer provided radial components if present; otherwise derive from full tensors
+        if 'beta_r' in g:
+            beta_r = g['beta_r']
+        else:
+            betaU = g.get('beta_U', None)
+            beta_r = betaU[:, 0] if betaU is not None else np.zeros_like(alpha)
+
+        if 'gamma_rr' in g:
+            gamma_rr = g['gamma_rr']
+        else:
+            gammaLL = g.get('gamma_LL', None)
+            if gammaLL is not None:
+                gamma_rr = gammaLL[:, 0, 0]
+            else:
+                gamma_rr = np.ones_like(alpha)
+
         metric = {
-            "alpha": g['alpha'],
-            "beta_r": g['beta_r'],
-            "gamma_rr": g['gamma_rr']
+            "alpha": alpha,
+            "beta_r": beta_r,
+            "gamma_rr": gamma_rr,
         }
 
         # Use pressure cache if available

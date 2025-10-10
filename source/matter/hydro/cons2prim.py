@@ -130,6 +130,28 @@ class Cons2PrimSolver:
         # Enforce velocity limits
         self._enforce_velocity_limit_vectorized(vr, gamma_rr)
 
+        # Final primitive floors (stability near atmosphere):
+        # Ensure pressure never dips below the configured floor after solve.
+        # If we clamp pressure, recompute eps and h consistently via EOS.
+        p_floor = float(self.params.get("p_floor", 1.0e-15))
+        if p_floor > 0.0:
+            low_p_mask = p < p_floor
+            if np.any(low_p_mask):
+                p[low_p_mask] = p_floor
+                try:
+                    eps[low_p_mask] = self.eos.eps_from_rho_p(rho0[low_p_mask], p[low_p_mask])
+                except Exception:
+                    # Fallback small internal energy if EOS call fails
+                    eps[low_p_mask] = np.maximum(eps[low_p_mask], 1.0e-10)
+                # Recompute enthalpy with available EOS interface
+                try:
+                    h[low_p_mask] = self.eos.enthalpy(rho0[low_p_mask], p[low_p_mask], eps[low_p_mask])
+                except TypeError:
+                    try:
+                        h[low_p_mask] = self.eos.enthalpy(rho0[low_p_mask])
+                    except Exception:
+                        h[low_p_mask] = 1.0 + eps[low_p_mask] + p[low_p_mask] / np.maximum(rho0[low_p_mask], 1e-30)
+
         return {
             "rho0": rho0, "vr": vr, "p": p, "eps": eps,
             "W": W, "h": h, "success": success
