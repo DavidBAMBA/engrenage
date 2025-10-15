@@ -679,8 +679,6 @@ class ValenciaReferenceMetric:
         N = len(r)
         
         # Extract first spatial component for 1D reconstruction
-        # This is v^r (spherical), v^ρ (cylindrical), or v^x (Cartesian)
-        # depending on the background coordinate system
         v_primary = v_U[:, 0]
         
         # Reconstruct primitives to left/right states at interfaces
@@ -704,7 +702,6 @@ class ValenciaReferenceMetric:
         gamma_LL_f = 0.5 * (g['gamma_LL'][:-1] + g['gamma_LL'][1:])  # (N-1, 3, 3)
         
         # For 1D Riemann solver, extract first spatial components
-        # (direction depends on coordinate system from background)
         beta_primary_f = beta_U_f[:, 0]  # β^r or β^ρ or β^x
         gamma_primary_primary_f = gamma_LL_f[:, 0, 0]  # γ_rr or γ_ρρ or γ_xx
         
@@ -768,7 +765,6 @@ class ValenciaReferenceMetric:
             gamma_primary_primary_f, alpha_f, beta_primary_f, eos
         )
         
-        # Multiply by α √γ to get NRPy-style partial fluxes (no √ĝ here)
         dens_factor = alpha_f * sqrt_gamma_f
         F_batch = dens_factor[:, None] * F_phys_batch
         

@@ -41,6 +41,7 @@ from source.bssn.tensoralgebra import get_bar_gamma_LL
 
 from examples.tov_solver import TOVSolver
 import examples.tov_initial_data as tov_id
+import examples.tov_initial_data_interpolated as tov_id_interp
 
 
 def plot_first_step(state_t0, state_t1, grid, hydro, tov_solution=None):
@@ -431,7 +432,7 @@ def evolve_fixed_timestep(state_initial, dt, num_steps, grid, background, hydro,
     prim_prev, s_prev = primitives_from_state(state_flat)
 
     print("\n===== Evolution diagnostics (per step) =====")
-    print("Columns: step | min/max rho0 | min/max P | max|vr| | min D | min(tau+D) | cons2prim fails")
+    print("Columns: step | t | min/max rho0 | min/max P | max|vr| | min D | min(tau+D) | cons2prim fails")
 
     for step in range(num_steps):
         # Advance one RK4 step
@@ -467,7 +468,8 @@ def evolve_fixed_timestep(state_initial, dt, num_steps, grid, background, hydro,
         min_tau_plus_D = float(np.min(tau_next + D_next))
         c2p_fail_count = int(np.sum(~prim_next['success']))
 
-        print(f"step {step+1:4d}:  rho0[{min_rho:.3e},{max_rho:.3e}]  P[{min_p:.3e},{max_p:.3e}]  "
+        t_curr = (step + 1) * dt
+        print(f"step {step+1:4d}  t={t_curr:.6e}:  rho0[{min_rho:.3e},{max_rho:.3e}]  P[{min_p:.3e},{max_p:.3e}]  "
               f"max|vr|={max_abs_v:.3e}  min D={min_D:.3e}  min(tau+D)={min_tau_plus_D:.3e}  "
               f"c2p_fail={c2p_fail_count}")
 
@@ -532,7 +534,7 @@ def evolve_fixed_timestep(state_initial, dt, num_steps, grid, background, hydro,
 
         # Light progress marker
         if (step + 1) % 20 == 0:
-            print(f"  Step {step+1}/{num_steps} OK")
+            print(f"  Step {step+1}/{num_steps} OK  (t={t_curr:.6e})")
 
     return state_flat.reshape((grid.NUM_VARS, grid.N))
 
@@ -719,8 +721,8 @@ def main():
     # ==================================================================
     # CONFIGURATION
     # ==================================================================
-    r_max = 20.0
-    num_points = 3000
+    r_max = 16.0
+    num_points = 4000
     K = 100.0
     Gamma = 2.0
     rho_central = 1.28e-3
@@ -730,8 +732,8 @@ def main():
     # ==================================================================
     # Define atmosphere parameters ONCE - all subsystems will use these
     ATMOSPHERE = AtmosphereParams(
-        rho_floor=1.0e-12,      # Rest mass density floor
-        p_floor=1.0e-14,        # Pressure floor
+        rho_floor=1.0e-10,      # Rest mass density floor
+        p_floor=1.0e-11,        # Pressure floor
         v_max=0.9999,           # Maximum velocity
         W_max=100.0,            # Maximum Lorentz factor
         tau_atm_factor=1.0,     # tau_atm = tau_atm_factor * p_floor
@@ -762,7 +764,7 @@ def main():
         eos=eos,
         spacetime_mode="dynamic",
         atmosphere=ATMOSPHERE,  # Use centralized atmosphere
-        reconstructor=create_reconstruction("mp5"),
+        reconstructor=create_reconstruction("minmod"),
         riemann_solver=HLLERiemannSolver()
     )
 
@@ -775,26 +777,35 @@ def main():
     print(f"EOS: K={K}, Gamma={Gamma}\n")
 
     # ==================================================================
-    # SOLVE TOV
+    # SOLVE TOV ON FINE INDEPENDENT GRID
     # ==================================================================
-    print("Solving TOV equations on evolution grid (no interpolation)...")
-    # Use Schwarzschild coordinates (use_isotropic=False) to get full domain coverage
+    print("Solving TOV equations on fine independent grid...")
+    # Strategy: TOV on fine grid, then interpolate to coarse evolution grid
+    # This follows NRPy+ approach to avoid coupling TOV and evolution grids
     tov_solver = TOVSolver(K=K, Gamma=Gamma, use_isotropic=False)
-    r_positive = grid.r[NUM_GHOSTS:]  # use interior positive radii (exclude ghosts) for TOV
-    tov_solution = tov_solver.solve(rho_central, r_grid=r_positive, r_max=r_max)
+
+    # Fine TOV grid: 10x finer than evolution grid
+    tov_num_points = num_points * 10
+    tov_dr = r_max / tov_num_points
+    print(f"  TOV grid: {tov_num_points} points, dr = {tov_dr:.6e}")
+
+    # Solve TOV on fine grid (don't pass r_grid, let solver use its own)
+    tov_solution = tov_solver.solve(rho_central, r_max=r_max, dr=tov_dr)
 
     print(f"TOV Solution: M={tov_solution['M_star']:.6f}, R={tov_solution['R']:.3f}, C={tov_solution['C']:.4f}\n")
 
     plot_tov_diagnostics(tov_solution, r_max)
 
     # ==================================================================
-    # INITIAL DATA
+    # INITIAL DATA VIA HIGH-ORDER INTERPOLATION
     # ==================================================================
-    print("Creating initial data...")
-    initial_state_2d = tov_id.create_initial_data(
+    print("Creating initial data via high-order interpolation...")
+    initial_state_2d = tov_id_interp.create_initial_data_interpolated(
         tov_solution, grid, background, eos,
-        atmosphere=ATMOSPHERE,  # Use centralized atmosphere
-        polytrope_K=K, polytrope_Gamma=Gamma
+        atmosphere=ATMOSPHERE,
+        polytrope_K=K, polytrope_Gamma=Gamma,
+        use_hydrobase_tau=True,
+        interp_order=11  # NRPy+ default
     )
 
     # Initial-data diagnostics
@@ -818,8 +829,8 @@ def main():
     gc.collect()
 
     if integration_method == 'fixed':
-        dt = 0.1 * grid.min_dr  # CFL condition
-        num_steps = 100
+        dt = 0.15 * grid.min_dr  # CFL condition
+        num_steps = 10000
         print(f"\nEvolving with fixed dt={dt:.6f} (CFL=0.1) for {num_steps} steps using RK4")
 
         # Single step for comparison
@@ -836,7 +847,7 @@ def main():
     elif integration_method == 'adaptive':
         # NOTE: Adaptive methods are slower but can be more accurate
         # Available methods: 'RK45', 'RK23', 'DOP853', 'Radau', 'BDF', 'LSODA'
-        t_final = 0.005  # Final time
+        t_final = 10.00  # Final time
         print(f"\nEvolving to t={t_final} using solve_ivp (adaptive)")
 
         # For single step comparison, use small fixed dt

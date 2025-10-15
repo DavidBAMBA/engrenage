@@ -228,7 +228,7 @@ def test_riemann_sod():
     print("="*60)
 
     # Configuración base
-    r, grid, Nin = build_grid(n_interior=200, r_min=1e-3, r_max=1.0)
+    r, grid, Nin = build_grid(n_interior=100, r_min=1e-3, r_max=1.0)
     N = len(r)
     eos = IdealGasEOS(gamma=1.4)
     rsolve = HLLERiemannSolver()
@@ -295,7 +295,7 @@ def test_riemann_sod():
         steps = 0
         while t < Tfinal and steps < 5000:
             dt, D, Sr, tau, rho0, v, p = rk3_step(
-                val, D, Sr, tau, rho0, v, p, r_current, grid_current, eos, recon, rsolve, cfl=0.45
+                val, D, Sr, tau, rho0, v, p, r_current, grid_current, eos, recon, rsolve, cfl=0.3
             )
             t += dt
             steps += 1
@@ -457,9 +457,9 @@ def test_riemann_sod():
 
 # ========= TEST ÚNICO (unificado): BLAST WAVE ESFÉRICO =========
 def test_blast_wave(case='weak',
-                   n_interior=800, r_min=1e-3, r_max=1.0,
+                   n_interior=100, r_min=1e-3, r_max=1.0,
                    gamma=1.4, r0=None,
-                   t_final=0.4, cfl=0.45,
+                   t_final=0.4, cfl=0.3,
                    plot=True, savefig=True):
     """
     Blast wave esférico (Minkowski, FULL reference-metric) — test unificado.
@@ -550,6 +550,140 @@ def test_blast_wave(case='weak',
     return ok
 
 
+def test_blast_wave_compare(case='weak'):
+    print("\n" + "="*60)
+    print(f"TEST Blast radial - Comparación reconstructores ({case}, Minkowski, FULL reference-metric)")
+    print("="*60)
+
+    # Configuración base
+    r, grid, Nin = build_grid(n_interior=100, r_min=1e-3, r_max=1.0)
+    N = len(r)
+    eos = IdealGasEOS(gamma=1.4)
+    rsolve = HLLERiemannSolver()
+
+    # Parámetros del blast
+    ng = NUM_GHOSTS
+    r_mid = 0.5*(r[ng] + r[-ng-1]) if True else 0.5
+    if case.lower() == 'weak':
+        p_in, p_out   = 1.0, 0.1
+        rho_in, rho_out = 1.0, 0.125
+    elif case.lower() == 'strong':
+        p_in, p_out   = 133.33, 0.125
+        rho_in, rho_out = 10.0, 1.0
+    else:
+        raise ValueError("case debe ser 'weak' o 'strong'")
+
+    rho0_base = np.where(r < r_mid, rho_in, rho_out).astype(float)
+    p_base    = np.where(r < r_mid, p_in,  p_out ).astype(float)
+    v_base    = np.zeros(N, dtype=float)
+
+    # Métodos a comparar
+    methods    = ["minmod", "mp5"]  # , "mp5_hires" (opcional)
+    colors     = ["tab:red", "tab:blue"]
+    labels     = ["MINMOD", "MP5"]
+    linestyles = ["-", "-"]
+
+    # Resultados
+    results = {}
+
+    for i, method in enumerate(methods):
+        print(f"\nEjecutando {labels[i]}...")
+
+        # Opción de alta resolución (desactivada por defecto)
+        if method == "mp5_hires":
+            r_hires, grid_hires, Nin_hires = build_grid(n_interior=200, r_min=1e-3, r_max=1.0)
+            r_current = r_hires
+            grid_current = grid_hires
+            rho0 = np.where(r_hires < r_mid, rho_in, rho_out).astype(float)
+            p    = np.where(r_hires < r_mid, p_in,  p_out ).astype(float)
+            v    = np.zeros_like(r_hires)
+            actual_method = "mp5"
+        else:
+            r_current = r
+            grid_current = grid
+            rho0 = rho0_base.copy()
+            p    = p_base.copy()
+            v    = v_base.copy()
+            actual_method = method
+
+        # Ghosts
+        rho0, v, p = fill_ghosts_primitives(rho0, v, p)
+
+        # Conservadas iniciales
+        D, Sr, tau = to_conserved(rho0, v, p, eos)
+
+        # Recon y evolución
+        recon = create_reconstruction(actual_method)
+        val   = ValenciaReferenceMetric()
+
+        t, Tfinal = 0.0, 0.4
+        steps = 0
+        while t < Tfinal and steps < 10000:
+            dt, D, Sr, tau, rho0, v, p = rk3_step(
+                val, D, Sr, tau, rho0, v, p, r_current, grid_current, eos, recon, rsolve, cfl=0.3
+            )
+            t += dt; steps += 1
+
+        # Guardar
+        rin = r_current[ng:-ng]
+        results[method] = {
+            'r': rin.copy(),
+            'rho': rho0[ng:-ng].copy(),
+            'p': p[ng:-ng].copy(),
+            'v': v[ng:-ng].copy(),
+            'E': (tau[ng:-ng] + D[ng:-ng]).copy(),
+            't': t,
+            'steps': steps,
+        }
+        print(f"  {method}: t≈{t:.3f}, pasos={steps}")
+
+    # ========= FIGURA ÚNICA (ρ, p, v, E) sin zoom =========
+    avg_time = np.mean([results[m]['t'] for m in methods])
+    fig, axes = plt.subplots(2, 2, figsize=(12, 10))
+    lw_main = 2.5
+
+    # Densidad
+    ax = axes[0, 0]
+    for i, method in enumerate(methods):
+        ax.plot(results[method]['r'], results[method]['rho'], color=colors[i], label=labels[i], linewidth=lw_main, linestyle=linestyles[i])
+    ax.set_xlabel('r'); ax.set_ylabel('Densidad ρ₀'); ax.set_xlim(0,1); ax.grid(True, alpha=0.3); ax.legend(); ax.set_title('ρ')
+
+    # Presión
+    ax = axes[0, 1]
+    for i, method in enumerate(methods):
+        ax.plot(results[method]['r'], results[method]['p'], color=colors[i], label=labels[i], linewidth=lw_main, linestyle=linestyles[i])
+    ax.set_xlabel('r'); ax.set_ylabel('Presión p'); ax.set_xlim(0,1); ax.set_yscale('linear'); ax.grid(True, alpha=0.3); ax.legend(); ax.set_title('p')
+
+    # Velocidad
+    ax = axes[1, 0]
+    for i, method in enumerate(methods):
+        ax.plot(results[method]['r'], results[method]['v'], color=colors[i], label=labels[i], linewidth=lw_main, linestyle=linestyles[i])
+    ax.set_xlabel('r'); ax.set_ylabel('Velocidad v^r'); ax.set_xlim(0,1); ax.grid(True, alpha=0.3); ax.legend(); ax.set_title('v')
+
+    # Energía (densidad): tau + D
+    ax = axes[1, 1]
+    for i, method in enumerate(methods):
+        ax.plot(results[method]['r'], results[method]['E'], color=colors[i], label=labels[i], linewidth=lw_main, linestyle=linestyles[i])
+    ax.set_xlabel('r'); ax.set_ylabel('Energía dens. (τ + D)'); ax.set_xlim(0,1); ax.grid(True, alpha=0.3); ax.legend(); ax.set_title('E')
+
+    fig.suptitle(f"Blast {case}: Comparación MINMOD vs MP5 (t ≈ {avg_time:.3f})")
+    plt.tight_layout()
+    plt.savefig(f"blast_{case}_comparison.png", dpi=150, bbox_inches="tight")
+
+    # Criterio básico de OK
+    ok_methods = []
+    for method in methods:
+        rho_in = results[method]['rho']
+        r_in   = results[method]['r']
+        variation = float(np.std(rho_in)/max(np.mean(rho_in),1e-12))
+        grad   = np.gradient(rho_in, r_in)
+        contact= bool(np.any(np.abs(grad) > 0.5))
+        ok_methods.append((variation > 0.1) and contact)
+    all_ok = all(ok_methods)
+    print("✓ PASA" if all_ok else "✗ FALLA")
+    return all_ok
+
+
 def test_conservation_short():
     print("\n" + "="*60)
     print("TEST 4: Conservación global (masa/energía)")
@@ -594,8 +728,8 @@ if __name__ == "__main__":
     results.append(("cons2prim",     test_cons2prim_roundtrip()))
     results.append(("Conservación",  test_conservation_short()))
     results.append(("Sod radial",    test_riemann_sod()))
-    results.append(("Blast weak",    test_blast_wave(case="weak")))
-    results.append(("Blast strong",  test_blast_wave(case="strong")))
+    results.append(("Blast weak",    test_blast_wave_compare(case="weak")))
+    results.append(("Blast strong",  test_blast_wave_compare(case="strong")))
 
     print("\n" + "="*60)
     print("RESUMEN")

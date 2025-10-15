@@ -210,6 +210,38 @@ def create_initial_data(tov_solution, grid, background, eos, atmosphere_rho=None
             state_2d[NUM_BSSN_VARS + 1, i] = Sr
             state_2d[NUM_BSSN_VARS + 2, i] = tau
 
+    # CRITICAL: The TOV solution produces a sharp discontinuity at the stellar surface.
+    # We must set all exterior points (including transition zone) to atmosphere values
+    # to avoid Gibbs phenomenon with high-order reconstructors like MP5.
+    #
+    # Strategy: Find the stellar surface (where TOV rho drops below reasonable threshold),
+    # then set everything beyond that to atmosphere values.
+    if atmosphere is not None:
+        from source.matter.hydro.atmosphere import AtmosphereParams
+        if isinstance(atmosphere, AtmosphereParams):
+            D = state_2d[NUM_BSSN_VARS + 0, :]
+
+            # Find stellar surface: use a threshold that's much higher than floor
+            # to capture the full transition region where TOV solution goes to zero
+            surface_threshold = 1.0e-6  # Physical threshold for "star interior"
+
+            interior_mask = D >= surface_threshold
+            if np.any(interior_mask):
+                # Find last truly interior point
+                interior_indices = np.where(interior_mask)[0]
+                last_interior_idx = interior_indices[-1]
+
+                # Set all points beyond this to atmosphere
+                exterior_mask = np.arange(len(D)) > last_interior_idx
+                if np.any(exterior_mask):
+                    state_2d[NUM_BSSN_VARS + 0, exterior_mask] = atmosphere.rho_floor
+                    state_2d[NUM_BSSN_VARS + 1, exterior_mask] = 0.0
+                    state_2d[NUM_BSSN_VARS + 2, exterior_mask] = atmosphere.tau_atm
+
+                    R_surf = grid.r[last_interior_idx]
+                    n_exterior = np.sum(exterior_mask)
+                    print(f'  Initial data: Set {n_exterior} exterior points (r > {R_surf:.6f}) to atmosphere')
+
     # Fill ghost zones
     grid.fill_boundaries(state_2d)
     return state_2d
