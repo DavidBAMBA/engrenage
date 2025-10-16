@@ -195,6 +195,9 @@ class Cons2PrimSolver:
         W = np.ones(N)
         h = np.ones(N)
 
+        # Ideal-gas quick check
+        _is_ideal = getattr(self.eos, "name", "").startswith("ideal_gas")
+
         # Newton-Raphson iterations
         for iteration in range(self.params["max_iter"]):
             if not np.any(active):
@@ -235,35 +238,43 @@ class Cons2PrimSolver:
             if not np.any(active):
                 break
 
-            # Compute numerical derivatives for remaining points
+            # Compute derivatives for remaining points
             still_active = active & ~converged
             if not np.any(still_active):
                 break
 
             p_still = p[still_active]
-            dp = np.maximum(1e-3 * np.maximum(np.abs(p_still), 1.0), 1e-12)
-
-            ok2, states2 = self._evaluate_pressure_vectorized(
-                D[still_active], Sr[still_active], tau[still_active],
-                p_still + dp, gamma_rr[still_active]
-            )
-
-            if not np.all(ok2):
-                failed_indices = np.where(still_active)[0][~ok2]
-                p[failed_indices] = np.maximum(self.params["p_floor"],
-                                             p[failed_indices] * 1.5 + 1e-12)
-                continue
-
-            # Newton update
+            # Residual aligned with still_active
             f_still = f_active[~converged_now] if np.any(converged_now) else f_active
-            # Safe derivative: handle non-finite and zero dp
-            num = states2[5] - f_still
-            # Replace non-finite numerator with +inf so it is treated as bad derivative
-            num = np.where(np.isfinite(num), num, np.inf)
-            dp_safe = np.where(np.abs(dp) > 0, dp, 1e-12)
-            df = num / dp_safe
-            # Treat non-finite derivatives as "small" to trigger fallback handling
-            df = np.where(np.isfinite(df), df, 0.0)
+
+            if _is_ideal:
+                # === Analytic df/dp for Ideal Gas EOS (2 líneas clave) ===
+                E = tau[still_active] + D[still_active]
+                Q = E + p_still
+                g = np.maximum(gamma_rr[still_active], 1e-30)
+                v2 = (Sr[still_active] ** 2) / np.maximum(Q * Q * g, 1e-30)
+                W_loc = 1.0 / np.sqrt(np.maximum(1.0 - v2, 1e-16))
+                Wprime = - (Sr[still_active] ** 2) * (W_loc ** 3) / np.maximum(Q ** 3 * g, 1e-30)
+                c = float(self.eos.gamma) / (float(self.eos.gamma) - 1.0)
+                df = c * (W_loc ** 2) + (D[still_active] + 2.0 * c * p_still * W_loc) * Wprime - 1.0
+            else:
+                # Numerical derivative
+                dp = np.maximum(1e-3 * np.maximum(np.abs(p_still), 1.0), 1e-12)
+                ok2, states2 = self._evaluate_pressure_vectorized(
+                    D[still_active], Sr[still_active], tau[still_active],
+                    p_still + dp, gamma_rr[still_active]
+                )
+                if not np.all(ok2):
+                    failed_indices = np.where(still_active)[0][~ok2]
+                    p[failed_indices] = np.maximum(self.params["p_floor"],
+                                                 p[failed_indices] * 1.5 + 1e-12)
+                    continue
+
+                num = states2[5] - f_still
+                num = np.where(np.isfinite(num), num, np.inf)
+                dp_safe = np.where(np.abs(dp) > 0, dp, 1e-12)
+                df = num / dp_safe
+                df = np.where(np.isfinite(df), df, 0.0)
 
             # Avoid small derivatives
             small_deriv = (np.abs(df) < 1e-15)
@@ -278,7 +289,7 @@ class Cons2PrimSolver:
             invalid_update = ~np.isfinite(p_new) | (p_new <= 0)
             p_new[invalid_update] = np.maximum(self.params["p_floor"], 0.5 * p_still[invalid_update])
 
-            p[still_active] = 0.5 * p_still + 0.5 * p_new  # Damped update
+            p[still_active] = 0.5 * p_still + 0.5 * p_new  # Damped Newton
 
         # Handle non-converged points with bisection fallback
         not_converged = ~converged
@@ -461,8 +472,10 @@ class Cons2PrimSolver:
         return False, None
 
     def _solve_newton_raphson(self, D, Sr, tau, gamma_rr):
-        """Newton-Raphson solver with numerical derivatives."""
+        """Newton-Raphson solver with numerical derivatives (analytic for IdealGas)."""
         p = max(self.params["p_floor"], 0.1 * (tau + D))
+
+        _is_ideal = getattr(self.eos, "name", "").startswith("ideal_gas")
 
         for _ in range(self.params["max_iter"]):
             ok, state = self._evaluate_pressure(D, Sr, tau, p, gamma_rr)
@@ -476,16 +489,24 @@ class Cons2PrimSolver:
             if abs(f) <= self.params["tol"] * max(1.0, abs(p)):
                 return True, (rho0, vr, p, eps, W, h)
 
-            # Numerical derivative
-            dp = max(1e-3 * max(abs(p), 1.0), 1e-12)
-            ok2, state2 = self._evaluate_pressure(D, Sr, tau, p + dp, gamma_rr)
+            if _is_ideal:
+                # === Analytic df/dp for Ideal Gas EOS (2 líneas clave) ===
+                E = tau + D
+                Q = E + p
+                g = max(gamma_rr, 1e-30)
+                Wprime = - (Sr * Sr) * (W ** 3) / max(Q ** 3 * g, 1e-30)
+                c = float(self.eos.gamma) / (float(self.eos.gamma) - 1.0)
+                df = c * (W ** 2) + (D + 2.0 * c * p * W) * Wprime - 1.0
+            else:
+                # Numerical derivative
+                dp = max(1e-3 * max(abs(p), 1.0), 1e-12)
+                ok2, state2 = self._evaluate_pressure(D, Sr, tau, p + dp, gamma_rr)
+                if not ok2:
+                    p = max(self.params["p_floor"], p * 1.5 + 1e-12)
+                    continue
+                df = (state2[5] - f) / dp
 
-            if not ok2:
-                p = max(self.params["p_floor"], p * 1.5 + 1e-12)
-                continue
-
-            df = (state2[5] - f) / dp
-            if abs(df) < 1e-15:
+            if not np.isfinite(df) or abs(df) < 1e-15:
                 p = max(self.params["p_floor"], p * 1.5 + 1e-12)
                 continue
 

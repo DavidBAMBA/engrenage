@@ -44,6 +44,44 @@ import examples.tov_initial_data as tov_id
 import examples.tov_initial_data_interpolated as tov_id_interp
 
 
+def diagnose_t0_residuals(state_2d, grid, background, hydro):
+    """Compute and print t=0 RHS residuals (especially dS_r/dt) to locate imbalance.
+
+    This helps identify discrete hydrostatic imbalance (typically strongest near the surface).
+    """
+    # Build BSSN containers (Cowling)
+    bssn_vars = BSSNVars(grid.N)
+    bssn_vars.set_bssn_vars(state_2d[:NUM_BSSN_VARS, :])
+    bssn_d1 = grid.get_d1_metric_quantities(state_2d)
+
+    # Matter vars
+    hydro.set_matter_vars(state_2d, bssn_vars, grid)
+    rhs_D, rhs_Sr, rhs_tau = hydro.get_matter_rhs(grid.r, bssn_vars, bssn_d1, background)
+
+    interior = slice(NUM_GHOSTS, -NUM_GHOSTS)
+    r_int = grid.r[interior]
+
+    # Report maxima
+    i_max = NUM_GHOSTS + int(np.argmax(np.abs(rhs_Sr[interior])))
+    print("\nInitial RHS diagnostics (t=0):")
+    print(f"  max |dS_r/dt| at r={grid.r[i_max]:.6f} (i={i_max}) -> {rhs_Sr[i_max]:.3e}")
+    print(f"  max |dD/dt|   = {np.max(np.abs(rhs_D[interior])):.3e}")
+    print(f"  max |dτ/dt|   = {np.max(np.abs(rhs_tau[interior])):.3e}")
+
+    # Coarse surface estimate from primitives
+    prim = hydro._get_primitives(bssn_vars, grid.r)
+    mask_interior = prim['rho0'] > 1e-6
+    if np.any(mask_interior):
+        i_surf = np.where(mask_interior)[0][-1]
+        print(f"  estimated stellar surface near r={grid.r[i_surf]:.6f} (i={i_surf})")
+        window = slice(max(NUM_GHOSTS, i_surf-5), min(grid.N-NUM_GHOSTS, i_surf+6))
+        print("  dS_r/dt in 11-pt window around surface:")
+        for ii in range(window.start, window.stop):
+            print(f"    i={ii:5d}, r={grid.r[ ii ]:8.5f}, dS_r/dt={rhs_Sr[ii]: .3e}")
+    else:
+        print("  WARNING: could not locate interior points above threshold.")
+
+
 def plot_first_step(state_t0, state_t1, grid, hydro, tov_solution=None):
     """Plot only t=0 vs t=1×dt to inspect the first update."""
     bssn_0 = BSSNVars(grid.N)
@@ -430,9 +468,13 @@ def evolve_fixed_timestep(state_initial, dt, num_steps, grid, background, hydro,
 
     # Diagnostics at start
     prim_prev, s_prev = primitives_from_state(state_flat)
+    
+    # Store initial state for error calculation
+    prim_initial, s_initial = primitives_from_state(state_initial.flatten())
 
     print("\n===== Evolution diagnostics (per step) =====")
-    print("Columns: step | t | min/max rho0 | min/max P | max|vr| | min D | min(tau+D) | cons2prim fails")
+    print("Columns: step | t | ρ_central | max_Δρ/ρ | max_vʳ | max_D | max_Sʳ | max_τ | c2p_fails")
+    print("-" * 100)
 
     for step in range(num_steps):
         # Advance one RK4 step
@@ -446,6 +488,7 @@ def evolve_fixed_timestep(state_initial, dt, num_steps, grid, background, hydro,
 
         rho_prev = prim_prev['rho0'][interior]
         rho_next = prim_next['rho0'][interior]
+        rho_init = prim_initial['rho0'][interior]
         p_prev = prim_prev['p'][interior]
         p_next = prim_next['p'][interior]
         v_prev = prim_prev['vr'][interior]
@@ -458,20 +501,28 @@ def evolve_fixed_timestep(state_initial, dt, num_steps, grid, background, hydro,
         Sr_next = s_next[NUM_BSSN_VARS + 1, interior]
         tau_next = s_next[NUM_BSSN_VARS + 2, interior]
 
-        # Summary stats
-        min_rho = float(np.min(rho_next))
-        max_rho = float(np.max(rho_next))
-        min_p = float(np.min(p_next))
-        max_p = float(np.max(p_next))
+        # Compute more informative stats
+        rho_central = float(prim_next['rho0'][NUM_GHOSTS])  # Central density
+        
+        # Maximum relative density error vs initial state
+        rel_rho_err = np.abs(rho_next - rho_init) / (np.abs(rho_init) + 1e-20)
+        max_rel_rho_err = float(np.max(rel_rho_err))
+        
+        # Maximum velocity
         max_abs_v = float(np.max(np.abs(v_next)))
-        min_D = float(np.min(D_next))
-        min_tau_plus_D = float(np.min(tau_next + D_next))
+        
+        # Maximum conserved variables (more useful than minimum)
+        max_D = float(np.max(D_next))
+        max_Sr = float(np.max(np.abs(Sr_next)))
+        max_tau = float(np.max(np.abs(tau_next)))
+        
+        # Cons2prim failures
         c2p_fail_count = int(np.sum(~prim_next['success']))
 
         t_curr = (step + 1) * dt
-        print(f"step {step+1:4d}  t={t_curr:.6e}:  rho0[{min_rho:.3e},{max_rho:.3e}]  P[{min_p:.3e},{max_p:.3e}]  "
-              f"max|vr|={max_abs_v:.3e}  min D={min_D:.3e}  min(tau+D)={min_tau_plus_D:.3e}  "
-              f"c2p_fail={c2p_fail_count}")
+        print(f"step {step+1:4d}  t={t_curr:.6e}:  ρ_c={rho_central:.6e}  max_Δρ/ρ={max_rel_rho_err:.3e}  "
+              f"max_vʳ={max_abs_v:.3e}  max_D={max_D:.3e}  max_Sʳ={max_Sr:.3e}  "
+              f"max_τ={max_tau:.3e}  c2p_fail={c2p_fail_count}")
 
         # Detect first signs of instability / non-physical values
         issues = []
@@ -483,9 +534,9 @@ def evolve_fixed_timestep(state_initial, dt, num_steps, grid, background, hydro,
             issues.append("negative pressure")
         if np.any(np.abs(v_next) >= 1.0):
             issues.append("superluminal v")
-        if min_D < 0:
+        if np.any(D_next < 0):
             issues.append("negative D")
-        if min_tau_plus_D < 0:
+        if np.any((tau_next + D_next) < 0):
             issues.append("tau + D < 0")
 
         # If problems detected, print focused context (location and local values)
@@ -526,7 +577,9 @@ def evolve_fixed_timestep(state_initial, dt, num_steps, grid, background, hydro,
             # Stop early so we can inspect before blow-up cascades
             print("  -> Halting evolution early due to detected instability.")
             state_flat = state_flat_next  # return the last state
-            return state_flat.reshape((grid.NUM_VARS, grid.N))
+            actual_steps = step + 1
+            actual_time = actual_steps * dt
+            return state_flat.reshape((grid.NUM_VARS, grid.N)), actual_steps, actual_time
 
         # Prepare next step
         state_flat = state_flat_next
@@ -536,7 +589,8 @@ def evolve_fixed_timestep(state_initial, dt, num_steps, grid, background, hydro,
         if (step + 1) % 20 == 0:
             print(f"  Step {step+1}/{num_steps} OK  (t={t_curr:.6e})")
 
-    return state_flat.reshape((grid.NUM_VARS, grid.N))
+    actual_time = num_steps * dt
+    return state_flat.reshape((grid.NUM_VARS, grid.N)), num_steps, actual_time
 
 
 def evolve_adaptive(state_initial, t_final, grid, background, hydro,
@@ -642,8 +696,9 @@ def plot_tov_diagnostics(tov_solution, r_max):
 ## plot_initial_comparison moved to examples/tov_initial_data.py
 
 
-def plot_evolution(state_t0, state_t1, state_t100, grid, hydro, dt, num_steps):
-    """Plot evolution snapshots: t=0, t=1*dt, t=100*dt."""
+def plot_evolution(state_t0, state_t1, state_t100, state_t10000, grid, hydro, 
+                   t_1, t_100, t_10000):
+    """Plot evolution snapshots with actual times reached."""
     bssn_0 = BSSNVars(grid.N)
     bssn_0.set_bssn_vars(state_t0[:NUM_BSSN_VARS, :])
     hydro.set_matter_vars(state_t0, bssn_0, grid)
@@ -659,25 +714,32 @@ def plot_evolution(state_t0, state_t1, state_t100, grid, hydro, dt, num_steps):
     hydro.set_matter_vars(state_t100, bssn_100, grid)
     prim_100 = hydro._get_primitives(bssn_100, grid.r)
 
-    r_int = grid.r[NUM_GHOSTS:-NUM_GHOSTS]
-    t_final = num_steps * dt
+    bssn_10000 = BSSNVars(grid.N)
+    bssn_10000.set_bssn_vars(state_t10000[:NUM_BSSN_VARS, :])
+    hydro.set_matter_vars(state_t10000, bssn_10000, grid)
+    prim_10000 = hydro._get_primitives(bssn_10000, grid.r)
 
-    fig, axes = plt.subplots(2, 2, figsize=(14, 10))
+    r_int = grid.r[NUM_GHOSTS:-NUM_GHOSTS]
+
+    fig, axes = plt.subplots(3, 2, figsize=(14, 14))
 
     # Density
     axes[0, 0].plot(r_int, prim_0['rho0'][NUM_GHOSTS:-NUM_GHOSTS], 'b-', linewidth=2, label='t=0')
-    axes[0, 0].plot(r_int, prim_1['rho0'][NUM_GHOSTS:-NUM_GHOSTS], 'orange', linestyle='--', linewidth=1.5, label=f't=1×dt')
-    axes[0, 0].plot(r_int, prim_100['rho0'][NUM_GHOSTS:-NUM_GHOSTS], 'red', linestyle=':', linewidth=1.5, label=f't={num_steps}×dt')
+    axes[0, 0].plot(r_int, prim_1['rho0'][NUM_GHOSTS:-NUM_GHOSTS], 'orange', linestyle='--', linewidth=1.5, label=f't={t_1:.4f}')
+    axes[0, 0].plot(r_int, prim_100['rho0'][NUM_GHOSTS:-NUM_GHOSTS], 'green', linestyle='-.', linewidth=1.5, label=f't={t_100:.4f}')
+    axes[0, 0].plot(r_int, prim_10000['rho0'][NUM_GHOSTS:-NUM_GHOSTS], 'red', linestyle=':', linewidth=1.5, label=f't={t_10000:.4f}')
     axes[0, 0].set_xlabel('r')
     axes[0, 0].set_ylabel(r'$\rho_0$')
     axes[0, 0].set_title('Baryon Density Evolution')
     axes[0, 0].legend()
+    axes[0, 0].set_ylim(0.0, 0.002)
     axes[0, 0].grid(True, alpha=0.3)
 
     # Pressure
     axes[0, 1].plot(r_int, np.maximum(prim_0['p'][NUM_GHOSTS:-NUM_GHOSTS], 1e-20), 'b-', linewidth=2, label='t=0')
-    axes[0, 1].plot(r_int, np.maximum(prim_1['p'][NUM_GHOSTS:-NUM_GHOSTS], 1e-20), 'orange', linestyle='--', linewidth=1.5, label=f't=1×dt')
-    axes[0, 1].plot(r_int, np.maximum(prim_100['p'][NUM_GHOSTS:-NUM_GHOSTS], 1e-20), 'red', linestyle=':', linewidth=1.5, label=f't={num_steps}×dt')
+    axes[0, 1].plot(r_int, np.maximum(prim_1['p'][NUM_GHOSTS:-NUM_GHOSTS], 1e-20), 'orange', linestyle='--', linewidth=1.5, label=f't={t_1:.4f}')
+    axes[0, 1].plot(r_int, np.maximum(prim_100['p'][NUM_GHOSTS:-NUM_GHOSTS], 1e-20), 'green', linestyle='-.', linewidth=1.5, label=f't={t_100:.4f}')
+    axes[0, 1].plot(r_int, np.maximum(prim_10000['p'][NUM_GHOSTS:-NUM_GHOSTS], 1e-20), 'red', linestyle=':', linewidth=1.5, label=f't={t_10000:.4f}')
     axes[0, 1].set_xlabel('r')
     axes[0, 1].set_ylabel('P')
     axes[0, 1].set_title('Pressure Evolution')
@@ -686,8 +748,9 @@ def plot_evolution(state_t0, state_t1, state_t100, grid, hydro, dt, num_steps):
 
     # Velocity
     axes[1, 0].plot(r_int, prim_0['vr'][NUM_GHOSTS:-NUM_GHOSTS], 'b-', linewidth=2, label='t=0')
-    axes[1, 0].plot(r_int, prim_1['vr'][NUM_GHOSTS:-NUM_GHOSTS], 'orange', linestyle='--', linewidth=1.5, label=f't=1×dt')
-    axes[1, 0].plot(r_int, prim_100['vr'][NUM_GHOSTS:-NUM_GHOSTS], 'red', linestyle=':', linewidth=1.5, label=f't={num_steps}×dt')
+    axes[1, 0].plot(r_int, prim_1['vr'][NUM_GHOSTS:-NUM_GHOSTS], 'orange', linestyle='--', linewidth=1.5, label=f't={t_1:.4f}')
+    axes[1, 0].plot(r_int, prim_100['vr'][NUM_GHOSTS:-NUM_GHOSTS], 'green', linestyle='-.', linewidth=1.5, label=f't={t_100:.4f}')
+    axes[1, 0].plot(r_int, prim_10000['vr'][NUM_GHOSTS:-NUM_GHOSTS], 'red', linestyle=':', linewidth=1.5, label=f't={t_10000:.4f}')
     axes[1, 0].set_xlabel('r')
     axes[1, 0].set_ylabel(r'$v^r$')
     axes[1, 0].set_title('Radial Velocity Evolution')
@@ -697,16 +760,40 @@ def plot_evolution(state_t0, state_t1, state_t100, grid, hydro, dt, num_steps):
     # Relative density error
     delta_rho_1 = np.abs(prim_1['rho0'][NUM_GHOSTS:-NUM_GHOSTS] - prim_0['rho0'][NUM_GHOSTS:-NUM_GHOSTS]) / (np.abs(prim_0['rho0'][NUM_GHOSTS:-NUM_GHOSTS]) + 1e-20)
     delta_rho_100 = np.abs(prim_100['rho0'][NUM_GHOSTS:-NUM_GHOSTS] - prim_0['rho0'][NUM_GHOSTS:-NUM_GHOSTS]) / (np.abs(prim_0['rho0'][NUM_GHOSTS:-NUM_GHOSTS]) + 1e-20)
+    delta_rho_10000 = np.abs(prim_10000['rho0'][NUM_GHOSTS:-NUM_GHOSTS] - prim_0['rho0'][NUM_GHOSTS:-NUM_GHOSTS]) / (np.abs(prim_0['rho0'][NUM_GHOSTS:-NUM_GHOSTS]) + 1e-20)
 
-    axes[1, 1].semilogy(r_int, delta_rho_1, 'orange', linestyle='--', linewidth=1.5, label=f't=1×dt')
-    axes[1, 1].semilogy(r_int, delta_rho_100, 'red', linestyle=':', linewidth=1.5, label=f't={num_steps}×dt')
+    axes[1, 1].semilogy(r_int, delta_rho_1, 'orange', linestyle='--', linewidth=1.5, label=f't={t_1:.4f}')
+    axes[1, 1].semilogy(r_int, delta_rho_100, 'green', linestyle='-.', linewidth=1.5, label=f't={t_100:.4f}')
+    axes[1, 1].semilogy(r_int, delta_rho_10000, 'red', linestyle=':', linewidth=1.5, label=f't={t_10000:.4f}')
     axes[1, 1].set_xlabel('r')
     axes[1, 1].set_ylabel(r'$|\Delta\rho|/\rho$')
     axes[1, 1].set_title('Relative Density Error')
     axes[1, 1].legend()
     axes[1, 1].grid(True, alpha=0.3)
 
-    plt.suptitle(f'Evolution: t=0 → t={dt:.4f} → t={t_final:.4f}', fontsize=14, y=1.00)
+    # Lapse function (alpha)
+    axes[2, 0].plot(r_int, state_t0[idx_lapse, NUM_GHOSTS:-NUM_GHOSTS], 'b-', linewidth=2, label='t=0')
+    axes[2, 0].plot(r_int, state_t1[idx_lapse, NUM_GHOSTS:-NUM_GHOSTS], 'orange', linestyle='--', linewidth=1.5, label=f't={t_1:.4f}')
+    axes[2, 0].plot(r_int, state_t100[idx_lapse, NUM_GHOSTS:-NUM_GHOSTS], 'green', linestyle='-.', linewidth=1.5, label=f't={t_100:.4f}')
+    axes[2, 0].plot(r_int, state_t10000[idx_lapse, NUM_GHOSTS:-NUM_GHOSTS], 'red', linestyle=':', linewidth=1.5, label=f't={t_10000:.4f}')
+    axes[2, 0].set_xlabel('r')
+    axes[2, 0].set_ylabel(r'$\alpha$')
+    axes[2, 0].set_title('Lapse Function Evolution')
+    axes[2, 0].legend()
+    axes[2, 0].grid(True, alpha=0.3)
+
+    # Conformal factor (phi)
+    axes[2, 1].plot(r_int, state_t0[idx_phi, NUM_GHOSTS:-NUM_GHOSTS], 'b-', linewidth=2, label='t=0')
+    axes[2, 1].plot(r_int, state_t1[idx_phi, NUM_GHOSTS:-NUM_GHOSTS], 'orange', linestyle='--', linewidth=1.5, label=f't={t_1:.4f}')
+    axes[2, 1].plot(r_int, state_t100[idx_phi, NUM_GHOSTS:-NUM_GHOSTS], 'green', linestyle='-.', linewidth=1.5, label=f't={t_100:.4f}')
+    axes[2, 1].plot(r_int, state_t10000[idx_phi, NUM_GHOSTS:-NUM_GHOSTS], 'red', linestyle=':', linewidth=1.5, label=f't={t_10000:.4f}')
+    axes[2, 1].set_xlabel('r')
+    axes[2, 1].set_ylabel(r'$\phi$')
+    axes[2, 1].set_title('Conformal Factor Evolution')
+    axes[2, 1].legend()
+    axes[2, 1].grid(True, alpha=0.3)
+
+    plt.suptitle(f'Evolution: t=0 → t={t_1:.4f} → t={t_100:.4f} → t={t_10000:.4f}', fontsize=14, y=0.995)
     plt.tight_layout()
     plt.savefig('tov_evolution.png', dpi=150, bbox_inches='tight')
     plt.close(fig)
@@ -722,7 +809,7 @@ def main():
     # CONFIGURATION
     # ==================================================================
     r_max = 16.0
-    num_points = 4000
+    num_points = 1000
     K = 100.0
     Gamma = 2.0
     rho_central = 1.28e-3
@@ -763,7 +850,7 @@ def main():
     hydro = PerfectFluid(
         eos=eos,
         spacetime_mode="dynamic",
-        atmosphere=ATMOSPHERE,  # Use centralized atmosphere
+        atmosphere=ATMOSPHERE,  
         reconstructor=create_reconstruction("minmod"),
         riemann_solver=HLLERiemannSolver()
     )
@@ -805,8 +892,12 @@ def main():
         atmosphere=ATMOSPHERE,
         polytrope_K=K, polytrope_Gamma=Gamma,
         use_hydrobase_tau=True,
-        interp_order=11  # NRPy+ default
+        interp_order=11,  
+        exterior_buffer_cells=4
     )
+
+    # Diagnostics: check discrete hydrostatic balance at t=0
+    diagnose_t0_residuals(initial_state_2d, grid, background, hydro)
 
     # Initial-data diagnostics
     tov_id.plot_initial_comparison(tov_solution, initial_state_2d, grid, hydro)
@@ -820,52 +911,82 @@ def main():
     bssn_fixed = initial_state_2d[:NUM_BSSN_VARS, :].copy()
     bssn_d1_fixed = grid.get_d1_metric_quantities(initial_state_2d)
 
-    # Free derivative matrices after computing d1 (saves ~N² memory for Cowling)
-    # For N=10000: saves ~12 GB, keeping only ~6 MB in bssn_d1_fixed
-    del grid.derivs.drn_matrix
-    del grid.derivs.dxn_matrix
-    del grid.derivs.advec_x_matrix
-    import gc
-    gc.collect()
 
     if integration_method == 'fixed':
         dt = 0.15 * grid.min_dr  # CFL condition
-        num_steps = 10000
-        print(f"\nEvolving with fixed dt={dt:.6f} (CFL=0.1) for {num_steps} steps using RK4")
+        num_steps_total = 1000
+        print(f"\nEvolving with fixed dt={dt:.6f} (CFL=0.1) for {num_steps_total} steps using RK4")
 
         # Single step for comparison
         state_t1 = rk4_step(initial_state_2d.flatten(), dt, grid, background, hydro,
                            bssn_fixed, bssn_d1_fixed, ATMOSPHERE).reshape((grid.NUM_VARS, grid.N))
+        t_1 = dt  # Time after 1 step
+        
         # Plot only the first step changes
         plot_first_step(initial_state_2d, state_t1, grid, hydro, tov_solution)
         plot_surface_zoom(tov_solution, initial_state_2d, state_t1, grid, hydro, window=0.1)
 
-        # Multiple steps
-        state_t100 = evolve_fixed_timestep(initial_state_2d, dt, num_steps, grid, background,
-                                          hydro, bssn_fixed, bssn_d1_fixed, ATMOSPHERE, method='rk4')
+        # Define intermediate checkpoint (around 10% of total, or 100 if total is large)
+        if num_steps_total <= 100:
+            checkpoint_mid = max(10, num_steps_total // 10)
+        else:
+            checkpoint_mid = 100
+        
+        # Evolve incrementally to intermediate checkpoint
+        print(f"\nEvolving to step {checkpoint_mid}...")
+        state_t100, steps_100, t_100 = evolve_fixed_timestep(initial_state_2d, dt, checkpoint_mid, grid, background,
+                                                              hydro, bssn_fixed, bssn_d1_fixed, ATMOSPHERE, method='rk4')
+        print(f"  -> Reached step {steps_100}, t={t_100:.6e}")
+        
+        # Continue evolution to num_steps_total (or until it breaks)
+        if num_steps_total > checkpoint_mid and steps_100 == checkpoint_mid:
+            remaining_steps = num_steps_total - checkpoint_mid
+            print(f"\nContinuing evolution from step {checkpoint_mid} to {num_steps_total} ({remaining_steps} more steps)...")
+            state_tfinal, steps_more, t_more = evolve_fixed_timestep(state_t100, dt, remaining_steps, grid, background,
+                                                                      hydro, bssn_fixed, bssn_d1_fixed, ATMOSPHERE, method='rk4')
+            t_final = t_100 + t_more
+            steps_final = steps_100 + steps_more
+            print(f"  -> Reached step {steps_final}, t={t_final:.6e}")
+        else:
+            # Evolution stopped early at checkpoint, or checkpoint == total
+            state_tfinal = state_t100
+            t_final = t_100
+            steps_final = steps_100
+        
+        # For plotting: use intermediate state and final state (wherever it stopped)
+        state_t10000 = state_tfinal
+        t_10000 = t_final
+        num_steps = steps_final
 
     elif integration_method == 'adaptive':
         # NOTE: Adaptive methods are slower but can be more accurate
         # Available methods: 'RK45', 'RK23', 'DOP853', 'Radau', 'BDF', 'LSODA'
-        t_final = 10.00  # Final time
-        print(f"\nEvolving to t={t_final} using solve_ivp (adaptive)")
+        t_100 = 1.00  # Time for intermediate snapshot
+        t_10000 = 10.00  # Final time
+        print(f"\nEvolving to t={t_10000} using solve_ivp (adaptive)")
 
         # For single step comparison, use small fixed dt
         dt = 0.5 * grid.min_dr
+        t_1 = dt
         # Define an effective number of steps for labeling/plots
         # so code paths that expect 'num_steps' still work.
-        num_steps = max(1, int(round(t_final / dt)))
+        num_steps = max(1, int(round(t_10000 / dt)))
         state_t1 = rk4_step(initial_state_2d.flatten(), dt, grid, background, hydro,
                            bssn_fixed, bssn_d1_fixed, ATMOSPHERE).reshape((grid.NUM_VARS, grid.N))
 
-        # Adaptive evolution
-        state_t100 = evolve_adaptive(initial_state_2d, t_final, grid, background, hydro,
+        # Adaptive evolution to t=1.0
+        state_t100 = evolve_adaptive(initial_state_2d, t_100, grid, background, hydro,
                                     bssn_fixed, bssn_d1_fixed, method='RK45', rtol=1e-5, atol=1e-7)
+        
+        # Adaptive evolution to t=10.0
+        state_t10000 = evolve_adaptive(initial_state_2d, t_10000, grid, background, hydro,
+                                      bssn_fixed, bssn_d1_fixed, method='RK45', rtol=1e-5, atol=1e-7)
 
     # ==================================================================
     # DIAGNOSTICS
     # ==================================================================
-    plot_evolution(initial_state_2d, state_t1, state_t100, grid, hydro, dt, num_steps)
+    plot_evolution(initial_state_2d, state_t1, state_t100, state_t10000, grid, hydro, 
+                   t_1, t_100, t_10000)
 
     # Print detailed statistics
     bssn_0 = BSSNVars(grid.N)
@@ -883,11 +1004,13 @@ def main():
     hydro.set_matter_vars(state_t100, bssn_100, grid)
     prim_100 = hydro._get_primitives(bssn_100, grid.r)
 
-    # Calculate actual final time
-    if integration_method == 'fixed':
-        t_final_actual = num_steps * dt
-    else:
-        t_final_actual = t_final
+    bssn_10000 = BSSNVars(grid.N)
+    bssn_10000.set_bssn_vars(state_t10000[:NUM_BSSN_VARS, :])
+    hydro.set_matter_vars(state_t10000, bssn_10000, grid)
+    prim_10000 = hydro._get_primitives(bssn_10000, grid.r)
+
+    # Calculate actual final time (already stored in t_10000)
+    t_final_actual = t_10000
 
     # Interior points only (exclude ghosts)
     interior = slice(NUM_GHOSTS, -NUM_GHOSTS)
@@ -895,52 +1018,62 @@ def main():
     # Compute errors
     delta_rho_1 = np.abs(prim_1['rho0'][interior] - prim_0['rho0'][interior]) / (np.abs(prim_0['rho0'][interior]) + 1e-20)
     delta_rho_100 = np.abs(prim_100['rho0'][interior] - prim_0['rho0'][interior]) / (np.abs(prim_0['rho0'][interior]) + 1e-20)
+    delta_rho_10000 = np.abs(prim_10000['rho0'][interior] - prim_0['rho0'][interior]) / (np.abs(prim_0['rho0'][interior]) + 1e-20)
 
     delta_P_1 = np.abs(prim_1['p'][interior] - prim_0['p'][interior]) / (np.abs(prim_0['p'][interior]) + 1e-20)
     delta_P_100 = np.abs(prim_100['p'][interior] - prim_0['p'][interior]) / (np.abs(prim_0['p'][interior]) + 1e-20)
+    delta_P_10000 = np.abs(prim_10000['p'][interior] - prim_0['p'][interior]) / (np.abs(prim_0['p'][interior]) + 1e-20)
 
     # Error growth factor
     max_err_rho_1 = np.max(delta_rho_1)
     max_err_rho_100 = np.max(delta_rho_100)
-    growth_rho = max_err_rho_100 / max_err_rho_1 if max_err_rho_1 > 1e-15 else 0
+    max_err_rho_10000 = np.max(delta_rho_10000)
+    growth_rho = max_err_rho_10000 / max_err_rho_1 if max_err_rho_1 > 1e-15 else 0
 
     max_err_P_1 = np.max(delta_P_1)
     max_err_P_100 = np.max(delta_P_100)
-    growth_P = max_err_P_100 / max_err_P_1 if max_err_P_1 > 1e-15 else 0
+    max_err_P_10000 = np.max(delta_P_10000)
+    growth_P = max_err_P_10000 / max_err_P_1 if max_err_P_1 > 1e-15 else 0
 
     print(f"\n{'='*70}")
-    print(f"EVOLUTION DIAGNOSTICS (t=0 → t={dt:.4f} → t={t_final_actual:.4f})")
+    print(f"EVOLUTION DIAGNOSTICS (t=0 → t={t_1:.4f} → t={t_100:.4f} → t={t_10000:.4f})")
     print(f"{'='*70}")
 
     print(f"\n1. VELOCITY EVOLUTION:")
-    print(f"   Max |v^r| at t=0:       {np.max(np.abs(prim_0['vr'])):.3e}")
-    print(f"   Max |v^r| at t=1×dt:    {np.max(np.abs(prim_1['vr'])):.3e}")
-    print(f"   Max |v^r| at t={num_steps}×dt:   {np.max(np.abs(prim_100['vr'])):.3e}")
+    print(f"   Max |v^r| at t=0:           {np.max(np.abs(prim_0['vr'])):.3e}")
+    print(f"   Max |v^r| at t={t_1:.4f}:   {np.max(np.abs(prim_1['vr'])):.3e}")
+    print(f"   Max |v^r| at t={t_100:.4f}:   {np.max(np.abs(prim_100['vr'])):.3e}")
+    print(f"   Max |v^r| at t={t_10000:.4f}: {np.max(np.abs(prim_10000['vr'])):.3e}")
 
     print(f"\n2. CENTRAL DENSITY:")
-    print(f"   ρ_c at t=0:       {prim_0['rho0'][NUM_GHOSTS]:.6e}")
-    print(f"   ρ_c at t=1×dt:    {prim_1['rho0'][NUM_GHOSTS]:.6e}")
-    print(f"   ρ_c at t={num_steps}×dt:   {prim_100['rho0'][NUM_GHOSTS]:.6e}")
-    print(f"   Δρ_c/ρ_c (1 step):   {abs(prim_1['rho0'][NUM_GHOSTS] - prim_0['rho0'][NUM_GHOSTS])/prim_0['rho0'][NUM_GHOSTS]:.3e}")
-    print(f"   Δρ_c/ρ_c ({num_steps} steps): {abs(prim_100['rho0'][NUM_GHOSTS] - prim_0['rho0'][NUM_GHOSTS])/prim_0['rho0'][NUM_GHOSTS]:.3e}")
+    print(f"   ρ_c at t=0:           {prim_0['rho0'][NUM_GHOSTS]:.6e}")
+    print(f"   ρ_c at t={t_1:.4f}:   {prim_1['rho0'][NUM_GHOSTS]:.6e}")
+    print(f"   ρ_c at t={t_100:.4f}:   {prim_100['rho0'][NUM_GHOSTS]:.6e}")
+    print(f"   ρ_c at t={t_10000:.4f}: {prim_10000['rho0'][NUM_GHOSTS]:.6e}")
+    print(f"   Δρ_c/ρ_c (t={t_1:.4f}):    {abs(prim_1['rho0'][NUM_GHOSTS] - prim_0['rho0'][NUM_GHOSTS])/prim_0['rho0'][NUM_GHOSTS]:.3e}")
+    print(f"   Δρ_c/ρ_c (t={t_100:.4f}):  {abs(prim_100['rho0'][NUM_GHOSTS] - prim_0['rho0'][NUM_GHOSTS])/prim_0['rho0'][NUM_GHOSTS]:.3e}")
+    print(f"   Δρ_c/ρ_c (t={t_10000:.4f}):{abs(prim_10000['rho0'][NUM_GHOSTS] - prim_0['rho0'][NUM_GHOSTS])/prim_0['rho0'][NUM_GHOSTS]:.3e}")
 
     print(f"\n3. DENSITY ERROR (max over domain):")
-    print(f"   Max |Δρ|/ρ at t=1×dt:    {max_err_rho_1:.3e}")
-    print(f"   Max |Δρ|/ρ at t={num_steps}×dt:   {max_err_rho_100:.3e}")
-    print(f"   Growth factor (100/1):   {growth_rho:.1f}x")
+    print(f"   Max |Δρ|/ρ at t={t_1:.4f}:    {max_err_rho_1:.3e}")
+    print(f"   Max |Δρ|/ρ at t={t_100:.4f}:  {max_err_rho_100:.3e}")
+    print(f"   Max |Δρ|/ρ at t={t_10000:.4f}: {max_err_rho_10000:.3e}")
+    print(f"   Growth factor (final/1):      {growth_rho:.1f}x")
 
     print(f"\n4. PRESSURE ERROR (max over domain):")
-    print(f"   Max |ΔP|/P at t=1×dt:    {max_err_P_1:.3e}")
-    print(f"   Max |ΔP|/P at t={num_steps}×dt:   {max_err_P_100:.3e}")
-    print(f"   Growth factor (100/1):   {growth_P:.1f}x")
+    print(f"   Max |ΔP|/P at t={t_1:.4f}:    {max_err_P_1:.3e}")
+    print(f"   Max |ΔP|/P at t={t_100:.4f}:  {max_err_P_100:.3e}")
+    print(f"   Max |ΔP|/P at t={t_10000:.4f}: {max_err_P_10000:.3e}")
+    print(f"   Growth factor (final/1):      {growth_P:.1f}x")
 
     print(f"\n5. CONS2PRIM STATUS:")
-    print(f"   Success at t=0:      {np.sum(prim_0['success'])}/{grid.N}")
-    print(f"   Success at t=1×dt:   {np.sum(prim_1['success'])}/{grid.N}")
-    print(f"   Success at t={num_steps}×dt:  {np.sum(prim_100['success'])}/{grid.N}")
+    print(f"   Success at t=0:           {np.sum(prim_0['success'])}/{grid.N}")
+    print(f"   Success at t={t_1:.4f}:   {np.sum(prim_1['success'])}/{grid.N}")
+    print(f"   Success at t={t_100:.4f}:   {np.sum(prim_100['success'])}/{grid.N}")
+    print(f"   Success at t={t_10000:.4f}: {np.sum(prim_10000['success'])}/{grid.N}")
 
-    if not np.all(prim_100['success']):
-        failed_idx = np.where(~prim_100['success'])[0]
+    if not np.all(prim_10000['success']):
+        failed_idx = np.where(~prim_10000['success'])[0]
         print(f"   Failed points: {failed_idx[:5]} (first 5)")
         print(f"   Failed radii:  {grid.r[failed_idx[:5]]}")
 
@@ -948,7 +1081,7 @@ def main():
     print("Evolution complete. Plots saved:")
     print("  1. tov_solution.png              - TOV solution (ρ, P, M, α)")
     print("  2. tov_initial_data_comparison.png - TOV vs Initial data at t=0")
-    print("  3. tov_evolution.png             - Evolution: t=0 → t=dt → t=100×dt")
+    print(f"  3. tov_evolution.png             - Evolution: t=0 → t={t_1:.4f} → t={t_100:.4f} → t={t_10000:.4f}")
     print("="*70)
 
 

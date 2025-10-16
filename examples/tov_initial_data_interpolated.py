@@ -150,7 +150,8 @@ def create_initial_data_interpolated(tov_solution, grid, background, eos,
                                       atmosphere=None,
                                       polytrope_K=None, polytrope_Gamma=None,
                                       use_hydrobase_tau=True,
-                                      interp_order=11):
+                                      interp_order=11,
+                                      exterior_buffer_cells=0):
     """
     Create BSSN + hydro initial data using high-order interpolation (NRPy+ strategy).
 
@@ -267,5 +268,44 @@ def create_initial_data_interpolated(tov_solution, grid, background, eos,
     grid.fill_boundaries(state_2d)
 
     print(f"  Initial data created via interpolation")
+
+    # Optional: apply an atmosphere buffer just outside the stellar surface.
+    # This helps reduce discrete hydrostatic imbalance at the sharp surface interface.
+    if exterior_buffer_cells and exterior_buffer_cells > 0:
+        R = float(R_star)
+        r = grid.r
+        # Apply buffer only on +r side (physical radial direction)
+        pos_idx = np.where(r >= 0.0)[0]
+        if pos_idx.size > 0:
+            # Find last interior index on +r side
+            interior_pos = pos_idx[np.where(np.abs(r[pos_idx]) < R)[0]]
+            if interior_pos.size > 0:
+                last_int = int(interior_pos[-1])
+                start = last_int + 1
+                end = min(grid.N, start + int(exterior_buffer_cells))
+                if end > start:
+                    mask = np.zeros(grid.N, dtype=bool)
+                    mask[start:end] = True
+
+                    # Set atmosphere conservative vars consistently
+                    state_2d[NUM_BSSN_VARS + 0, mask] = atmosphere_rho
+                    state_2d[NUM_BSSN_VARS + 1, mask] = 0.0
+                    # Prefer AtmosphereParams tau if available
+                    try:
+                        from source.matter.hydro.atmosphere import AtmosphereParams
+                        if isinstance(atmosphere, AtmosphereParams):
+                            state_2d[NUM_BSSN_VARS + 2, mask] = atmosphere.tau_atm
+                        else:
+                            # Fallback: hydrobase-style tau with polytrope if available
+                            if use_hydrobase_tau and polytrope_Gamma is not None and polytrope_K is not None:
+                                p_buf = max(p_atm, 0.0)
+                                eps_buf = p_buf / max((polytrope_Gamma - 1.0) * atmosphere_rho, 1e-30)
+                                state_2d[NUM_BSSN_VARS + 2, mask] = atmosphere_rho * eps_buf
+                            else:
+                                state_2d[NUM_BSSN_VARS + 2, mask] = p_atm
+                    except Exception:
+                        state_2d[NUM_BSSN_VARS + 2, mask] = p_atm
+
+                    print(f"  Applied atmosphere buffer: {end - start} cells beyond R on +r side")
 
     return state_2d

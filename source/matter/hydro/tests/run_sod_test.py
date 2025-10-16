@@ -7,7 +7,7 @@ import sys
 import os
 
 # Añadir el path del directorio source desde tests
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..', '..'))
+sys.path.insert(0, '/home/yo/repositories/engrenage')
 
 # Importar el test
 from test import test_riemann_sod

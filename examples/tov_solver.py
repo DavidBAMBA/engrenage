@@ -229,7 +229,12 @@ class TOVSolver:
             else:
                 r_iso_normalized = r_iso_arr * normalize
 
-            exp4phi = (r_schw_arr / r_iso_normalized) ** 2
+            # Compute exp(4φ) = ψ⁴ = γ_rr in isotropic coordinates
+            # The correct formula is: γ_rr = (r_Schw/r_iso)² / (1 - 2M/r_Schw)
+            # At r→0: M~r³, so (1-2M/r)→1, and r_iso~r_Schw, giving γ_rr→1
+            exp4phi = np.ones_like(r_schw_arr)
+            mask = r_iso_normalized > 1e-15
+            exp4phi[mask] = (r_schw_arr[mask] / r_iso_normalized[mask]) ** 2 / np.maximum(1.0 - 2.0*M_arr[mask]/r_schw_arr[mask], 1e-10)
 
             nu_surface = nu_arr[surface_idx[0]] if len(surface_idx) > 0 else nu_arr[-1]
             expnu = np.exp(

@@ -41,7 +41,10 @@ class ValenciaReferenceMetric:
     """Valencia formulation - full 3D tensor algebra following BSSN pattern."""
 
     def __init__(self, boundary_mode="parity", *, atmosphere=None,
-                 atmosphere_rho=None, p_floor=None, v_max=None):
+                 atmosphere_rho=None, p_floor=None, v_max=None,
+                 enable_surface_flattening=True,
+                 rho_surface_threshold=1.0e-6,
+                 surface_jump_max=50.0):
         """
         Initialize Valencia formulation.
 
@@ -76,10 +79,21 @@ class ValenciaReferenceMetric:
 
         self.atmosphere = atmosphere
 
+        # Controls for added robustness at the stellar surface
+        self.enable_surface_flattening = bool(enable_surface_flattening)
+        self.rho_surface_threshold = float(rho_surface_threshold)
+        self.surface_jump_max = float(surface_jump_max)
+
     def _extract_geometry(self, r, bssn_vars, spacetime_mode, background):
         """
         Extract geometric quantities from BSSN variables.
-
+        
+        IMPORTANT RESCALING NOTES:
+        - bssn_vars.shift_U is the RESCALED shift (needs inverse_scaling_vector)
+        - bssn_vars.h_LL is the RESCALED deviation (already includes scaling_matrix)
+        - bar_gamma_LL = h_LL * scaling_matrix + hat_gamma_LL (includes scale factors)
+        - Physical shift: beta^i = inverse_scaling_vector^i * shift_U^i
+        
         Returns dictionary with all geometric quantities needed for RHS computation.
         """
         N = len(r)
@@ -110,11 +124,15 @@ class ValenciaReferenceMetric:
 
             # Shift β^i (all three components)
             g['beta_U'] = np.zeros((N, SPACEDIM))
+            
             if hasattr(bssn_vars, 'shift_U') and bssn_vars.shift_U is not None:
                 shift_array = np.asarray(bssn_vars.shift_U)
                 if shift_array.ndim >= 2:
                     for i in range(min(SPACEDIM, shift_array.shape[1])):
                         g['beta_U'][:, i] = shift_array[:, i].astype(float)
+
+            g['beta_U'] = g['beta_U'] * background.inverse_scaling_vector
+
 
             # Conformal factor e^{φ}
             phi_arr = np.asarray(bssn_vars.phi, dtype=float)
@@ -128,9 +146,10 @@ class ValenciaReferenceMetric:
             # Inverse physical metric γ^{ij}
             g['gamma_UU'] = np.linalg.inv(g['gamma_LL'])
 
-            # √γ = e^{6φ} √(det γ̄) (NRPy+ uses e6phi, line 223, 244, 257)
-            det_bar_gamma = get_det_bar_gamma(r, bssn_vars.h_LL, background)
-            g['sqrt_gamma'] = e6phi * np.sqrt(np.abs(det_bar_gamma) + 1e-30)
+            # √γ = e^{6φ} γ̄ = γ̂
+            # The factor √(det γ̂) is handled implicitly via Γ̂^i_{jk}
+            g['sqrt_gamma'] = e6phi
+            g['e6phi'] = e6phi  # Store for later use
 
             # √ĝ for reference metric
             g['sqrt_g_hat_cell'] = np.sqrt(np.abs(background.det_hat_gamma) + 1e-30)
@@ -333,13 +352,12 @@ class ValenciaReferenceMetric:
         beta_U = g['beta_U']  # (N, SPACEDIM) - all three components
         
         # Compute e^{6φ} and √(det γ̄) separately for clarity
+        # Use only e^{6φ} as volume element (GRoovy Eq. 20)
+        # The √(det γ̂) factor is implicitly handled via Γ̂^i_{jk}
         phi = np.asarray(bssn_vars.phi, dtype=float)
         e6phi = np.exp(6.0 * phi)
-        det_bar_gamma = get_det_bar_gamma(r, bssn_vars.h_LL, background)
-        sqrt_det_bar_gamma = np.sqrt(np.abs(det_bar_gamma) + 1e-30)
-        
-        # This is the full volume element (NRPy+ uses e6phi assuming det γ̄ = 1)
-        vol_element = e6phi * sqrt_det_bar_gamma  # = sqrt_gamma in our notation
+        vol_element = e6phi
+
         
         # Build full 3D metric γ_ij = e^{4φ} γ̄_ij
         e4phi = np.exp(4.0 * phi)
@@ -393,7 +411,14 @@ class ValenciaReferenceMetric:
         if hasattr(bssn_d1, 'shift_U') and bssn_d1.shift_U is not None:
             shift_d1 = np.asarray(bssn_d1.shift_U)
             if shift_d1.ndim >= 3:
-                dbeta_dx = shift_d1.copy()
+                # Las derivadas del shift también necesitan reescalamiento
+                # d(β^i)/dx^j = d(s^i * shift^i)/dx^j = s^i * d(shift^i)/dx^j + shift^i * d(s^i)/dx^j
+                for i in range(SPACEDIM):
+                    for j in range(SPACEDIM):
+                        dbeta_dx[:, i, j] = (
+                            background.inverse_scaling_vector[:, i] * shift_d1[:, i, j]
+                            + bssn_vars.shift_U[:, i] * background.d1_inverse_scaling_vector[:, i, j]
+                        )
 
         # Reference metric Christoffel symbols Γ̂^i_{jk}
         hat_chris = background.hat_christoffel
@@ -409,22 +434,16 @@ class ValenciaReferenceMetric:
 
         hat_D_bar_gamma = get_hat_D_bar_gamma_LL(r, bssn_vars.h_LL, bssn_d1.h_LL, background)
 
-        # ∇̂_i γ_{jk} = e^{4φ} [4 γ̄_{jk} ∂_i φ + ∂_i γ̄_{jk} - Γ̂^l_{ij} γ̄_{lk} - Γ̂^l_{ik} γ̄_{jl}]
+        # ∇̂_i γ_{jk} = e^{4φ} [4 γ̄_{jk} ∂_i φ + ∇̂_i γ̄_{jk}]
         hatD_gamma_LL = np.zeros((N, SPACEDIM, SPACEDIM, SPACEDIM))
         for i in range(SPACEDIM):
             for j in range(SPACEDIM):
                 for k in range(SPACEDIM):
-                    # Start with partial derivatives and phi term (NRPy+ line 410-411)
+                    # Phi term + covariant derivative of \bar{\gamma}_{jk}
                     hatD_gamma_LL[:, i, j, k] = (
                         4.0 * bar_gamma_LL[:, j, k] * dphi_dx[:, i]
                         + hat_D_bar_gamma[:, j, k, i]
                     )
-                    # Subtract Christoffel correction terms (NRPy+ line 412-415)
-                    for l in range(SPACEDIM):
-                        hatD_gamma_LL[:, i, j, k] -= (
-                            hat_chris[:, l, i, j] * bar_gamma_LL[:, l, k]
-                            + hat_chris[:, l, i, k] * bar_gamma_LL[:, j, l]
-                        )
                     # Multiply by e^{4φ} to get physical metric derivative
                     hatD_gamma_LL[:, i, j, k] *= e4phi
 
@@ -452,6 +471,27 @@ class ValenciaReferenceMetric:
             first_term + second_term + third_term
         )
         
+        # --- Debug: print once contributions at first interior cell (r ~ 0) ---
+        if not getattr(self, '_debug_source_once', False):
+            try:
+                i0 = NUM_GHOSTS
+                print("\n[Valencia debug] Source-term internals (first interior cell):")
+                print(f"  r[i0]={r[i0]:.6e}, alpha={alpha[i0]:.6e}, e6phi={vol_element[i0]:.6e} (≈√γ)")
+                # Angular velocities should be zero by spherical symmetry
+                print(f"  v_theta={v_U[i0,1]:.6e}, v_phi={v_U[i0,2]:.6e}")
+                # T^{θθ}, T^{φφ}
+                print(f"  T4UU[θθ]={T4UU['ij'][i0,1,1]:.6e}, T4UU[φφ]={T4UU['ij'][i0,2,2]:.6e}")
+                # ∇̂_r γ_{θθ}, ∇̂_r γ_{φφ}
+                print(f"  hatD_gamma_LL[r,θ,θ]={hatD_gamma_LL[i0, i_r, i_t, i_t]:.6e}, hatD_gamma_LL[r,φ,φ]={hatD_gamma_LL[i0, i_r, i_p, i_p]:.6e}")
+                # ∂_r α
+                print(f"  dalpha_dr={dalpha_dx[i0, i_r]:.6e}")
+                # Momentum source terms components
+                print(f"  first_term[r]={first_term[i0]:.6e}, second_term[r]={second_term[i0]:.6e}, third_term[r]={third_term[i0]:.6e}")
+                print(f"  src_S_vector[r]={src_S_vector[i0,0]:.6e}")
+            except Exception:
+                pass
+            self._debug_source_once = True
+
         # Return full 3D momentum source vector and energy source
         return src_S_vector, src_tau  # (N, 3), (N,)
 
@@ -542,9 +582,9 @@ class ValenciaReferenceMetric:
         tau = tau.copy()
         D, S_tildeD, tau = self._apply_ghost_cell_boundaries(D, S_tildeD, tau, r)
 
-        # Compute NRPy-style partial fluxes at interfaces: α_face √γ_face F_phys
+        # Compute NRPy-style partial fluxes at interfaces using α e^{6φ} at faces
         flux_hat = self._compute_interface_fluxes(
-            rho0, v_U, pressure, g, r, eos, reconstructor, riemann_solver
+            rho0, v_U, pressure, g, r, eos, reconstructor, riemann_solver, bssn_vars
         )
 
         # Reference metric Christoffel symbols Γ̂^i_{jk}
@@ -554,6 +594,7 @@ class ValenciaReferenceMetric:
         F_D_face = flux_hat['D']
         F_S_tildeD_face = flux_hat['S_tildeD']  # Now (N_faces, 3) for all three components
         F_tau_face = flux_hat['tau']
+        debug_faces = flux_hat.get('debug', {})
 
         # ====================================================================
         # FLUX DIVERGENCE (NRPy form): -∂_r(F̃^r)
@@ -561,7 +602,7 @@ class ValenciaReferenceMetric:
         # ====================================================================
 
         rhs_D = np.zeros(N)
-        rhs_S_tildeD = np.zeros((N, SPACEDIM))  # Full 3D momentum RHS
+        rhs_S_tildeD = np.zeros((N, SPACEDIM))  
         rhs_tau = np.zeros(N)
 
         # Compute divergence in interior cells
@@ -581,40 +622,79 @@ class ValenciaReferenceMetric:
         #   D, τ:      -Γ̂^k_{kr} F̃^r
         #   S_i:       -Γ̂^k_{kr} F̃^r_i + Γ̂^l_{ri} F̃^r_l
         # ====================================================================
-        
-        # Build sqrt_gamma consistently: use hat determinant in Minkowski, bar determinant otherwise.
+
+        # Use e^{6φ} (not √γ) for densitization at centers, matching NRPy.
         alpha = g['alpha']
-        if spacetime_mode == "fixed_minkowski":
-            sqrt_gamma = g['sqrt_gamma']
-        else:
-            phi = np.asarray(bssn_vars.phi, dtype=float)
-            e6phi = np.exp(6.0 * phi)
-            det_bar_gamma = get_det_bar_gamma(r, bssn_vars.h_LL, background)
-            sqrt_det_bar_gamma = np.sqrt(np.abs(det_bar_gamma) + 1e-30)
-            sqrt_gamma = e6phi * sqrt_det_bar_gamma
+        phi_c = np.asarray(bssn_vars.phi, dtype=float)
+        e6phi_c = np.exp(6.0 * phi_c)
+
 
         # Compute 4-velocity and stress-energy
         u4U = self._compute_4velocity(rho0, v_U, W, g)
         T4UU = self._compute_T4UU(rho0, v_U, pressure, W, h, g)
 
         # Conservative density
-        rho_star = alpha * sqrt_gamma * rho0 * u4U[:, 0]
+        rho_star = alpha * e6phi_c * rho0 * u4U[:, 0]
 
         # Physical fluxes at cell centers
         fD_U = np.zeros((N, SPACEDIM))
         for j in range(SPACEDIM):
             fD_U[:, j] = rho_star * v_U[:, j]
 
+        # Energy (tau) partial flux vector, densitized:
+        #   F̃^j_tau = α e^{6φ} ( α T^{0j} ) - ρ_* v^j
         fTau_U = np.zeros((N, SPACEDIM))
         for j in range(SPACEDIM):
-            fTau_U[:, j] = alpha ** 2 * sqrt_gamma * T4UU['0i'][:, j] - rho_star * v_U[:, j]
+            fTau_U[:, j] = alpha ** 2 * e6phi_c * T4UU['0i'][:, j] - rho_star * v_U[:, j]
 
-        # Momentum partial flux tensor F̃^j_i = α √γ T^j_i
+        # Momentum partial flux tensor F̃^j_i = α e^{6φ} T^j_i
         T4UD = self._compute_T4UD(T4UU, g)
         F_S_no_ghat = np.zeros((N, SPACEDIM, SPACEDIM))
         for j in range(SPACEDIM):
             for i in range(SPACEDIM):
-                F_S_no_ghat[:, j, i] = alpha * sqrt_gamma * T4UD['i_j'][:, j, i]
+                F_S_no_ghat[:, j, i] = alpha * e6phi_c * T4UD['i_j'][:, j, i]
+
+        # Debug print once: inspect first-interior-cell flux balance near origin
+        if not getattr(self, '_debug_printed_once', False):
+            try:
+                i0 = NUM_GHOSTS
+                kL = i0 - 1
+                kR = i0
+                print("\n[Valencia debug] First interior cell diagnostics:")
+                print(f"  i0={i0}, r={r[i0]:.6e}")
+                # Face fluxes (densitized) entering divergence
+                print(f"  Faces kL={kL}, kR={kR} (len faces={len(F_D_face)})")
+                print(f"    F_D_face[kL:kR]    = {[F_D_face[kL], F_D_face[kR]] if kR < len(F_D_face) else 'n/a'}")
+                print(f"    F_tau_face[kL:kR]  = {[F_tau_face[kL], F_tau_face[kR]] if kR < len(F_tau_face) else 'n/a'}")
+                print(f"    F_S_face_r[kL:kR]  = {[F_S_tildeD_face[kL,0], F_S_tildeD_face[kR,0]] if kR < len(F_S_tildeD_face) else 'n/a'}")
+                # Center flux pieces
+                print(f"  Center densitization: alpha={alpha[i0]:.6e}, e6phi={e6phi_c[i0]:.6e}")
+                print(f"    fD_U[i0,0]   = {fD_U[i0,0]:.6e}")
+                print(f"    fTau_U[i0,0] = {fTau_U[i0,0]:.6e}")
+                print(f"    F_S_c_r[i0]  = {F_S_no_ghat[i0,0,0]:.6e}")
+                # Connection pieces
+                Gamma_trace = np.einsum('xkkj->xj', hat_chris)
+                print(f"  Gamma_trace_r[i0] = {Gamma_trace[i0,0]:.6e}")
+                # Face densitization params if available
+                if debug_faces:
+                    af = debug_faces.get('alpha_f', None)
+                    e6f = debug_faces.get('e6phi_f', None)
+                    rhoL = debug_faces.get('rhoL', None)
+                    rhoR = debug_faces.get('rhoR', None)
+                    vL = debug_faces.get('vL', None)
+                    vR = debug_faces.get('vR', None)
+                    pL = debug_faces.get('pL', None)
+                    pR = debug_faces.get('pR', None)
+                    if af is not None and e6f is not None and kR < len(af):
+                        print(f"  Face params: alpha_f[kL:kR]={[af[kL], af[kR]] if kR < len(af) else 'n/a'}, e6phi_f[kL:kR]={[e6f[kL], e6f[kR]] if kR < len(e6f) else 'n/a'}")
+                    if rhoL is not None and vL is not None and pL is not None:
+                        print(f"  Reconstructed at kL: rhoL={rhoL[kL]:.6e}, vL={vL[kL]:.6e}, pL={pL[kL]:.6e}")
+                    if rhoR is not None and vR is not None and pR is not None:
+                        print(f"  Reconstructed at kL: rhoR={rhoR[kL]:.6e}, vR={vR[kL]:.6e}, pR={pR[kL]:.6e}")
+                self._debug_printed_once = True
+            except Exception as _e:
+                # Don't let debugging break evolution
+                self._debug_printed_once = True
 
         # Connection contributions
         Gamma_trace = np.einsum('xkkj->xj', hat_chris)
@@ -641,6 +721,27 @@ class ValenciaReferenceMetric:
         rhs_S_tildeD += src_S_tildeD  # Vector addition - all three components
         rhs_tau += src_tau
 
+        # Second debug block: full balance in first interior cell
+        if not getattr(self, '_debug_balance_printed', False):
+            try:
+                i0 = NUM_GHOSTS
+                kL = i0 - 1
+                kR = i0
+                inv_vol = 1.0 / (dr + 1e-30)
+                divS_i0 = -(F_S_tildeD_face[kR, 0] - F_S_tildeD_face[kL, 0]) * inv_vol
+                # Connection term at center for i=radial
+                Gamma_trace = np.einsum('xkkj->xj', hat_chris)
+                term1 = -np.einsum('j,ji->', Gamma_trace[i0, :], F_S_no_ghat[i0, :, :][:, 0])
+                term2 = np.einsum('lji,jl->', hat_chris[i0, :, :, 0], F_S_no_ghat[i0, :, :])
+                connS_i0 = term1 + term2
+                srcS_i0 = src_S_tildeD[i0, 0]
+                print("[Valencia debug] Balance at first interior cell:")
+                print(f"  divS = {divS_i0:.6e}, connS = {connS_i0:.6e}, srcS = {srcS_i0:.6e}")
+                print(f"  rhs_S(i0) = {rhs_S_tildeD[i0,0]:.6e}")
+                self._debug_balance_printed = True
+            except Exception:
+                self._debug_balance_printed = True
+
         # Preserve backward-compatible shape: if input momentum was 1D, return RHS radial as (N,)
         if _return_radial_only:
             rhs_S_out = rhs_S_tildeD[:, 0]
@@ -650,7 +751,7 @@ class ValenciaReferenceMetric:
         return rhs_D, rhs_S_out, rhs_tau  # (N,), (N,) or (N,3), (N,)
 
     def _compute_interface_fluxes(self, rho0, v_U, pressure, g, r,
-                                eos, reconstructor, riemann_solver):
+                                eos, reconstructor, riemann_solver, bssn_vars):
         """
         Compute NRPy-style partial fluxes at cell interfaces: F̃_face = α_face √γ_face F_phys.
 
@@ -696,6 +797,10 @@ class ValenciaReferenceMetric:
         alpha_f = 0.5 * (g['alpha'][:-1] + g['alpha'][1:])
         sqrt_gamma_f = 0.5 * (g['sqrt_gamma'][:-1] + g['sqrt_gamma'][1:])
         sqrt_g_hat_f = g['sqrt_g_hat_face']
+        # Exact e^{6phi} at faces from BSSN phi (NRPy-compatible densitization)
+        phi_arr = np.asarray(bssn_vars.phi, dtype=float)
+        phi_face = 0.5 * (phi_arr[:-1] + phi_arr[1:])
+        e6phi_f = np.exp(6.0 * phi_face)
         
         # Interpolate shift and metric to faces
         beta_U_f = 0.5 * (g['beta_U'][:-1] + g['beta_U'][1:])  # (N-1, 3)
@@ -705,10 +810,10 @@ class ValenciaReferenceMetric:
         beta_primary_f = beta_U_f[:, 0]  # β^r or β^ρ or β^x
         gamma_primary_primary_f = gamma_LL_f[:, 0, 0]  # γ_rr or γ_ρρ or γ_xx
         
-        # Enforce reflecting condition at first physical interior face (r≈0)
-        # Only applies to spherical-like coordinates with reflecting boundary
-        if recon_boundary == "reflecting" and (len(vL) > NUM_GHOSTS):
-            k0 = NUM_GHOSTS  # interface between cells NUM_GHOSTS and NUM_GHOSTS+1
+        # Enforce reflecting condition at the first face that enters
+        # the divergence of the first interior cell (just inside r≈0)
+        if recon_boundary == "reflecting" and (len(vL) > 0):
+            k0 = max(0, NUM_GHOSTS - 1)
             if k0 < len(vL):
                 vL[k0] = 0.0
                 vR[k0] = 0.0
@@ -733,6 +838,22 @@ class ValenciaReferenceMetric:
                 pR[mask] = p_avg[mask]
                 vL[mask] = 0.0
                 vR[mask] = 0.0
+
+        # Surface-aware flattening: handle strong jump at stellar surface
+        if self.enable_surface_flattening and len(rhoL) > 0:
+            surface_thr = max(self.rho_surface_threshold, 1000.0 * self.atmosphere.rho_floor)
+            denom = np.maximum(np.minimum(rhoL, rhoR), 1e-30)
+            jump_ratio = np.maximum(rhoL, rhoR) / denom
+            mask_surf = (rhoL < surface_thr) | (rhoR < surface_thr) | (jump_ratio > self.surface_jump_max)
+            if np.any(mask_surf):
+                rho_avg = 0.5 * (rhoL + rhoR)
+                p_avg = np.maximum(0.5 * (pL + pR), self.atmosphere.p_floor)
+                rhoL[mask_surf] = np.maximum(rho_avg[mask_surf], self.atmosphere.rho_floor)
+                rhoR[mask_surf] = np.maximum(rho_avg[mask_surf], self.atmosphere.rho_floor)
+                pL[mask_surf] = p_avg[mask_surf]
+                pR[mask_surf] = p_avg[mask_surf]
+                vL[mask_surf] = 0.0
+                vR[mask_surf] = 0.0
         
         # Apply physical limiters if available
         if hasattr(reconstructor, "apply_physical_limiters"):
@@ -765,7 +886,9 @@ class ValenciaReferenceMetric:
             gamma_primary_primary_f, alpha_f, beta_primary_f, eos
         )
         
-        dens_factor = alpha_f * sqrt_gamma_f
+        # Densitization strictly α e^{6φ} at faces
+        dens_factor = alpha_f * e6phi_f
+
         F_batch = dens_factor[:, None] * F_phys_batch
         
         # Construct 3D momentum flux array
@@ -782,7 +905,14 @@ class ValenciaReferenceMetric:
         return {
             'D': F_batch[:, 0],           # Density flux
             'S_tildeD': F_S_tildeD_face,  # (N_faces, 3) momentum flux vector
-            'tau': F_batch[:, 2]          # Energy flux
+            'tau': F_batch[:, 2],         # Energy flux
+            'debug': {
+                'alpha_f': alpha_f,
+                'e6phi_f': e6phi_f,
+                'rhoL': rhoL, 'rhoR': rhoR,
+                'vL': vL, 'vR': vR,
+                'pL': pL, 'pR': pR,
+            }
         }
 
     def _get_mesh_spacing(self, grid, r):
