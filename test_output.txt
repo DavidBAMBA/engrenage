@@ -1,0 +1,181 @@
+================================================================================
+DETAILED TERM-BY-TERM COMPARISON: Valencia vs NRPy
+================================================================================
+
+================================================================================
+COMPUTING WITH VALENCIA
+================================================================================
+✓ Valencia computation complete
+
+================================================================================
+COMPUTING WITH GRHD_equations_numpy (NRPy)
+================================================================================
+✓ GRHD_equations_numpy computation complete
+
+================================================================================
+PART 1: FLUX DEFINITIONS
+================================================================================
+
+1.1 DENSITY FLUX: F^j_ρ = ρ* v^j
+--------------------------------------------------------------------------------
+Formula (NRPy line 272-275): F^j_ρ = ρ* v^j
+  Component 0: max diff = 0.000e+00  ✓
+  Component 1: max diff = 0.000e+00  ✓
+  Component 2: max diff = 0.000e+00  ✓
+  Overall:      max diff = 0.000e+00  ✓ MATCH
+
+1.2 ENERGY FLUX: F^j_τ = α² e^{6φ} T^{0j} - ρ* v^j
+--------------------------------------------------------------------------------
+Formula (NRPy line 292-295): F^j_τ = α² e^{6φ} T^{0j} - ρ* v^j
+  Component 0: max diff = 0.000e+00  ✓
+  Component 1: max diff = 0.000e+00  ✓
+  Component 2: max diff = 0.000e+00  ✓
+  Overall:      max diff = 0.000e+00  ✓ MATCH
+
+1.3 MOMENTUM FLUX: F^j_i = α e^{6φ} T^j_i
+--------------------------------------------------------------------------------
+Formula (NRPy line 306-309): F^j_i = α e^{6φ} T^j_i
+  Component (0,0): max diff = 0.000e+00  ✓
+  Component (1,0): max diff = 0.000e+00  ✓
+  Component (2,0): max diff = 0.000e+00  ✓
+  Component (0,1): max diff = 0.000e+00  ✓
+  Component (1,1): max diff = 0.000e+00  ✓
+  Component (2,1): max diff = 0.000e+00  ✓
+  Component (0,2): max diff = 0.000e+00  ✓
+  Component (1,2): max diff = 0.000e+00  ✓
+  Component (2,2): max diff = 0.000e+00  ✓
+  Overall:         max diff = 0.000e+00  ✓ MATCH
+
+================================================================================
+PART 2: CONNECTION TERMS
+================================================================================
+
+2.1 DENSITY CONNECTION: Γ̂^i_{ij} F^j_ρ
+--------------------------------------------------------------------------------
+Formula (NRPy line 340-345): Σ_{i,j} Γ̂^i_{ij} F^j_ρ
+Valencia: -Σ_j Γ̂^k_{kj} F^j_ρ (equivalent with sign)
+  Max difference: 0.000e+00  ✓ MATCH
+
+2.2 ENERGY CONNECTION: Γ̂^i_{ij} F^j_τ
+--------------------------------------------------------------------------------
+Formula (NRPy line 346-351): Σ_{i,j} Γ̂^i_{ij} F^j_τ
+Valencia: -Σ_j Γ̂^k_{kj} F^j_τ (equivalent with sign)
+  Max difference: 0.000e+00  ✓ MATCH
+
+2.3 MOMENTUM CONNECTION: Γ̂^j_{jl} F^l_i - Γ̂^l_{ji} F^j_l
+--------------------------------------------------------------------------------
+Formula (NRPy line 358-363):
+  Σ_{j,l} [Γ̂^j_{jl} F^l_i - Γ̂^l_{ji} F^j_l]
+Valencia:
+  -Σ_l [Γ̂^k_{kl} F^l_i] + Σ_{l,j} [Γ̂^l_{ji} F^j_l]
+  Component 0: max diff = 2.842e-14  ✓
+  Component 1: max diff = 0.000e+00  ✓
+  Component 2: max diff = 0.000e+00  ✓
+  Overall:      max diff = 2.842e-14  ✓ MATCH
+
+================================================================================
+PART 3: SOURCE TERMS
+================================================================================
+
+[Valencia debug] Source-term internals (first interior cell):
+  r[i0]=4.000000e-01, alpha=9.921061e-01, e6phi=1.023640e+00 (≈√γ)
+  v_theta=0.000000e+00, v_phi=0.000000e+00
+  T4UU[θθ]=8.035108e-01, T4UU[φφ]=8.035108e-01
+  hatD_gamma_LL[r,θ,θ]=4.356078e-03, hatD_gamma_LL[r,φ,φ]=4.786153e-03
+  dalpha_dr=3.197170e-03
+
+3.1 ENERGY SOURCE TERM
+--------------------------------------------------------------------------------
+Formula (NRPy line 318-329):
+  S_τ = α e^{6φ} [K_ij (T^{00} β^i β^j + 2 T^{0i} β^j + T^{ij})
+                    - (T^{00} β^i + T^{0i}) ∂_i α]
+
+  Term 1: K_ij contraction
+    Max difference: 0.000e+00  ✓
+
+  Term 2: Lapse derivative
+    Max difference: 0.000e+00  ✓
+
+  Total (with α e^{6φ} factor):
+    Max difference: 1.110e-16  ✓ MATCH
+
+3.2 MOMENTUM SOURCE TERM
+--------------------------------------------------------------------------------
+Formula (NRPy line 392-409):
+  S_{S_i} = α e^{6φ} [-T^{00} α ∂_i α
+                         + T^0_j (∂_i β^j + Γ̂^j_{ik} β^k)
+                         + (1/2) (T^{00} β^j β^k + 2 T^{0j} β^k + T^{jk}) ∇̂_i γ_{jk}]
+
+  Decomposition into three terms:
+
+  Term 1: -T^{00} α ∂_i α
+    Max difference: 0.000e+00  ✓
+      Component 0: 0.000e+00
+      Component 1: 0.000e+00
+      Component 2: 0.000e+00
+
+  Term 2: T^0_j (∂_i β^j + Γ̂^j_{ik} β^k)
+    Max difference: 4.825e+00  ✗
+      Component 0: 0.000e+00
+      Component 1: 4.825e+00
+      Component 2: 1.365e+00
+
+  Term 3: (1/2) (T^{00} β^j β^k + 2 T^{0j} β^k + T^{jk}) ∇̂_i γ_{jk}
+    Max difference: 0.000e+00  ✓
+      Component 0: 0.000e+00
+      Component 1: 0.000e+00
+      Component 2: 0.000e+00
+
+  Total momentum source (with α e^{6φ} factor):
+    Valencia vs GRHD module: 4.852e+00  ✗
+      Component 0: 1.242e-02
+      Component 1: 4.852e+00
+      Component 2: 1.379e+00
+
+  [Debug] Checking shift vector consistency:
+    Valencia.beta_U vs computed beta_U: 0.000e+00
+
+  [Debug] Comparing individual terms (before alpha*e6phi factor):
+    Term 1 (Valencia vs manual): 0.000e+00
+    Term 2 (Valencia vs manual): 0.000e+00
+    Term 3 (Valencia vs manual): 1.412e-02
+
+  [Debug] Checking covariant derivative of shift:
+    Valencia hatD_beta_U vs recomputed: 0.000e+00
+    T4UD['0_j'] Valencia vs computed: 0.000e+00
+    Second term using Valencia hatD_beta_U: 0.000e+00
+
+  [Debug] Values at first interior cell (i=3):
+    betaU_dD_nrpy[i0,0,0] = 1.564066e-03
+    betaU_dD_nrpy[i0,1,0] = 8.862644e-03
+    hatD_beta_U_val[i0,0,0] = 1.564066e-03
+    hatD_beta_U_val[i0,0,1] = 5.306550e-03
+    second_term_val[i0,0] = -1.037826e-01
+    second_term_nrpy[i0,0] = -1.037826e-01
+
+    Manual vs GRHD module: 4.851e+00  ✗
+      Component 0: 0.000e+00
+      Component 1: 4.851e+00
+      Component 2: 1.378e+00
+
+================================================================================
+DETAILED COMPARISON SUMMARY
+================================================================================
+Density flux F^j_ρ            : max diff = 0.000e+00  ✓ PASS
+Energy flux F^j_τ             : max diff = 0.000e+00  ✓ PASS
+Momentum flux F^j_i           : max diff = 0.000e+00  ✓ PASS
+Density connection            : max diff = 0.000e+00  ✓ PASS
+Energy connection             : max diff = 0.000e+00  ✓ PASS
+Momentum connection           : max diff = 2.842e-14  ✓ PASS
+Energy source (K_ij term)     : max diff = 0.000e+00  ✓ PASS
+Energy source (∂α term)       : max diff = 0.000e+00  ✓ PASS
+Energy source (total)         : max diff = 1.110e-16  ✓ PASS
+Momentum source (term 1: -T00 α ∂α): max diff = 0.000e+00  ✓ PASS
+Momentum source (term 2: T0j ∂β): max diff = 4.825e+00  ✗ FAIL
+Momentum source (term 3: metric deriv): max diff = 0.000e+00  ✓ PASS
+Momentum source (Valencia vs GRHD): max diff = 4.852e+00  ✗ FAIL
+Momentum source (manual vs GRHD): max diff = 4.851e+00  ✗ FAIL
+================================================================================
+✗ SOME COMPARISONS FAILED
+================================================================================
+

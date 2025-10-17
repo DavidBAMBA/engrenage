@@ -31,8 +31,9 @@ from source.bssn.bssnstatevariables import (
     idx_K, idx_arr, idx_att, idx_app, idx_lapse,
 )
 from source.backgrounds.sphericalbackground import i_r, i_t, i_p
-from source.bssn.tensoralgebra import get_bar_gamma_LL
-from source.matter.hydro.cons2prim import prim_to_cons
+# Note: We no longer need these imports since we follow NRPy's approach
+# from source.bssn.tensoralgebra import get_bar_gamma_LL
+# from source.matter.hydro.cons2prim import prim_to_cons
 
 
 def interpolate_tov_avoiding_surface(r_target, tov_solution, field_name,
@@ -312,7 +313,6 @@ def convert_adm_to_bssn(adm_vars, grid, background):
 def create_initial_data_interpolated(tov_solution, grid, background, eos,
                                       atmosphere=None,
                                       polytrope_K=None, polytrope_Gamma=None,
-                                      use_hydrobase_tau=True,
                                       interp_order=11):
     """
     Create BSSN + hydro initial data from TOV solution.
@@ -332,8 +332,7 @@ def create_initial_data_interpolated(tov_solution, grid, background, eos,
         background: FlatSphericalBackground
         eos: Equation of state
         atmosphere: AtmosphereParams object
-        polytrope_K, polytrope_Gamma: EOS parameters for τ prescription
-        use_hydrobase_tau: Use HydroBase τ = ρ₀ε prescription (recommended)
+        polytrope_K, polytrope_Gamma: EOS parameters for polytropic EOS
         interp_order: Lagrange interpolation order (default 11)
 
     Returns:
@@ -395,36 +394,28 @@ def create_initial_data_interpolated(tov_solution, grid, background, eos,
             rho_arr[i] = atmosphere_rho
             P_arr[i] = p_atm
 
-    # Convert primitives → conservatives
-    if use_hydrobase_tau and polytrope_Gamma is not None:
-        # HydroBase prescription: τ = ρ₀ ε = ρ₀ P / [(Γ-1) ρ₀] = P / (Γ-1)
-        # For v=0: W=1, so D = ρ₀, S^r = 0, τ = ρ₀ ε
+    # Convert primitives → conservatives following NRPy approach
+    # For TOV star with v=0: T^00 = ρ_total = ρ₀(1 + ε)
+    # where ε = P/[(Γ-1)ρ₀] for polytropic EOS
+
+    # Compute specific internal energy
+    if polytrope_Gamma is not None:
+        # For polytropic EOS: ε = P / [(Γ-1) ρ₀]
         eps_arr = P_arr / np.maximum((polytrope_Gamma - 1.0) * rho_arr, 1e-30)
-        D_arr = rho_arr
-        Sr_arr = np.zeros_like(rho_arr)
-        tau_arr = rho_arr * eps_arr
     else:
-        # Full prim→cons using physical metric γ_rr
-        D_arr = np.zeros(N)
-        Sr_arr = np.zeros(N)
-        tau_arr = np.zeros(N)
-
-        # Rebuild γ_rr from BSSN variables
-        phi = bssn_state[idx_phi, :]
-        e4phi = np.exp(4.0 * phi)
-
-        # Get γ̄_rr from h_rr
-        h_LL = np.zeros((N, 3, 3))
-        h_LL[:, i_r, i_r] = bssn_state[idx_hrr, :]
-        h_LL[:, i_t, i_t] = bssn_state[idx_htt, :]
-        h_LL[:, i_p, i_p] = bssn_state[idx_hpp, :]
-
-        bar_gamma_LL = get_bar_gamma_LL(grid.r, h_LL, background)
-        gamma_rr = e4phi * bar_gamma_LL[:, i_r, i_r]
-
+        # Use EOS to compute epsilon from pressure and density
+        eps_arr = np.zeros(N)
         for i in range(N):
-            D_arr[i], Sr_arr[i], tau_arr[i] = prim_to_cons(
-                rho_arr[i], 0.0, P_arr[i], gamma_rr[i], eos)
+            eps_arr[i] = eos.epsilon_from_P_rho(P_arr[i], rho_arr[i])
+
+    # For static TOV (v=0), the conservative variables simplify:
+    # D = ρ₀ (conserved baryon density)
+    # S^r = 0 (no momentum for static star)
+    # τ = ρ₀ ε (conserved energy minus rest mass)
+    # This follows from T^μν for perfect fluid with v=0
+    D_arr = rho_arr
+    Sr_arr = np.zeros_like(rho_arr)
+    tau_arr = rho_arr * eps_arr
 
     # Store hydro conservatives
     bssn_state[NUM_BSSN_VARS + 0, :] = D_arr
@@ -448,7 +439,7 @@ def create_initial_data_interpolated(tov_solution, grid, background, eos,
 
 
 # ============================================================================
-# Diagnostic/Validation Functions (from original tov_initial_data.py)
+# Diagnostic/Validation Functions 
 # ============================================================================
 
 def plot_initial_comparison(tov_solution, initial_state_2d, grid, hydro, output_dir="."):

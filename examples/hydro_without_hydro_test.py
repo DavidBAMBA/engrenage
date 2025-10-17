@@ -470,7 +470,6 @@ def main():
         tov_solution, grid, background, eos,
         atmosphere=ATMOSPHERE,
         polytrope_K=K, polytrope_Gamma=Gamma,
-        use_hydrobase_tau=True,
         use_isotropic=False
     )
 

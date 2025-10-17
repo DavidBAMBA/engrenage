@@ -391,7 +391,6 @@ def get_rhs_full(t, y, grid, background, hydro):
     return rhs.flatten()
 
 
-
 def _apply_atmosphere_reset(state_2d, grid, hydro, atmosphere, rho_threshold=None):
     """
     Apply atmosphere floors using IllinoisGRMHD strategy.
@@ -775,7 +774,6 @@ def plot_tov_diagnostics(tov_solution, r_max):
     plt.close(fig)
 
 
-
 def plot_bssn_evolution(state_t0, state_tfinal, grid, t_0=0.0, t_final=1.0):
     """Plot BSSN variables at initial and final time to show their evolution.
 
@@ -1141,7 +1139,6 @@ def main():
         tov_solution, grid, background, eos,
         atmosphere=ATMOSPHERE,
         polytrope_K=K, polytrope_Gamma=Gamma,
-        use_hydrobase_tau=True,
         interp_order=11  # High order Lagrange interpolation
     )
 

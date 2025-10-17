@@ -1,8 +1,14 @@
 import numpy as np
 import sys
+import os
 import matplotlib.pyplot as plt
 from scipy.integrate import ode, trapezoid
 from scipy.interpolate import interp1d
+
+# Create directory for plots
+plots_dir = 'tov_cow_plots'
+if not os.path.exists(plots_dir):
+    os.makedirs(plots_dir)
 
 # Engrenage core
 sys.path.insert(0, '/home/yo/repositories/engrenage')
@@ -288,7 +294,7 @@ def plot_first_step(state_t0, state_t1, grid, hydro, tov_solution=None):
     axes[1, 2].grid(True, alpha=0.3)
 
     plt.tight_layout()
-    plt.savefig('tov_first_step.png', dpi=150, bbox_inches='tight')
+    plt.savefig(os.path.join(plots_dir, 'tov_first_step.png'), dpi=150, bbox_inches='tight')
     plt.close(fig)
 
 
@@ -348,7 +354,7 @@ def plot_surface_zoom(tov_solution, state_t0, state_t1, grid, hydro, window=0.5)
         a.set_xlabel('r')
 
     plt.tight_layout()
-    plt.savefig('tov_surface_zoom.png', dpi=150, bbox_inches='tight')
+    plt.savefig(os.path.join(plots_dir, 'tov_surface_zoom.png'), dpi=150, bbox_inches='tight')
     plt.close(fig)
 
 
@@ -750,7 +756,7 @@ def plot_tov_diagnostics(tov_solution, r_max):
     axes[1, 2].grid(True, alpha=0.3)
 
     plt.tight_layout()
-    plt.savefig('tov_solution.png', dpi=150, bbox_inches='tight')
+    plt.savefig(os.path.join(plots_dir, 'tov_solution.png'), dpi=150, bbox_inches='tight')
     plt.close(fig)
 
 
@@ -865,7 +871,7 @@ def plot_bssn_evolution(state_t0, state_tfinal, grid, t_0=0.0, t_final=1.0):
     plt.suptitle(f'BSSN Variables Evolution (Cowling Approximation)\nt={t_0:.6e} → t={t_final:.6e}',
                  fontsize=14, y=0.995)
     plt.tight_layout()
-    plt.savefig('tov_bssn_evolution.png', dpi=150, bbox_inches='tight')
+    plt.savefig(os.path.join(plots_dir, 'tov_bssn_evolution.png'), dpi=150, bbox_inches='tight')
     plt.close(fig)
 
     # Compute and print maximum changes to verify Cowling approximation
@@ -1019,7 +1025,7 @@ def plot_evolution(state_t0, state_t1, state_t100, state_t10000, grid, hydro,
 
     plt.suptitle(f'Evolution: t=0 → t={t_1:.6e} → {label_100}={t_100:.6e} → {label_10000}={t_10000:.6e}', fontsize=14, y=0.995)
     plt.tight_layout()
-    plt.savefig('tov_evolution.png', dpi=150, bbox_inches='tight')
+    plt.savefig(os.path.join(plots_dir, 'tov_evolution.png'), dpi=150, bbox_inches='tight')
     plt.close(fig)
 
 
@@ -1033,7 +1039,7 @@ def main():
     # CONFIGURATION
     # ==================================================================
     r_max = 16.0
-    num_points = 5000
+    num_points = 1600
     K = 100.0
     Gamma = 2.0
     rho_central = 1.280e-3
@@ -1043,8 +1049,8 @@ def main():
     # ==================================================================
     # Define atmosphere parameters ONCE - all subsystems will use these
     ATMOSPHERE = AtmosphereParams(
-        rho_floor=1.0e-10,      # Rest mass density floor
-        p_floor=1.0e-11,        # Pressure floor
+        rho_floor=1.0e-10,  # Rest mass density floor
+        p_floor=1.0e-11,     # Pressure floor
         v_max=0.9999,           # Maximum velocity
         W_max=100.0,            # Maximum Lorentz factor
         tau_atm_factor=1.0,     # tau_atm = tau_atm_factor * p_floor
@@ -1061,7 +1067,7 @@ def main():
     print()
 
     # Time integration method
-    # 'fixed': RK4 with fixed timestep (fast, stable)
+    # 'fixed': RK4 with fixed timestep 
     # 'adaptive': solve_ivp with adaptive timestep (slower, more accurate)
     integration_method = 'fixed'  # 'fixed' or 'adaptive'
 
@@ -1117,7 +1123,6 @@ def main():
         tov_solution, grid, background, eos,
         atmosphere=ATMOSPHERE,
         polytrope_K=K, polytrope_Gamma=Gamma,
-        use_hydrobase_tau=True,
         interp_order=11  # High order Lagrange interpolation
     )
 
@@ -1126,9 +1131,6 @@ def main():
 
     # Initial-data diagnostics
     tov_id.plot_initial_comparison(tov_solution, initial_state_2d, grid, hydro)
-    tov_id.plot_initial_geometry_comparison(tov_solution, initial_state_2d, grid)
-    tov_id.plot_hydrostatic_equilibrium_residual(initial_state_2d, grid, hydro, background)
-    tov_id.plot_cons2prim_consistency(initial_state_2d, grid, hydro, background)
 
     # ==================================================================
     # EVOLUTION
@@ -1139,7 +1141,7 @@ def main():
 
     if integration_method == 'fixed':
         dt = 0.15 * grid.min_dr  # CFL condition
-        num_steps_total = 10000
+        num_steps_total = 1700
         print(f"\nEvolving with fixed dt={dt:.6f} (CFL=0.1) for {num_steps_total} steps using RK4")
 
         # Single step for comparison
