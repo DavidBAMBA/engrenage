@@ -84,54 +84,79 @@ class ValenciaReferenceMetric:
         self.rho_surface_threshold = float(rho_surface_threshold)
         self.surface_jump_max = float(surface_jump_max)
 
-    def _extract_geometry(self, r, bssn_vars, spacetime_mode, background):
+        # Geometric quantities
+        # These will be computed by _extract_geometry()
+        self.alpha = None              # Lapse function
+        self.beta_U = None             # Shift vector (N, 3)
+        self.gamma_LL = None           # Physical metric (N, 3, 3)
+        self.gamma_UU = None           # Inverse metric (N, 3, 3)
+        self.sqrt_gamma = None         # √γ determinant factor
+        self.e6phi = None              # e^(6φ) conformal factor
+        self.sqrt_g_hat_cell = None    # √ĝ at cell centers
+        self.sqrt_g_hat_face = None    # √ĝ at cell faces
+        self.dr = None                 # Mesh spacing
+
+    def _extract_geometry(self, r, bssn_vars, spacetime_mode, background, grid):
         """
-        Extract geometric quantities from BSSN variables.
-        
+        Extract geometric quantities from BSSN variables and store as class attributes.
+
         IMPORTANT RESCALING NOTES:
         - bssn_vars.shift_U is the RESCALED shift (needs inverse_scaling_vector)
         - bssn_vars.h_LL is the RESCALED deviation (already includes scaling_matrix)
         - bar_gamma_LL = h_LL * scaling_matrix + hat_gamma_LL (includes scale factors)
         - Physical shift: beta^i = inverse_scaling_vector^i * shift_U^i
-        
-        Returns dictionary with all geometric quantities needed for RHS computation.
+
+        Stores all geometric quantities as class attributes, including mesh spacing.
         """
         N = len(r)
-        g = {}
+
+        # Mesh spacing (computed once per timestep)
+        if grid is not None and hasattr(grid, 'derivs') and hasattr(grid.derivs, 'dx'):
+            self.dr = float(grid.derivs.dx)
+        elif grid is not None and hasattr(grid, 'dr'):
+            self.dr = float(grid.dr)
+        elif grid is not None and hasattr(grid, 'spacing') and np.isscalar(grid.spacing):
+            self.dr = float(grid.spacing)
+        elif grid is not None and hasattr(grid, 'spacing') and hasattr(grid.spacing, '__len__'):
+            # For 3D grids with multiple spacings, return radial spacing
+            self.dr = float(grid.spacing[0])
+        else:
+            # Fallback: compute from radial coordinate array (used when grid is None)
+            self.dr = float(r[1] - r[0]) if len(r) > 1 else 1.0
 
         if spacetime_mode == "fixed_minkowski":
-            g['alpha'] = np.ones(N)
-            
+            self.alpha = np.ones(N)
+
             # All three shift components are zero
-            g['beta_U'] = np.zeros((N, SPACEDIM))
-            
+            self.beta_U = np.zeros((N, SPACEDIM))
+
             # Identity metric in 3D
-            g['gamma_LL'] = np.zeros((N, SPACEDIM, SPACEDIM))
+            self.gamma_LL = np.zeros((N, SPACEDIM, SPACEDIM))
             for i in range(SPACEDIM):
-                g['gamma_LL'][:, i, i] = 1.0
-            
+                self.gamma_LL[:, i, i] = 1.0
+
             # Inverse metric (also identity)
-            g['gamma_UU'] = np.copy(g['gamma_LL'])
-            
+            self.gamma_UU = np.copy(self.gamma_LL)
+
             # Determinant and square root
-            g['sqrt_gamma'] = np.ones(N)
-            g['sqrt_g_hat_cell'] = background.det_hat_gamma ** 0.5
-            g['sqrt_g_hat_face'] = 0.5 * (g['sqrt_g_hat_cell'][:-1] + g['sqrt_g_hat_cell'][1:])
-            
+            self.sqrt_gamma = np.ones(N)
+            self.sqrt_g_hat_cell = background.det_hat_gamma ** 0.5
+            self.sqrt_g_hat_face = 0.5 * (self.sqrt_g_hat_cell[:-1] + self.sqrt_g_hat_cell[1:])
+
         else:
             # Lapse α
-            g['alpha'] = np.asarray(bssn_vars.lapse, dtype=float)
+            self.alpha = np.asarray(bssn_vars.lapse, dtype=float)
 
             # Shift β^i (all three components)
-            g['beta_U'] = np.zeros((N, SPACEDIM))
-            
+            self.beta_U = np.zeros((N, SPACEDIM))
+
             if hasattr(bssn_vars, 'shift_U') and bssn_vars.shift_U is not None:
                 shift_array = np.asarray(bssn_vars.shift_U)
                 if shift_array.ndim >= 2:
                     for i in range(min(SPACEDIM, shift_array.shape[1])):
-                        g['beta_U'][:, i] = shift_array[:, i].astype(float)
+                        self.beta_U[:, i] = shift_array[:, i].astype(float)
 
-            g['beta_U'] = g['beta_U'] * background.inverse_scaling_vector
+            self.beta_U = self.beta_U * background.inverse_scaling_vector
 
 
             # Conformal factor e^{φ}
@@ -141,21 +166,19 @@ class ValenciaReferenceMetric:
 
             # Physical metric γ_ij = e^{4φ} γ̄_ij (full 3x3 tensor)
             bar_gamma_LL = get_bar_gamma_LL(r, bssn_vars.h_LL, background)
-            g['gamma_LL'] = e4phi[:, None, None] * bar_gamma_LL
-            
+            self.gamma_LL = e4phi[:, None, None] * bar_gamma_LL
+
             # Inverse physical metric γ^{ij}
-            g['gamma_UU'] = np.linalg.inv(g['gamma_LL'])
+            self.gamma_UU = np.linalg.inv(self.gamma_LL)
 
             # √γ = e^{6φ} γ̄ = γ̂
             # The factor √(det γ̂) is handled implicitly via Γ̂^i_{jk}
-            g['sqrt_gamma'] = e6phi
-            g['e6phi'] = e6phi  # Store for later use
+            self.sqrt_gamma = e6phi
+            self.e6phi = e6phi  # Store for later use
 
             # √ĝ for reference metric
-            g['sqrt_g_hat_cell'] = np.sqrt(np.abs(background.det_hat_gamma) + 1e-30)
-            g['sqrt_g_hat_face'] = 0.5 * (g['sqrt_g_hat_cell'][:-1] + g['sqrt_g_hat_cell'][1:])
-
-        return g
+            self.sqrt_g_hat_cell = np.sqrt(np.abs(background.det_hat_gamma) + 1e-30)
+            self.sqrt_g_hat_face = 0.5 * (self.sqrt_g_hat_cell[:-1] + self.sqrt_g_hat_cell[1:])
 
     def _compute_vU_from_u4U(self, u4U):
         """
@@ -172,65 +195,58 @@ class ValenciaReferenceMetric:
         
         return v_U
 
-    def _compute_4velocity(self, rho0, v_U, W, g):
+    def _compute_4velocity(self, rho0, v_U, W):
         """
-        Compute 4-velocity components u^μ following NRPy+ convention.
-        
+        Compute 4-velocity components u^μ 
+
         u^0 = W/α (timelike component, Valencia formulation)
         u^i = W v^i (spatial components)
-        
+
         Args:
             v_U: (N, 3) array with [v^x, v^y, v^z] spatial velocity components
-        
+
         Returns: u^μ as (N, 4) array [u^t, u^x, u^y, u^z]
         """
         N = len(rho0)
-        alpha = g['alpha']
-        
-        # 4-velocity components (NRPy+ line 59-61)
+
+        # 4-velocity components 
         u4U = np.zeros((N, 4))
-        u4U[:, 0] = W / alpha  # u^t = u^0
-        
+        u4U[:, 0] = W / self.alpha  # u^t = u^0
+
         # All three spatial components
         for i in range(SPACEDIM):
             u4U[:, i + 1] = W * v_U[:, i]  # u^i = W v^i
-        
+
         return u4U
 
-    def _compute_T4UU(self, rho0, v_U, pressure, W, h, g):
+    def _compute_T4UU(self, rho0, v_U, pressure, W, h):
         """
-        Compute contravariant stress-energy tensor T^{μν} following NRPy+ (line 146-161).
-        
+        Compute contravariant stress-energy tensor T^{μν} 
+
         T^{μν} = ρ₀ h u^μ u^ν + P g^{μν}
-        
+
         Args:
             v_U: (N, 3) array with [v^x, v^y, v^z] spatial velocity components
-            g: Dictionary with geometric quantities from _extract_geometry
-        
+
         Returns: T^{μν} with components:
             - T^{00} = T^{tt} (energy density in Eulerian frame)
             - T^{0i} = T^{ti} (energy flux / momentum density)
             - T^{ij} (momentum flux / stress tensor)
         """
         N = len(rho0)
-        
+
         # Get 4-velocity
-        u4U = self._compute_4velocity(rho0, v_U, W, g)
-        
-        # Extract geometric quantities (already computed in _extract_geometry)
-        alpha = g['alpha']
-        beta_U = g['beta_U']  # (N, SPACEDIM)
-        gamma_UU = g['gamma_UU']  # (N, SPACEDIM, SPACEDIM)
-        
-        # Compute g^{μν} components (NRPy+ uses ADM_to_g4UU, line 153)
+        u4U = self._compute_4velocity(rho0, v_U, W)
+
+        # Compute g^{μν} components 
         # g^{tt} = -1/α²
-        g4UU_00 = -1.0 / (alpha ** 2)
-        
+        g4UU_00 = -1.0 / (self.alpha ** 2)
+
         # g^{ti} = β^i/α²
-        g4UU_0i = beta_U / (alpha[:, None] ** 2)
-        
+        g4UU_0i = self.beta_U / (self.alpha[:, None] ** 2)
+
         # g^{ij} = γ^{ij} - β^i β^j / α²
-        g4UU_spatial = gamma_UU - np.einsum('xi,xj->xij', beta_U, beta_U) / (alpha[:, None, None] ** 2)
+        g4UU_spatial = self.gamma_UU - np.einsum('xi,xj->xij', self.beta_U, self.beta_U) / (self.alpha[:, None, None] ** 2)
         
         # Compute T^{μν} = ρ₀ h u^μ u^ν + P g^{μν} (NRPy+ line 159-161)
         T4UU = {}
@@ -257,24 +273,23 @@ class ValenciaReferenceMetric:
         
         return T4UU
 
-    def _compute_T4UD(self, T4UU, g):
+    def _compute_T4UD(self, T4UU):
         """
         Compute mixed stress-energy tensor T^μ_ν = T^{μδ} g_{δν} following NRPy+ (line 176-198).
-        
+
         Needed for momentum flux computation.
-        
+
         Args:
             T4UU: Contravariant stress-energy tensor from _compute_T4UU
-            g: Dictionary with geometric quantities from _extract_geometry
-        
+
         Returns: T^μ_ν with all components
         """
-        N = len(g['alpha'])
-        
-        # Extract geometric quantities (already computed in _extract_geometry)
-        alpha = g['alpha']
-        beta_U = g['beta_U']  # (N, SPACEDIM)
-        gamma_LL = g['gamma_LL']  # (N, SPACEDIM, SPACEDIM)
+        N = len(self.alpha)
+
+        # Geometric quantities from class attributes
+        alpha = self.alpha
+        beta_U = self.beta_U  # (N, SPACEDIM)
+        gamma_LL = self.gamma_LL  # (N, SPACEDIM, SPACEDIM)
         
         # Build g_{μν} components (NRPy+ uses ADM_to_g4DD)
         # g_{tt} = -α² + β_k β^k (using γ_ij to lower β)
@@ -314,8 +329,7 @@ class ValenciaReferenceMetric:
         
         return T4UD
 
-
-    def _compute_source_terms(self, rho0, v_U, pressure, W, h, g,
+    def _compute_source_terms(self, rho0, v_U, pressure, W, h,
                             bssn_vars, bssn_d1, background, spacetime_mode, r):
         """
         Physical source terms of GRHD equations in Fully 3D implementation.
@@ -323,15 +337,15 @@ class ValenciaReferenceMetric:
         Energy source (tau_source_term, NRPy+ line 334-358):
             S_τ = α e^{6φ} √(det γ̄) [K_ij (T^{00} β^i β^j + 2 T^{0i} β^j + T^{ij})
                                     - (T^{00} β^i + T^{0i}) ∂_i α]
-        
+
         Momentum source S_tilde_source_termD:
             S_{S_i} = α e^{6φ} √(det γ̄) [-T^{00} α ∂_i α
                                         + T^0_j (∂_i β^j + Γ̂^j_{ik} β^k)
                                         + (1/2) (T^{tt} β^j β^k + 2 T^{tj} β^k + T^{jk}) ∇̂_i γ_{jk}]
-        
+
         Args:
             v_U: (N, 3) array with [v^x, v^y, v^z] spatial velocity components
-            
+
         Returns:
             src_S_vector: (N, 3) momentum source for all three spatial directions
             src_tau: (N,) energy source
@@ -347,9 +361,9 @@ class ValenciaReferenceMetric:
             src_tau = np.zeros(N)
             return src_S_vector, src_tau
 
-        # Extract geometry
-        alpha = g['alpha']
-        beta_U = g['beta_U']  # (N, SPACEDIM) - all three components
+        # Geometric quantities from class attributes
+        alpha = self.alpha
+        beta_U = self.beta_U  # (N, SPACEDIM) - all three components
         
         # Compute e^{6φ} and √(det γ̄) separately for clarity
         # Use only e^{6φ} as volume element (GRoovy Eq. 20)
@@ -365,8 +379,8 @@ class ValenciaReferenceMetric:
         gamma_LL = e4phi[:, None, None] * bar_gamma_LL
         
         # Compute stress-energy tensors T^{μν} and T^μ_ν with all three velocity components
-        T4UU = self._compute_T4UU(rho0, v_U, pressure, W, h, g)
-        T4UD = self._compute_T4UD(T4UU, g)
+        T4UU = self._compute_T4UU(rho0, v_U, pressure, W, h)
+        T4UD = self._compute_T4UD(T4UU)
         
         # ====================================================================
         # ENERGY SOURCE TERM (NRPy+ line 334-358)
@@ -514,8 +528,6 @@ class ValenciaReferenceMetric:
         rhs_S_tildeD: (N, 3) - time derivative of momentum vector
         rhs_tau: (N,) - time derivative of tau
         """
-        
-        dr = self._get_mesh_spacing(grid, r)
         N = len(r)
 
         # Track original momentum dimensionality to preserve caller-facing API
@@ -559,16 +571,14 @@ class ValenciaReferenceMetric:
             v_U = v_U_3d
         elif v_U.shape[1] != SPACEDIM:
             raise ValueError(f"Velocity shape {v_U.shape} incompatible with SPACEDIM={SPACEDIM}")
-        
 
-        # Extract geometry (α, β^i, γ_ij, √γ, √ĝ, etc.) early, as W may need γ_ij
-        g = self._extract_geometry(r, bssn_vars, spacetime_mode, background)
+        # Extract geometry (α, β^i, γ_ij, √γ, √ĝ, dr, etc.) early, as W may need γ_ij
+        self._extract_geometry(r, bssn_vars, spacetime_mode, background, grid)
 
         # Compute W and h from primitives if not provided
         if W is None:
             # v² = γ_ij v^i v^j
-            gamma_LL = g['gamma_LL']  # (N, 3, 3)
-            v_squared = np.einsum('xij,xi,xj->x', gamma_LL, v_U, v_U)
+            v_squared = np.einsum('xij,xi,xj->x', self.gamma_LL, v_U, v_U)
             # Lorentz factor: W = 1/√(1 - v²)
             W = 1.0 / np.sqrt(np.maximum(1.0 - v_squared, 1e-16))
 
@@ -583,18 +593,12 @@ class ValenciaReferenceMetric:
         D, S_tildeD, tau = self._apply_ghost_cell_boundaries(D, S_tildeD, tau, r)
 
         # Compute NRPy-style partial fluxes at interfaces using α e^{6φ} at faces
-        flux_hat = self._compute_interface_fluxes(
-            rho0, v_U, pressure, g, r, eos, reconstructor, riemann_solver, bssn_vars
+        F_D_face, F_S_tildeD_face, F_tau_face, debug_faces = self._compute_interface_fluxes(
+            rho0, v_U, pressure, r, eos, reconstructor, riemann_solver, bssn_vars
         )
 
         # Reference metric Christoffel symbols Γ̂^i_{jk}
         hat_chris = background.hat_christoffel  # (N, 3, 3, 3)
-
-        # Partial fluxes at faces (no √ĝ)
-        F_D_face = flux_hat['D']
-        F_S_tildeD_face = flux_hat['S_tildeD']  # Now (N_faces, 3) for all three components
-        F_tau_face = flux_hat['tau']
-        debug_faces = flux_hat.get('debug', {})
 
         # ====================================================================
         # FLUX DIVERGENCE (NRPy form): -∂_r(F̃^r)
@@ -608,7 +612,7 @@ class ValenciaReferenceMetric:
         # Compute divergence in interior cells
         for i in range(NUM_GHOSTS, N - NUM_GHOSTS):
             # NRPy-style partial derivative form: divide only by Δr
-            inv_vol = 1.0 / (dr + 1e-30)
+            inv_vol = 1.0 / (self.dr + 1e-30)
 
             rhs_D[i] = -(F_D_face[i] - F_D_face[i-1]) * inv_vol
             
@@ -624,14 +628,14 @@ class ValenciaReferenceMetric:
         # ====================================================================
 
         # Use e^{6φ} (not √γ) for densitization at centers, matching NRPy.
-        alpha = g['alpha']
+        alpha = self.alpha
         phi_c = np.asarray(bssn_vars.phi, dtype=float)
         e6phi_c = np.exp(6.0 * phi_c)
 
 
         # Compute 4-velocity and stress-energy
-        u4U = self._compute_4velocity(rho0, v_U, W, g)
-        T4UU = self._compute_T4UU(rho0, v_U, pressure, W, h, g)
+        u4U = self._compute_4velocity(rho0, v_U, W)
+        T4UU = self._compute_T4UU(rho0, v_U, pressure, W, h)
 
         # Conservative density
         rho_star = alpha * e6phi_c * rho0 * u4U[:, 0]
@@ -648,7 +652,7 @@ class ValenciaReferenceMetric:
             fTau_U[:, j] = alpha ** 2 * e6phi_c * T4UU['0i'][:, j] - rho_star * v_U[:, j]
 
         # Momentum partial flux tensor F̃^j_i = α e^{6φ} T^j_i
-        T4UD = self._compute_T4UD(T4UU, g)
+        T4UD = self._compute_T4UD(T4UU)
         F_S_no_ghat = np.zeros((N, SPACEDIM, SPACEDIM))
         for j in range(SPACEDIM):
             for i in range(SPACEDIM):
@@ -714,7 +718,7 @@ class ValenciaReferenceMetric:
         # SOURCE TERMS (geometric couplings - NRPy+ style)
         # ====================================================================
         src_S_tildeD, src_tau = self._compute_source_terms(
-            rho0, v_U, pressure, W, h, g, bssn_vars, bssn_d1,
+            rho0, v_U, pressure, W, h, bssn_vars, bssn_d1,
             background, spacetime_mode, r
         )  # Returns (N,3), (N,)
 
@@ -727,7 +731,7 @@ class ValenciaReferenceMetric:
                 i0 = NUM_GHOSTS
                 kL = i0 - 1
                 kR = i0
-                inv_vol = 1.0 / (dr + 1e-30)
+                inv_vol = 1.0 / (self.dr + 1e-30)
                 divS_i0 = -(F_S_tildeD_face[kR, 0] - F_S_tildeD_face[kL, 0]) * inv_vol
                 # Connection term at center for i=radial
                 Gamma_trace = np.einsum('xkkj->xj', hat_chris)
@@ -750,7 +754,7 @@ class ValenciaReferenceMetric:
 
         return rhs_D, rhs_S_out, rhs_tau  # (N,), (N,) or (N,3), (N,)
 
-    def _compute_interface_fluxes(self, rho0, v_U, pressure, g, r,
+    def _compute_interface_fluxes(self, rho0, v_U, pressure, r,
                                 eos, reconstructor, riemann_solver, bssn_vars):
         """
         Compute NRPy-style partial fluxes at cell interfaces: F̃_face = α_face √γ_face F_phys.
@@ -772,39 +776,40 @@ class ValenciaReferenceMetric:
             r: Coordinate for reconstruction (interpretation depends on background)
 
         Returns:
-            Dictionary with partial-flux arrays at interfaces (no √ĝ factor):
-                'D': (N_faces,) density flux
-                'S_tildeD': (N_faces, 3) momentum flux (only [:, 0] non-zero)
-                'tau': (N_faces,) energy flux
+            Tuple of partial-flux arrays at interfaces (no √ĝ factor):
+                F_D_face: (N_faces,) density flux
+                F_S_tildeD_face: (N_faces, 3) momentum flux (only [:, 0] non-zero)
+                F_tau_face: (N_faces,) energy flux
+                debug_info: dict with diagnostic information
         """
         N = len(r)
-        
+
         # Extract first spatial component for 1D reconstruction
         v_primary = v_U[:, 0]
-        
+
         # Reconstruct primitives to left/right states at interfaces
         # Map Valencia boundary_mode to reconstructor boundary_type
         recon_boundary = "reflecting" if self.boundary_mode == "parity" else "outflow"
         (rhoL, vL, pL), (rhoR, vR, pR) = reconstructor.reconstruct_primitive_variables(
             rho0, v_primary, pressure, x=r, boundary_type=recon_boundary
         )
-        
+
         # Extract interior faces (exclude ghost zones)
         rhoL, vL, pL = rhoL[1:-1], vL[1:-1], pL[1:-1]
         rhoR, vR, pR = rhoR[1:-1], vR[1:-1], pR[1:-1]
-        
-        # Interpolate geometry to faces
-        alpha_f = 0.5 * (g['alpha'][:-1] + g['alpha'][1:])
-        sqrt_gamma_f = 0.5 * (g['sqrt_gamma'][:-1] + g['sqrt_gamma'][1:])
-        sqrt_g_hat_f = g['sqrt_g_hat_face']
+
+        # Interpolate geometry to faces from class attributes
+        alpha_f = 0.5 * (self.alpha[:-1] + self.alpha[1:])
+        sqrt_gamma_f = 0.5 * (self.sqrt_gamma[:-1] + self.sqrt_gamma[1:])
+        sqrt_g_hat_f = self.sqrt_g_hat_face
         # Exact e^{6phi} at faces from BSSN phi (NRPy-compatible densitization)
         phi_arr = np.asarray(bssn_vars.phi, dtype=float)
         phi_face = 0.5 * (phi_arr[:-1] + phi_arr[1:])
         e6phi_f = np.exp(6.0 * phi_face)
-        
+
         # Interpolate shift and metric to faces
-        beta_U_f = 0.5 * (g['beta_U'][:-1] + g['beta_U'][1:])  # (N-1, 3)
-        gamma_LL_f = 0.5 * (g['gamma_LL'][:-1] + g['gamma_LL'][1:])  # (N-1, 3, 3)
+        beta_U_f = 0.5 * (self.beta_U[:-1] + self.beta_U[1:])  # (N-1, 3)
+        gamma_LL_f = 0.5 * (self.gamma_LL[:-1] + self.gamma_LL[1:])  # (N-1, 3, 3)
         
         # For 1D Riemann solver, extract first spatial components
         beta_primary_f = beta_U_f[:, 0]  # β^r or β^ρ or β^x
@@ -901,39 +906,17 @@ class ValenciaReferenceMetric:
         F_S_tildeD_face[:, 0] = F_batch[:, 1]  # Primary direction flux
         # F_S_tildeD_face[:, 1] = 0  # Secondary direction (no flux in 1D)
         # F_S_tildeD_face[:, 2] = 0  # Tertiary direction (no flux in 1D)
-        
-        return {
-            'D': F_batch[:, 0],           # Density flux
-            'S_tildeD': F_S_tildeD_face,  # (N_faces, 3) momentum flux vector
-            'tau': F_batch[:, 2],         # Energy flux
-            'debug': {
-                'alpha_f': alpha_f,
-                'e6phi_f': e6phi_f,
-                'rhoL': rhoL, 'rhoR': rhoR,
-                'vL': vL, 'vR': vR,
-                'pL': pL, 'pR': pR,
-            }
+
+        # Debug info for diagnostics
+        debug_info = {
+            'alpha_f': alpha_f,
+            'e6phi_f': e6phi_f,
+            'rhoL': rhoL, 'rhoR': rhoR,
+            'vL': vL, 'vR': vR,
+            'pL': pL, 'pR': pR,
         }
 
-    def _get_mesh_spacing(self, grid, r):
-        """
-        Get mesh spacing from grid object.
-        
-        For 3D grids, this returns the radial spacing.
-        Full 3D implementation would need dx, dy, dz or dr, dtheta, dphi.
-        """
-        if hasattr(grid, 'derivs') and hasattr(grid.derivs, 'dx'):
-            return float(grid.derivs.dx)
-        elif hasattr(grid, 'dr'):
-            return float(grid.dr)
-        elif hasattr(grid, 'spacing') and np.isscalar(grid.spacing):
-            return float(grid.spacing)
-        elif hasattr(grid, 'spacing') and hasattr(grid.spacing, '__len__'):
-            # For 3D grids with multiple spacings, return radial spacing
-            return float(grid.spacing[0])
-        else:
-            # Fallback: compute from radial coordinate array
-            return float(r[1] - r[0]) if len(r) > 1 else 1.0
+        return F_batch[:, 0], F_S_tildeD_face, F_batch[:, 2], debug_info
 
     def _apply_ghost_cell_boundaries(self, D, S_tildeD, tau, r):
         """

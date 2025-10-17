@@ -1,0 +1,6 @@
+/home/yo/repositories/engrenage/examples/TOVEvolution_corrected.py:678: SyntaxWarning: invalid escape sequence '\p'
+  axes[1, 1].set_title('Conformal Factor $\phi$')
+Traceback (most recent call last):
+  File "/home/yo/repositories/engrenage/examples/TOVEvolution_corrected.py", line 14, in <module>
+    import numpy as np
+ModuleNotFoundError: No module named 'numpy'

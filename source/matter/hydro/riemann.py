@@ -278,30 +278,4 @@ class HLLERiemannSolver:
         return lam_minus, lam_plus
 
 
-class HLLCRiemannSolver:
-    """
-    Placeholder HLLC (contact-resolving) solver.
-    Falls back to HLLE while keeping a compatible interface.
-    """
-
-    def __init__(self):
-        self.name = "HLLC"
-        self.solver_type = "contact_resolving (fallback to HLLE)"
-        self._hlle = HLLERiemannSolver()
-
-    def solve(self, UL, UR, primL, primR, gamma_rr, alpha, beta_r, eos):
-        return self._hlle.solve(UL, UR, primL, primR, gamma_rr, alpha, beta_r, eos)
-
-    def solve_batch(self, *args, **kwargs):
-        return self._hlle.solve_batch(*args, **kwargs)
-
-    def estimate_dt(self, *args, **kwargs):
-        return self._hlle.estimate_dt(*args, **kwargs)
-
-    def get_solver_statistics(self):
-        return self._hlle.get_solver_statistics()
-
-    def reset_statistics(self):
-        return self._hlle.reset_statistics()
-
 

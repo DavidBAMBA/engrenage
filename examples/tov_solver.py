@@ -1,5 +1,7 @@
 """
-Standalone TOV solver (NRPy+-consistent) with plotting.
+Standalone TOV solver with plotting.
+
+Solves TOV equations in Schwarzschild coordinates only.
 
 Usage:
   python examples/tov_solver.py --K 200.0 --Gamma 2.0 --rho_central 1.28e-3 --r_max 11.0 --num_points 1000
@@ -12,12 +14,11 @@ from scipy.integrate import ode
 
 
 class TOVSolver:
-    """TOV solver with isotropic coordinates (follows NRPy+ equations)."""
+    """TOV solver in Schwarzschild coordinates."""
 
-    def __init__(self, K, Gamma, use_isotropic=False):
+    def __init__(self, K, Gamma):
         self.K = K
         self.Gamma = Gamma
-        self.use_isotropic = use_isotropic
 
     def eos_pressure(self, rho_baryon):
         return self.K * rho_baryon ** self.Gamma
@@ -35,24 +36,32 @@ class TOVSolver:
         return rho_b * (1.0 + eps)
 
     def tov_rhs(self, r_schw, y):
-        if self.use_isotropic:
-            P, nu, M, r_iso = y
-        else:
-            P, Phi, M = y
+        """
+        TOV RHS in Schwarzschild coordinates.
 
-        if r_schw < 1e-10:
-            if self.use_isotropic:
-                return np.array([0.0, 0.0, 0.0, 1.0])
-            else:
-                return np.array([0.0, 0.0, 0.0])
-
+        Variables: y = [P, nu, M]
+        - P: pressure
+        - nu: metric function (related to lapse)
+        - M: enclosed mass
+        """
+        P, nu, M = y
         rho = self.eos_rho_energy(P)
+
+        # Near origin: use Taylor expansion
+        # This ensures correct behavior as r→0 and avoids division by zero
+        if r_schw < 1e-4 or M <= 0:
+            # For small r, m ≈ (4π/3)r³ρ, so use Taylor-expanded equations
+            # dP/dr = -(ρ+P) × [4πr(ρ/3 + P)] / [1 - 8πρr²]
+            dP_dr = -(rho + P) * (4.0*np.pi/3.0*r_schw*rho + 4.0*np.pi*r_schw*P) / (1.0 - 8.0*np.pi*rho*r_schw**2)
+            dnu_dr = -2.0 / (P + rho) * dP_dr  # From dP/dr relation
+            dM_dr = 4.0 * np.pi * r_schw**2 * rho
+            return np.array([dP_dr, dnu_dr, dM_dr])
+
+        # Standard TOV equations for r > 1e-4
         denom = r_schw * (r_schw - 2.0 * M)
         if abs(denom) < 1e-30:
-            if self.use_isotropic:
-                return np.array([0.0, 0.0, 0.0, 0.0])
-            else:
-                return np.array([0.0, 0.0, 0.0])
+            # Failsafe: near horizon or singularity
+            return np.array([0.0, 0.0, 0.0])
 
         numerator = M + 4.0 * np.pi * r_schw ** 3 * P
 
@@ -60,41 +69,47 @@ class TOVSolver:
         dnu_dr = 2.0 * numerator / denom
         dM_dr = 4.0 * np.pi * r_schw ** 2 * rho
 
-        if self.use_isotropic:
-            if r_iso > 0 and r_schw > 2.0 * M:
-                dr_iso_dr = r_iso / (r_schw * np.sqrt(1.0 - 2.0 * M / r_schw))
-            else:
-                dr_iso_dr = 1.0
-            return np.array([dP_dr, dnu_dr, dM_dr, dr_iso_dr])
-        else:
-            return np.array([dP_dr, dnu_dr, dM_dr])
+        return np.array([dP_dr, dnu_dr, dM_dr])
 
     def solve(self, rho_central, r_grid=None, r_max=20.0, dr=0.0001):
+        """
+        Solve TOV equations.
+
+        Args:
+            rho_central: Central baryon density
+            r_grid: Optional radial grid to interpolate onto
+            r_max: Maximum radius
+            dr: Step size (if r_grid not provided)
+
+        Returns:
+            dict with solution arrays
+        """
         P_c = self.eos_pressure(rho_central)
         nu_c = 0.0
         M_c = 0.0
-        r_iso_c = 0.0
 
         solver = ode(self.tov_rhs).set_integrator('dopri5')
-        if self.use_isotropic:
-            solver.set_initial_value([P_c, nu_c, M_c, r_iso_c], 0.0001)
-        else:
-            solver.set_initial_value([P_c, nu_c, M_c], 0.0001)
+        solver.set_initial_value([P_c, nu_c, M_c], 0.0001)
 
         if r_grid is not None:
             r_schw_arr = []
             P_arr = []
             nu_arr = []
             M_arr = []
-            r_iso_arr = [] if self.use_isotropic else None
             surface_found = False
             R_star = None
             M_star = None
             nu_star = None
-            r_iso_star = None
 
             for r_schw in r_grid:
-                if r_schw < 0.001:
+                # Include all grid points, even near r=0
+                # For r < 0.001, use initial conditions
+                if r_schw < 0.0005:
+                    # Very close to origin: use initial conditions
+                    r_schw_arr.append(r_schw)
+                    P_arr.append(P_c)
+                    nu_arr.append(nu_c)
+                    M_arr.append(M_c)
                     continue
 
                 if not surface_found:
@@ -111,17 +126,14 @@ class TOVSolver:
                     P_arr.append(max(y_now[0], 0.0))
                     nu_arr.append(y_now[1])
                     M_arr.append(y_now[2])
-                    if self.use_isotropic:
-                        r_iso_arr.append(y_now[3])
 
                     if y_now[0] <= 1e-10:
                         surface_found = True
                         R_star = r_schw
                         M_star = y_now[2]
                         nu_star = y_now[1]
-                        if self.use_isotropic:
-                            r_iso_star = y_now[3]
                 else:
+                    # Exterior: vacuum solution
                     r_schw_arr.append(r_schw)
                     P_arr.append(0.0)
                     if r_schw > 2.0 * M_star and R_star > 2.0 * M_star:
@@ -133,27 +145,16 @@ class TOVSolver:
                     nu_arr.append(nu_ext)
                     M_arr.append(M_star)
 
-                    if self.use_isotropic and r_iso_star is not None:
-                        if r_schw > 2.0 * M_star:
-                            r_iso_ext = 0.5 * (
-                                np.sqrt(r_schw * (r_schw - 2.0 * M_star)) + r_schw - M_star
-                            )
-                        else:
-                            r_iso_ext = r_iso_star
-                        r_iso_arr.append(r_iso_ext)
-
             r_schw_arr = np.array(r_schw_arr)
             P_arr = np.array(P_arr)
             nu_arr = np.array(nu_arr)
             M_arr = np.array(M_arr)
-            if self.use_isotropic:
-                r_iso_arr = np.array(r_iso_arr)
         else:
+            # Integrate with adaptive step
             r_schw_arr = [0.001]
             P_arr = [P_c]
             nu_arr = [nu_c]
             M_arr = [M_c]
-            r_iso_arr = [r_iso_c] if self.use_isotropic else None
 
             while solver.successful() and solver.y[0] > 1e-10 and solver.t < r_max:
                 solver.integrate(solver.t + dr)
@@ -161,14 +162,12 @@ class TOVSolver:
                 P_arr.append(solver.y[0])
                 nu_arr.append(solver.y[1])
                 M_arr.append(solver.y[2])
-                if self.use_isotropic:
-                    r_iso_arr.append(solver.y[3])
 
             R_star = r_schw_arr[-1]
             M_star = M_arr[-1]
             nu_star = nu_arr[-1]
-            r_iso_star = r_iso_arr[-1] if self.use_isotropic else None
 
+            # Extend to exterior
             r_current = R_star + dr
             while r_current <= r_max:
                 r_schw_arr.append(r_current)
@@ -181,27 +180,16 @@ class TOVSolver:
                     nu_ext = nu_star
                 nu_arr.append(nu_ext)
                 M_arr.append(M_star)
-
-                if self.use_isotropic and r_iso_star is not None:
-                    if r_current > 2.0 * M_star:
-                        r_iso_ext = 0.5 * (
-                            np.sqrt(r_current * (r_current - 2.0 * M_star)) + r_current - M_star
-                        )
-                    else:
-                        r_iso_ext = r_iso_star
-                    r_iso_arr.append(r_iso_ext)
-
                 r_current += dr
 
             r_schw_arr = np.array(r_schw_arr)
             P_arr = np.array(P_arr)
             nu_arr = np.array(nu_arr)
             M_arr = np.array(M_arr)
-            if self.use_isotropic:
-                r_iso_arr = np.array(r_iso_arr)
 
         rho_arr = np.array([self.eos_rho_baryon(P) for P in P_arr])
 
+        # Find surface
         surface_idx = np.where(P_arr <= 1e-10)[0]
         if len(surface_idx) > 0:
             R_star_schw = r_schw_arr[surface_idx[0]]
@@ -210,51 +198,16 @@ class TOVSolver:
 
         M_star = M_arr[-1]
 
-        if self.use_isotropic:
-            R_iso_surface = r_iso_arr[surface_idx[0]] if len(surface_idx) > 0 else r_iso_arr[-1]
-            R_iso_exact = 0.5 * (
-                np.sqrt(R_star_schw * (R_star_schw - 2.0 * M_star)) + R_star_schw - M_star
-            )
-            normalize = R_iso_exact / R_iso_surface if R_iso_surface != 0 else 1.0
-
-            r_iso_normalized = r_iso_arr.copy()
-            if len(surface_idx) > 0:
-                surf_i = surface_idx[0]
-                r_iso_normalized[: surf_i + 1] = r_iso_arr[: surf_i + 1] * normalize
-                r_ext = r_schw_arr[surf_i + 1 :]
-                if r_ext.size > 0:
-                    r_iso_normalized[surf_i + 1 :] = 0.5 * (
-                        np.sqrt(r_ext * (r_ext - 2.0 * M_star)) + r_ext - M_star
-                    )
-            else:
-                r_iso_normalized = r_iso_arr * normalize
-
-            # Compute exp(4φ) = ψ⁴ = γ_rr in isotropic coordinates
-            # The correct formula is: γ_rr = (r_Schw/r_iso)² / (1 - 2M/r_Schw)
-            # At r→0: M~r³, so (1-2M/r)→1, and r_iso~r_Schw, giving γ_rr→1
-            exp4phi = np.ones_like(r_schw_arr)
-            mask = r_iso_normalized > 1e-15
-            exp4phi[mask] = (r_schw_arr[mask] / r_iso_normalized[mask]) ** 2 / np.maximum(1.0 - 2.0*M_arr[mask]/r_schw_arr[mask], 1e-10)
-
-            nu_surface = nu_arr[surface_idx[0]] if len(surface_idx) > 0 else nu_arr[-1]
-            expnu = np.exp(
-                nu_arr - nu_surface + np.log(1.0 - 2.0 * M_star / R_star_schw)
-            )
-            alpha = np.sqrt(expnu)
-
-            r_coord = r_iso_normalized
-            R_star = R_iso_surface * normalize
-        else:
-            # Schwarzschild radial coordinate branch.
-            # Normalize the lapse so that α→1 as r→∞ and α is continuous at the surface:
-            # α_int(r) = exp( (ν(r) - ν(R)) / 2 ) * sqrt(1 - 2M/R),
-            # α_ext(r) = sqrt(1 - 2M/r)
-            exp4phi = 1.0 / (1.0 - 2.0 * M_arr / r_schw_arr)
-            nu_surface = nu_arr[surface_idx[0]] if len(surface_idx) > 0 else nu_arr[-1]
-            expnu = np.exp(nu_arr - nu_surface + np.log(1.0 - 2.0 * M_star / R_star_schw))
-            alpha = np.sqrt(expnu)
-            r_coord = r_schw_arr
-            R_star = R_star_schw
+        # Schwarzschild radial coordinate (only option now)
+        # Normalize lapse: α→1 as r→∞, continuous at surface
+        # α_int(r) = exp((ν(r) - ν(R))/2) × √(1 - 2M/R)
+        # α_ext(r) = √(1 - 2M/r)
+        exp4phi = 1.0 / np.maximum(1.0 - 2.0 * M_arr / r_schw_arr, 1e-10)
+        nu_surface = nu_arr[surface_idx[0]] if len(surface_idx) > 0 else nu_arr[-1]
+        expnu = np.exp(nu_arr - nu_surface + np.log(1.0 - 2.0 * M_star / R_star_schw))
+        alpha = np.sqrt(expnu)
+        r_coord = r_schw_arr
+        R_star = R_star_schw
 
         result = {
             'r': r_coord,
@@ -268,10 +221,6 @@ class TOVSolver:
             'M_star': M_star,
             'C': M_star / R_star,
         }
-
-        if self.use_isotropic:
-            result['r_schw'] = r_schw_arr
-            result['r_iso'] = r_iso_normalized
 
         return result
 
@@ -447,7 +396,7 @@ def _cli():
     p.add_argument('--make_A_comparison', action='store_true', help='Also plot A(r) comparison like TOV (1).py')
     args = p.parse_args()
 
-    solver = TOVSolver(K=args.K, Gamma=args.Gamma, use_isotropic=False)
+    solver = TOVSolver(K=args.K, Gamma=args.Gamma)
     r_grid = np.linspace(0.001, args.r_max, args.num_points)
     sol = solver.solve(rho_central=args.rho_central, r_grid=r_grid, r_max=args.r_max)
 

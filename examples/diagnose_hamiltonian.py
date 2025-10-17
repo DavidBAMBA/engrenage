@@ -27,7 +27,7 @@ from source.matter.hydro.eos import IdealGasEOS
 from source.matter.hydro.atmosphere import AtmosphereParams
 
 from examples.tov_solver import TOVSolver
-from examples.tov_initial_data_adm_bssn import create_initial_data_adm_bssn
+from examples.tov_initial_data_interpolated import create_initial_data_interpolated
 
 
 def compute_hamiltonian_terms(state, grid, background, hydro):
@@ -124,7 +124,7 @@ def main():
     tov_dr_solve = r_max_TOV_solve / tov_num_points_solve
 
     use_iso = False  # USE SCHWARZSCHILD COORDINATES
-    tov_solver = TOVSolver(K=K, Gamma=Gamma, use_isotropic=use_iso)
+    tov_solver = TOVSolver(K=K, Gamma=Gamma)
     tov_solution = tov_solver.solve(rho_central, r_max=r_max_TOV_solve, dr=tov_dr_solve)
 
     R_star = tov_solution['R']
@@ -148,7 +148,7 @@ def main():
 
     # Create initial data
     print("\nCreating initial data...")
-    initial_state = create_initial_data_adm_bssn(
+    initial_state = create_initial_data_interpolated(
         tov_solution, grid, background, eos,
         atmosphere=ATMOSPHERE,
         polytrope_K=K, polytrope_Gamma=Gamma,

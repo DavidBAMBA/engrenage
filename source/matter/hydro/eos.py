@@ -81,16 +81,7 @@ class IdealGasEOS:
         pressure = np.asarray(pressure, dtype=float)
         return -pressure / (self.gamma_minus_1 * rho0**2)
 
-    def temperature(self, rho0, pressure, eps, k_boltzmann: float = 1.0, mass_unit: float = 1.0):
-        """
-        Very rough ideal-gas temperature: P = ρ₀ T / (μ m_u); assume μ m_u = mass_unit.
-        """
-        rho0 = np.asarray(rho0, dtype=float)
-        pressure = np.asarray(pressure, dtype=float)
-        return pressure * mass_unit / (rho0 * k_boltzmann)
-
     # --- Consistency checks ---
-
     def validate_state(self, rho0, pressure, eps):
         """
         Returns (is_valid, message) for arrays or scalars.

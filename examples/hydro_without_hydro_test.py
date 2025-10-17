@@ -62,7 +62,7 @@ from source.matter.hydro.cons2prim import prim_to_cons
 
 # TOV solver
 from examples.tov_solver import TOVSolver
-from examples.tov_initial_data_adm_bssn import create_initial_data_adm_bssn
+from examples.tov_initial_data_interpolated import create_initial_data_interpolated
 
 
 class FrozenFluidHelper:
@@ -395,7 +395,7 @@ def main():
     rho_central = 0.129285  # Central density (NRPy+ value)
 
     # Grid will be set AFTER solving TOV to get stellar radius
-    num_points = 200        # Coarser for testing (NRPy+ uses 72 radial)
+    num_points = 1000        # Coarser for testing (NRPy+ uses 72 radial)
 
     print(f"\nEOS: K={K}, Gamma={Gamma}")
     print(f"Central density: ρ_c={rho_central:.3e}")
@@ -407,18 +407,18 @@ def main():
 
     # Use large temporary domain for TOV solver
     r_max_TOV_solve = 20.0  # Large enough to capture full star
-    tov_num_points_solve = 4000
+    tov_num_points_solve = 1000
     tov_dr_solve = r_max_TOV_solve / tov_num_points_solve
 
     # Use Schwarzschild coordinates
-    tov_solver = TOVSolver(K=K, Gamma=Gamma, use_isotropic=False)
+    tov_solver = TOVSolver(K=K, Gamma=Gamma)
     tov_solution = tov_solver.solve(rho_central, r_max=r_max_TOV_solve, dr=tov_dr_solve)
 
     R_star = tov_solution['R']
     M_star = tov_solution['M_star']
     C_star = tov_solution['C']
 
-    # Set grid domain based on stellar radius (match NRPy+: domain = 2.0 * R_star)
+    # Set grid domain based on stellar radius 
     r_max = 2.0 * R_star
 
     print(f"TOV: M={M_star:.6f}, R={R_star:.6f}, C={C_star:.4f}")
@@ -465,8 +465,8 @@ def main():
     print("  Solving TOV solution...")
     tov_solution = tov_solver.solve(rho_central, r_max=r_max, dr=r_max/4000)
 
-    # Use new ADM→BSSN conversion (with Schwarzschild coordinates)
-    initial_state_2d = create_initial_data_adm_bssn(
+    # Use high-order interpolation + rigorous ADM→BSSN conversion (with Schwarzschild coordinates)
+    initial_state_2d = create_initial_data_interpolated(
         tov_solution, grid, background, eos,
         atmosphere=ATMOSPHERE,
         polytrope_K=K, polytrope_Gamma=Gamma,
