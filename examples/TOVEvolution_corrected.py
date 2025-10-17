@@ -449,11 +449,16 @@ def rk4_step(state_flat, dt, grid, background, hydro, bssn_fixed, bssn_d1_fixed,
 
 
 def evolve_fixed_timestep(state_initial, dt, num_steps, grid, background, hydro,
-                          bssn_fixed, bssn_d1_fixed, atmosphere, method='rk4'):
+                          bssn_fixed, bssn_d1_fixed, atmosphere, method='rk4', t_start=0.0,
+                          reference_state=None, step_offset=0):
     """Evolve with fixed timestep using RK4.
 
     Args:
         atmosphere: AtmosphereParams object
+        t_start: Starting time for this evolution segment (default: 0.0)
+        reference_state: Reference state for error calculation (default: state_initial)
+                        Use this to maintain consistent error measurement across multiple segments
+        step_offset: Offset for step numbering in output (default: 0)
     """
     state_flat = state_initial.flatten()
 
@@ -468,9 +473,11 @@ def evolve_fixed_timestep(state_initial, dt, num_steps, grid, background, hydro,
 
     # Diagnostics at start
     prim_prev, s_prev = primitives_from_state(state_flat)
-    
-    # Store initial state for error calculation
-    prim_initial, s_initial = primitives_from_state(state_initial.flatten())
+
+    # Store reference state for error calculation (use provided reference or current initial)
+    if reference_state is None:
+        reference_state = state_initial
+    prim_initial, s_initial = primitives_from_state(reference_state.flatten())
 
     print("\n===== Evolution diagnostics (per step) =====")
     print("Columns: step | t | ρ_central | max_Δρ/ρ | max_vʳ | max_D | max_Sʳ | max_τ | c2p_fails")
@@ -503,24 +510,25 @@ def evolve_fixed_timestep(state_initial, dt, num_steps, grid, background, hydro,
 
         # Compute more informative stats
         rho_central = float(prim_next['rho0'][NUM_GHOSTS])  # Central density
-        
+
         # Maximum relative density error vs initial state
         rel_rho_err = np.abs(rho_next - rho_init) / (np.abs(rho_init) + 1e-20)
         max_rel_rho_err = float(np.max(rel_rho_err))
-        
+
         # Maximum velocity
         max_abs_v = float(np.max(np.abs(v_next)))
-        
+
         # Maximum conserved variables (more useful than minimum)
         max_D = float(np.max(D_next))
         max_Sr = float(np.max(np.abs(Sr_next)))
         max_tau = float(np.max(np.abs(tau_next)))
-        
+
         # Cons2prim failures
         c2p_fail_count = int(np.sum(~prim_next['success']))
 
-        t_curr = (step + 1) * dt
-        print(f"step {step+1:4d}  t={t_curr:.6e}:  ρ_c={rho_central:.6e}  max_Δρ/ρ={max_rel_rho_err:.3e}  "
+        t_curr = t_start + (step + 1) * dt
+        step_num = step_offset + step + 1
+        print(f"step {step_num:4d}  t={t_curr:.6e}:  ρ_c={rho_central:.6e}  max_Δρ/ρ={max_rel_rho_err:.3e}  "
               f"max_vʳ={max_abs_v:.3e}  max_D={max_D:.3e}  max_Sʳ={max_Sr:.3e}  "
               f"max_τ={max_tau:.3e}  c2p_fail={c2p_fail_count}")
 
@@ -578,7 +586,7 @@ def evolve_fixed_timestep(state_initial, dt, num_steps, grid, background, hydro,
             print("  -> Halting evolution early due to detected instability.")
             state_flat = state_flat_next  # return the last state
             actual_steps = step + 1
-            actual_time = actual_steps * dt
+            actual_time = t_start + actual_steps * dt
             return state_flat.reshape((grid.NUM_VARS, grid.N)), actual_steps, actual_time
 
         # Prepare next step
@@ -587,9 +595,9 @@ def evolve_fixed_timestep(state_initial, dt, num_steps, grid, background, hydro,
 
         # Light progress marker
         if (step + 1) % 20 == 0:
-            print(f"  Step {step+1}/{num_steps} OK  (t={t_curr:.6e})")
+            print(f"  Step {step_num}/{step_offset + num_steps} OK  (t={t_curr:.6e})")
 
-    actual_time = num_steps * dt
+    actual_time = t_start + num_steps * dt
     return state_flat.reshape((grid.NUM_VARS, grid.N)), num_steps, actual_time
 
 
@@ -696,9 +704,150 @@ def plot_tov_diagnostics(tov_solution, r_max):
 ## plot_initial_comparison moved to examples/tov_initial_data.py
 
 
-def plot_evolution(state_t0, state_t1, state_t100, state_t10000, grid, hydro, 
-                   t_1, t_100, t_10000):
-    """Plot evolution snapshots with actual times reached."""
+def plot_bssn_evolution(state_t0, state_tfinal, grid, t_0=0.0, t_final=1.0):
+    """Plot BSSN variables at initial and final time to verify Cowling approximation.
+
+    In Cowling approximation, BSSN variables should remain constant.
+    This plot helps verify that the spacetime is indeed frozen.
+
+    Args:
+        state_t0: Initial state
+        state_tfinal: Final state
+        grid: Grid object
+        t_0: Initial time (for labeling)
+        t_final: Final time (for labeling)
+    """
+    r_int = grid.r[NUM_GHOSTS:-NUM_GHOSTS]
+
+    fig, axes = plt.subplots(3, 3, figsize=(16, 14))
+
+    # Row 1: Conformal factor φ, Lapse α, Trace of extrinsic curvature K
+    # φ
+    axes[0, 0].plot(r_int, state_t0[idx_phi, NUM_GHOSTS:-NUM_GHOSTS], 'b-', linewidth=2, label=f't={t_0:.6e}')
+    axes[0, 0].plot(r_int, state_tfinal[idx_phi, NUM_GHOSTS:-NUM_GHOSTS], 'r--', linewidth=1.7, label=f't={t_final:.6e}')
+    axes[0, 0].set_xlabel('r')
+    axes[0, 0].set_ylabel(r'$\phi$')
+    axes[0, 0].set_title('Conformal Factor')
+    axes[0, 0].legend()
+    axes[0, 0].grid(True, alpha=0.3)
+
+    # α
+    axes[0, 1].plot(r_int, state_t0[idx_lapse, NUM_GHOSTS:-NUM_GHOSTS], 'b-', linewidth=2, label=f't={t_0:.6e}')
+    axes[0, 1].plot(r_int, state_tfinal[idx_lapse, NUM_GHOSTS:-NUM_GHOSTS], 'r--', linewidth=1.7, label=f't={t_final:.6e}')
+    axes[0, 1].set_xlabel('r')
+    axes[0, 1].set_ylabel(r'$\alpha$')
+    axes[0, 1].set_title('Lapse Function')
+    axes[0, 1].legend()
+    axes[0, 1].grid(True, alpha=0.3)
+
+    # K
+    axes[0, 2].plot(r_int, state_t0[idx_K, NUM_GHOSTS:-NUM_GHOSTS], 'b-', linewidth=2, label=f't={t_0:.6e}')
+    axes[0, 2].plot(r_int, state_tfinal[idx_K, NUM_GHOSTS:-NUM_GHOSTS], 'r--', linewidth=1.7, label=f't={t_final:.6e}')
+    axes[0, 2].set_xlabel('r')
+    axes[0, 2].set_ylabel(r'$K$')
+    axes[0, 2].set_title('Trace of Extrinsic Curvature')
+    axes[0, 2].legend()
+    axes[0, 2].grid(True, alpha=0.3)
+
+    # Row 2: Conformal metric components h_rr, h_θθ, h_φφ
+    # h_rr
+    axes[1, 0].plot(r_int, state_t0[idx_hrr, NUM_GHOSTS:-NUM_GHOSTS], 'b-', linewidth=2, label=f't={t_0:.6e}')
+    axes[1, 0].plot(r_int, state_tfinal[idx_hrr, NUM_GHOSTS:-NUM_GHOSTS], 'r--', linewidth=1.7, label=f't={t_final:.6e}')
+    axes[1, 0].set_xlabel('r')
+    axes[1, 0].set_ylabel(r'$h_{rr}$')
+    axes[1, 0].set_title('Conformal Metric $h_{rr}$')
+    axes[1, 0].legend()
+    axes[1, 0].grid(True, alpha=0.3)
+
+    # h_θθ
+    axes[1, 1].plot(r_int, state_t0[idx_htt, NUM_GHOSTS:-NUM_GHOSTS], 'b-', linewidth=2, label=f't={t_0:.6e}')
+    axes[1, 1].plot(r_int, state_tfinal[idx_htt, NUM_GHOSTS:-NUM_GHOSTS], 'r--', linewidth=1.7, label=f't={t_final:.6e}')
+    axes[1, 1].set_xlabel('r')
+    axes[1, 1].set_ylabel(r'$h_{\theta\theta}$')
+    axes[1, 1].set_title(r'Conformal Metric $h_{\theta\theta}$')
+    axes[1, 1].legend()
+    axes[1, 1].grid(True, alpha=0.3)
+
+    # h_φφ
+    axes[1, 2].plot(r_int, state_t0[idx_hpp, NUM_GHOSTS:-NUM_GHOSTS], 'b-', linewidth=2, label=f't={t_0:.6e}')
+    axes[1, 2].plot(r_int, state_tfinal[idx_hpp, NUM_GHOSTS:-NUM_GHOSTS], 'r--', linewidth=1.7, label=f't={t_final:.6e}')
+    axes[1, 2].set_xlabel('r')
+    axes[1, 2].set_ylabel(r'$h_{\phi\phi}$')
+    axes[1, 2].set_title(r'Conformal Metric $h_{\phi\phi}$')
+    axes[1, 2].legend()
+    axes[1, 2].grid(True, alpha=0.3)
+
+    # Row 3: Traceless extrinsic curvature components A_rr, A_θθ, A_φφ
+    # A_rr
+    axes[2, 0].plot(r_int, state_t0[idx_arr, NUM_GHOSTS:-NUM_GHOSTS], 'b-', linewidth=2, label=f't={t_0:.6e}')
+    axes[2, 0].plot(r_int, state_tfinal[idx_arr, NUM_GHOSTS:-NUM_GHOSTS], 'r--', linewidth=1.7, label=f't={t_final:.6e}')
+    axes[2, 0].set_xlabel('r')
+    axes[2, 0].set_ylabel(r'$A_{rr}$')
+    axes[2, 0].set_title('Traceless Extrinsic Curvature $A_{rr}$')
+    axes[2, 0].legend()
+    axes[2, 0].grid(True, alpha=0.3)
+
+    # A_θθ
+    axes[2, 1].plot(r_int, state_t0[idx_att, NUM_GHOSTS:-NUM_GHOSTS], 'b-', linewidth=2, label=f't={t_0:.6e}')
+    axes[2, 1].plot(r_int, state_tfinal[idx_att, NUM_GHOSTS:-NUM_GHOSTS], 'r--', linewidth=1.7, label=f't={t_final:.6e}')
+    axes[2, 1].set_xlabel('r')
+    axes[2, 1].set_ylabel(r'$A_{\theta\theta}$')
+    axes[2, 1].set_title(r'Traceless Extrinsic Curvature $A_{\theta\theta}$')
+    axes[2, 1].legend()
+    axes[2, 1].grid(True, alpha=0.3)
+
+    # A_φφ
+    axes[2, 2].plot(r_int, state_t0[idx_app, NUM_GHOSTS:-NUM_GHOSTS], 'b-', linewidth=2, label=f't={t_0:.6e}')
+    axes[2, 2].plot(r_int, state_tfinal[idx_app, NUM_GHOSTS:-NUM_GHOSTS], 'r--', linewidth=1.7, label=f't={t_final:.6e}')
+    axes[2, 2].set_xlabel('r')
+    axes[2, 2].set_ylabel(r'$A_{\phi\phi}$')
+    axes[2, 2].set_title(r'Traceless Extrinsic Curvature $A_{\phi\phi}$')
+    axes[2, 2].legend()
+    axes[2, 2].grid(True, alpha=0.3)
+
+    plt.suptitle(f'BSSN Variables Evolution (Cowling Approximation)\nt={t_0:.6e} → t={t_final:.6e}',
+                 fontsize=14, y=0.995)
+    plt.tight_layout()
+    plt.savefig('tov_bssn_evolution.png', dpi=150, bbox_inches='tight')
+    plt.close(fig)
+
+    # Compute and print maximum changes to verify Cowling approximation
+    print("\n" + "="*70)
+    print("BSSN VARIABLES VERIFICATION (Cowling Approximation)")
+    print("="*70)
+    print("Maximum absolute changes (should be ~0 for frozen spacetime):\n")
+
+    interior = slice(NUM_GHOSTS, -NUM_GHOSTS)
+
+    def max_change(var_idx, var_name):
+        change = np.abs(state_tfinal[var_idx, interior] - state_t0[var_idx, interior])
+        max_val = np.max(np.abs(state_t0[var_idx, interior]))
+        max_abs_change = np.max(change)
+        max_rel_change = max_abs_change / (max_val + 1e-30)
+        print(f"  {var_name:10s}: max |Δ| = {max_abs_change:.6e}  max |Δ/val| = {max_rel_change:.6e}")
+        return max_abs_change
+
+    max_change(idx_phi, 'φ')
+    max_change(idx_lapse, 'α')
+    max_change(idx_K, 'K')
+    max_change(idx_hrr, 'h_rr')
+    max_change(idx_htt, 'h_θθ')
+    max_change(idx_hpp, 'h_φφ')
+    max_change(idx_arr, 'A_rr')
+    max_change(idx_att, 'A_θθ')
+    max_change(idx_app, 'A_φφ')
+
+    print("="*70 + "\n")
+
+
+def plot_evolution(state_t0, state_t1, state_t100, state_t10000, grid, hydro,
+                   t_1, t_100, t_10000, label_100='t_100', label_10000='t_final'):
+    """Plot evolution snapshots with actual times reached.
+
+    Args:
+        label_100: Label for third snapshot (may be same as t_10000 if not enough steps)
+        label_10000: Label for fourth snapshot
+    """
     bssn_0 = BSSNVars(grid.N)
     bssn_0.set_bssn_vars(state_t0[:NUM_BSSN_VARS, :])
     hydro.set_matter_vars(state_t0, bssn_0, grid)
@@ -725,9 +874,10 @@ def plot_evolution(state_t0, state_t1, state_t100, state_t10000, grid, hydro,
 
     # Density
     axes[0, 0].plot(r_int, prim_0['rho0'][NUM_GHOSTS:-NUM_GHOSTS], 'b-', linewidth=2, label='t=0')
-    axes[0, 0].plot(r_int, prim_1['rho0'][NUM_GHOSTS:-NUM_GHOSTS], 'orange', linestyle='--', linewidth=1.5, label=f't={t_1:.4f}')
-    axes[0, 0].plot(r_int, prim_100['rho0'][NUM_GHOSTS:-NUM_GHOSTS], 'green', linestyle='-.', linewidth=1.5, label=f't={t_100:.4f}')
-    axes[0, 0].plot(r_int, prim_10000['rho0'][NUM_GHOSTS:-NUM_GHOSTS], 'red', linestyle=':', linewidth=1.5, label=f't={t_10000:.4f}')
+    axes[0, 0].plot(r_int, prim_1['rho0'][NUM_GHOSTS:-NUM_GHOSTS], 'orange', linestyle='--', linewidth=1.5, label=f't={t_1:.6e}')
+    if t_100 != t_10000:  # Only plot if different from final
+        axes[0, 0].plot(r_int, prim_100['rho0'][NUM_GHOSTS:-NUM_GHOSTS], 'green', linestyle='-.', linewidth=1.5, label=f'{label_100}={t_100:.6e}')
+    axes[0, 0].plot(r_int, prim_10000['rho0'][NUM_GHOSTS:-NUM_GHOSTS], 'red', linestyle=':', linewidth=1.5, label=f'{label_10000}={t_10000:.6e}')
     axes[0, 0].set_xlabel('r')
     axes[0, 0].set_ylabel(r'$\rho_0$')
     axes[0, 0].set_title('Baryon Density Evolution')
@@ -737,9 +887,10 @@ def plot_evolution(state_t0, state_t1, state_t100, state_t10000, grid, hydro,
 
     # Pressure
     axes[0, 1].plot(r_int, np.maximum(prim_0['p'][NUM_GHOSTS:-NUM_GHOSTS], 1e-20), 'b-', linewidth=2, label='t=0')
-    axes[0, 1].plot(r_int, np.maximum(prim_1['p'][NUM_GHOSTS:-NUM_GHOSTS], 1e-20), 'orange', linestyle='--', linewidth=1.5, label=f't={t_1:.4f}')
-    axes[0, 1].plot(r_int, np.maximum(prim_100['p'][NUM_GHOSTS:-NUM_GHOSTS], 1e-20), 'green', linestyle='-.', linewidth=1.5, label=f't={t_100:.4f}')
-    axes[0, 1].plot(r_int, np.maximum(prim_10000['p'][NUM_GHOSTS:-NUM_GHOSTS], 1e-20), 'red', linestyle=':', linewidth=1.5, label=f't={t_10000:.4f}')
+    axes[0, 1].plot(r_int, np.maximum(prim_1['p'][NUM_GHOSTS:-NUM_GHOSTS], 1e-20), 'orange', linestyle='--', linewidth=1.5, label=f't={t_1:.6e}')
+    if t_100 != t_10000:
+        axes[0, 1].plot(r_int, np.maximum(prim_100['p'][NUM_GHOSTS:-NUM_GHOSTS], 1e-20), 'green', linestyle='-.', linewidth=1.5, label=f'{label_100}={t_100:.6e}')
+    axes[0, 1].plot(r_int, np.maximum(prim_10000['p'][NUM_GHOSTS:-NUM_GHOSTS], 1e-20), 'red', linestyle=':', linewidth=1.5, label=f'{label_10000}={t_10000:.6e}')
     axes[0, 1].set_xlabel('r')
     axes[0, 1].set_ylabel('P')
     axes[0, 1].set_title('Pressure Evolution')
@@ -748,9 +899,10 @@ def plot_evolution(state_t0, state_t1, state_t100, state_t10000, grid, hydro,
 
     # Velocity
     axes[1, 0].plot(r_int, prim_0['vr'][NUM_GHOSTS:-NUM_GHOSTS], 'b-', linewidth=2, label='t=0')
-    axes[1, 0].plot(r_int, prim_1['vr'][NUM_GHOSTS:-NUM_GHOSTS], 'orange', linestyle='--', linewidth=1.5, label=f't={t_1:.4f}')
-    axes[1, 0].plot(r_int, prim_100['vr'][NUM_GHOSTS:-NUM_GHOSTS], 'green', linestyle='-.', linewidth=1.5, label=f't={t_100:.4f}')
-    axes[1, 0].plot(r_int, prim_10000['vr'][NUM_GHOSTS:-NUM_GHOSTS], 'red', linestyle=':', linewidth=1.5, label=f't={t_10000:.4f}')
+    axes[1, 0].plot(r_int, prim_1['vr'][NUM_GHOSTS:-NUM_GHOSTS], 'orange', linestyle='--', linewidth=1.5, label=f't={t_1:.6e}')
+    if t_100 != t_10000:
+        axes[1, 0].plot(r_int, prim_100['vr'][NUM_GHOSTS:-NUM_GHOSTS], 'green', linestyle='-.', linewidth=1.5, label=f'{label_100}={t_100:.6e}')
+    axes[1, 0].plot(r_int, prim_10000['vr'][NUM_GHOSTS:-NUM_GHOSTS], 'red', linestyle=':', linewidth=1.5, label=f'{label_10000}={t_10000:.6e}')
     axes[1, 0].set_xlabel('r')
     axes[1, 0].set_ylabel(r'$v^r$')
     axes[1, 0].set_title('Radial Velocity Evolution')
@@ -762,9 +914,10 @@ def plot_evolution(state_t0, state_t1, state_t100, state_t10000, grid, hydro,
     delta_rho_100 = np.abs(prim_100['rho0'][NUM_GHOSTS:-NUM_GHOSTS] - prim_0['rho0'][NUM_GHOSTS:-NUM_GHOSTS]) / (np.abs(prim_0['rho0'][NUM_GHOSTS:-NUM_GHOSTS]) + 1e-20)
     delta_rho_10000 = np.abs(prim_10000['rho0'][NUM_GHOSTS:-NUM_GHOSTS] - prim_0['rho0'][NUM_GHOSTS:-NUM_GHOSTS]) / (np.abs(prim_0['rho0'][NUM_GHOSTS:-NUM_GHOSTS]) + 1e-20)
 
-    axes[1, 1].semilogy(r_int, delta_rho_1, 'orange', linestyle='--', linewidth=1.5, label=f't={t_1:.4f}')
-    axes[1, 1].semilogy(r_int, delta_rho_100, 'green', linestyle='-.', linewidth=1.5, label=f't={t_100:.4f}')
-    axes[1, 1].semilogy(r_int, delta_rho_10000, 'red', linestyle=':', linewidth=1.5, label=f't={t_10000:.4f}')
+    axes[1, 1].semilogy(r_int, delta_rho_1, 'orange', linestyle='--', linewidth=1.5, label=f't={t_1:.6e}')
+    if t_100 != t_10000:
+        axes[1, 1].semilogy(r_int, delta_rho_100, 'green', linestyle='-.', linewidth=1.5, label=f'{label_100}={t_100:.6e}')
+    axes[1, 1].semilogy(r_int, delta_rho_10000, 'red', linestyle=':', linewidth=1.5, label=f'{label_10000}={t_10000:.6e}')
     axes[1, 1].set_xlabel('r')
     axes[1, 1].set_ylabel(r'$|\Delta\rho|/\rho$')
     axes[1, 1].set_title('Relative Density Error')
@@ -773,9 +926,10 @@ def plot_evolution(state_t0, state_t1, state_t100, state_t10000, grid, hydro,
 
     # Lapse function (alpha)
     axes[2, 0].plot(r_int, state_t0[idx_lapse, NUM_GHOSTS:-NUM_GHOSTS], 'b-', linewidth=2, label='t=0')
-    axes[2, 0].plot(r_int, state_t1[idx_lapse, NUM_GHOSTS:-NUM_GHOSTS], 'orange', linestyle='--', linewidth=1.5, label=f't={t_1:.4f}')
-    axes[2, 0].plot(r_int, state_t100[idx_lapse, NUM_GHOSTS:-NUM_GHOSTS], 'green', linestyle='-.', linewidth=1.5, label=f't={t_100:.4f}')
-    axes[2, 0].plot(r_int, state_t10000[idx_lapse, NUM_GHOSTS:-NUM_GHOSTS], 'red', linestyle=':', linewidth=1.5, label=f't={t_10000:.4f}')
+    axes[2, 0].plot(r_int, state_t1[idx_lapse, NUM_GHOSTS:-NUM_GHOSTS], 'orange', linestyle='--', linewidth=1.5, label=f't={t_1:.6e}')
+    if t_100 != t_10000:
+        axes[2, 0].plot(r_int, state_t100[idx_lapse, NUM_GHOSTS:-NUM_GHOSTS], 'green', linestyle='-.', linewidth=1.5, label=f'{label_100}={t_100:.6e}')
+    axes[2, 0].plot(r_int, state_t10000[idx_lapse, NUM_GHOSTS:-NUM_GHOSTS], 'red', linestyle=':', linewidth=1.5, label=f'{label_10000}={t_10000:.6e}')
     axes[2, 0].set_xlabel('r')
     axes[2, 0].set_ylabel(r'$\alpha$')
     axes[2, 0].set_title('Lapse Function Evolution')
@@ -784,16 +938,17 @@ def plot_evolution(state_t0, state_t1, state_t100, state_t10000, grid, hydro,
 
     # Conformal factor (phi)
     axes[2, 1].plot(r_int, state_t0[idx_phi, NUM_GHOSTS:-NUM_GHOSTS], 'b-', linewidth=2, label='t=0')
-    axes[2, 1].plot(r_int, state_t1[idx_phi, NUM_GHOSTS:-NUM_GHOSTS], 'orange', linestyle='--', linewidth=1.5, label=f't={t_1:.4f}')
-    axes[2, 1].plot(r_int, state_t100[idx_phi, NUM_GHOSTS:-NUM_GHOSTS], 'green', linestyle='-.', linewidth=1.5, label=f't={t_100:.4f}')
-    axes[2, 1].plot(r_int, state_t10000[idx_phi, NUM_GHOSTS:-NUM_GHOSTS], 'red', linestyle=':', linewidth=1.5, label=f't={t_10000:.4f}')
+    axes[2, 1].plot(r_int, state_t1[idx_phi, NUM_GHOSTS:-NUM_GHOSTS], 'orange', linestyle='--', linewidth=1.5, label=f't={t_1:.6e}')
+    if t_100 != t_10000:
+        axes[2, 1].plot(r_int, state_t100[idx_phi, NUM_GHOSTS:-NUM_GHOSTS], 'green', linestyle='-.', linewidth=1.5, label=f'{label_100}={t_100:.6e}')
+    axes[2, 1].plot(r_int, state_t10000[idx_phi, NUM_GHOSTS:-NUM_GHOSTS], 'red', linestyle=':', linewidth=1.5, label=f'{label_10000}={t_10000:.6e}')
     axes[2, 1].set_xlabel('r')
     axes[2, 1].set_ylabel(r'$\phi$')
     axes[2, 1].set_title('Conformal Factor Evolution')
     axes[2, 1].legend()
     axes[2, 1].grid(True, alpha=0.3)
 
-    plt.suptitle(f'Evolution: t=0 → t={t_1:.4f} → t={t_100:.4f} → t={t_10000:.4f}', fontsize=14, y=0.995)
+    plt.suptitle(f'Evolution: t=0 → t={t_1:.6e} → {label_100}={t_100:.6e} → {label_10000}={t_10000:.6e}', fontsize=14, y=0.995)
     plt.tight_layout()
     plt.savefig('tov_evolution.png', dpi=150, bbox_inches='tight')
     plt.close(fig)
@@ -851,7 +1006,7 @@ def main():
         eos=eos,
         spacetime_mode="dynamic",
         atmosphere=ATMOSPHERE,  
-        reconstructor=create_reconstruction("minmod"),
+        reconstructor=create_reconstruction("wenoz"),
         riemann_solver=HLLERiemannSolver()
     )
 
@@ -914,7 +1069,7 @@ def main():
 
     if integration_method == 'fixed':
         dt = 0.15 * grid.min_dr  # CFL condition
-        num_steps_total = 1000
+        num_steps_total = 40000
         print(f"\nEvolving with fixed dt={dt:.6f} (CFL=0.1) for {num_steps_total} steps using RK4")
 
         # Single step for comparison
@@ -935,17 +1090,20 @@ def main():
         # Evolve incrementally to intermediate checkpoint
         print(f"\nEvolving to step {checkpoint_mid}...")
         state_t100, steps_100, t_100 = evolve_fixed_timestep(initial_state_2d, dt, checkpoint_mid, grid, background,
-                                                              hydro, bssn_fixed, bssn_d1_fixed, ATMOSPHERE, method='rk4')
+                                                              hydro, bssn_fixed, bssn_d1_fixed, ATMOSPHERE, method='rk4',
+                                                              reference_state=initial_state_2d)
         print(f"  -> Reached step {steps_100}, t={t_100:.6e}")
-        
+
         # Continue evolution to num_steps_total (or until it breaks)
         if num_steps_total > checkpoint_mid and steps_100 == checkpoint_mid:
             remaining_steps = num_steps_total - checkpoint_mid
             print(f"\nContinuing evolution from step {checkpoint_mid} to {num_steps_total} ({remaining_steps} more steps)...")
-            state_tfinal, steps_more, t_more = evolve_fixed_timestep(state_t100, dt, remaining_steps, grid, background,
-                                                                      hydro, bssn_fixed, bssn_d1_fixed, ATMOSPHERE, method='rk4')
-            t_final = t_100 + t_more
-            steps_final = steps_100 + steps_more
+            state_tfinal, steps_more, t_final = evolve_fixed_timestep(state_t100, dt, remaining_steps, grid, background,
+                                                                      hydro, bssn_fixed, bssn_d1_fixed, ATMOSPHERE, method='rk4',
+                                                                      t_start=t_100, reference_state=initial_state_2d,
+                                                                      step_offset=checkpoint_mid)
+            # t_final already includes t_start from evolve_fixed_timestep
+            steps_final = checkpoint_mid + steps_more
             print(f"  -> Reached step {steps_final}, t={t_final:.6e}")
         else:
             # Evolution stopped early at checkpoint, or checkpoint == total
@@ -985,8 +1143,26 @@ def main():
     # ==================================================================
     # DIAGNOSTICS
     # ==================================================================
-    plot_evolution(initial_state_2d, state_t1, state_t100, state_t10000, grid, hydro, 
-                   t_1, t_100, t_10000)
+    # Determine labels for plotting based on actual evolution
+    if integration_method == 'fixed':
+        # For fixed timestep: use step numbers for clarity
+        if t_100 == t_10000:
+            # Same state (evolution stopped early or only ran to checkpoint)
+            label_100 = f't(step={steps_final})'
+            label_10000 = f't(step={steps_final})'
+        else:
+            label_100 = f't(step={steps_100})'
+            label_10000 = f't(step={steps_final})'
+    else:
+        # For adaptive timestep: use time labels
+        label_100 = 't_mid'
+        label_10000 = 't_final'
+
+    plot_evolution(initial_state_2d, state_t1, state_t100, state_t10000, grid, hydro,
+                   t_1, t_100, t_10000, label_100=label_100, label_10000=label_10000)
+
+    # Plot BSSN variables evolution to verify Cowling approximation
+    plot_bssn_evolution(initial_state_2d, state_t10000, grid, t_0=0.0, t_final=t_10000)
 
     # Print detailed statistics
     bssn_0 = BSSNVars(grid.N)
@@ -1036,41 +1212,47 @@ def main():
     growth_P = max_err_P_10000 / max_err_P_1 if max_err_P_1 > 1e-15 else 0
 
     print(f"\n{'='*70}")
-    print(f"EVOLUTION DIAGNOSTICS (t=0 → t={t_1:.4f} → t={t_100:.4f} → t={t_10000:.4f})")
+    print(f"EVOLUTION DIAGNOSTICS (t=0 → t={t_1:.6e} → t={t_100:.6e} → t={t_10000:.6e})")
     print(f"{'='*70}")
 
     print(f"\n1. VELOCITY EVOLUTION:")
-    print(f"   Max |v^r| at t=0:           {np.max(np.abs(prim_0['vr'])):.3e}")
-    print(f"   Max |v^r| at t={t_1:.4f}:   {np.max(np.abs(prim_1['vr'])):.3e}")
-    print(f"   Max |v^r| at t={t_100:.4f}:   {np.max(np.abs(prim_100['vr'])):.3e}")
-    print(f"   Max |v^r| at t={t_10000:.4f}: {np.max(np.abs(prim_10000['vr'])):.3e}")
+    print(f"   Max |v^r| at t=0:             {np.max(np.abs(prim_0['vr'])):.3e}")
+    print(f"   Max |v^r| at t={t_1:.6e}:   {np.max(np.abs(prim_1['vr'])):.3e}")
+    if t_100 != t_10000:
+        print(f"   Max |v^r| at t={t_100:.6e}:   {np.max(np.abs(prim_100['vr'])):.3e}")
+    print(f"   Max |v^r| at t={t_10000:.6e}: {np.max(np.abs(prim_10000['vr'])):.3e}")
 
     print(f"\n2. CENTRAL DENSITY:")
-    print(f"   ρ_c at t=0:           {prim_0['rho0'][NUM_GHOSTS]:.6e}")
-    print(f"   ρ_c at t={t_1:.4f}:   {prim_1['rho0'][NUM_GHOSTS]:.6e}")
-    print(f"   ρ_c at t={t_100:.4f}:   {prim_100['rho0'][NUM_GHOSTS]:.6e}")
-    print(f"   ρ_c at t={t_10000:.4f}: {prim_10000['rho0'][NUM_GHOSTS]:.6e}")
-    print(f"   Δρ_c/ρ_c (t={t_1:.4f}):    {abs(prim_1['rho0'][NUM_GHOSTS] - prim_0['rho0'][NUM_GHOSTS])/prim_0['rho0'][NUM_GHOSTS]:.3e}")
-    print(f"   Δρ_c/ρ_c (t={t_100:.4f}):  {abs(prim_100['rho0'][NUM_GHOSTS] - prim_0['rho0'][NUM_GHOSTS])/prim_0['rho0'][NUM_GHOSTS]:.3e}")
-    print(f"   Δρ_c/ρ_c (t={t_10000:.4f}):{abs(prim_10000['rho0'][NUM_GHOSTS] - prim_0['rho0'][NUM_GHOSTS])/prim_0['rho0'][NUM_GHOSTS]:.3e}")
+    print(f"   ρ_c at t=0:                 {prim_0['rho0'][NUM_GHOSTS]:.6e}")
+    print(f"   ρ_c at t={t_1:.6e}:   {prim_1['rho0'][NUM_GHOSTS]:.6e}")
+    if t_100 != t_10000:
+        print(f"   ρ_c at t={t_100:.6e}:   {prim_100['rho0'][NUM_GHOSTS]:.6e}")
+    print(f"   ρ_c at t={t_10000:.6e}: {prim_10000['rho0'][NUM_GHOSTS]:.6e}")
+    print(f"   Δρ_c/ρ_c (t={t_1:.6e}):    {abs(prim_1['rho0'][NUM_GHOSTS] - prim_0['rho0'][NUM_GHOSTS])/prim_0['rho0'][NUM_GHOSTS]:.3e}")
+    if t_100 != t_10000:
+        print(f"   Δρ_c/ρ_c (t={t_100:.6e}):  {abs(prim_100['rho0'][NUM_GHOSTS] - prim_0['rho0'][NUM_GHOSTS])/prim_0['rho0'][NUM_GHOSTS]:.3e}")
+    print(f"   Δρ_c/ρ_c (t={t_10000:.6e}):{abs(prim_10000['rho0'][NUM_GHOSTS] - prim_0['rho0'][NUM_GHOSTS])/prim_0['rho0'][NUM_GHOSTS]:.3e}")
 
     print(f"\n3. DENSITY ERROR (max over domain):")
-    print(f"   Max |Δρ|/ρ at t={t_1:.4f}:    {max_err_rho_1:.3e}")
-    print(f"   Max |Δρ|/ρ at t={t_100:.4f}:  {max_err_rho_100:.3e}")
-    print(f"   Max |Δρ|/ρ at t={t_10000:.4f}: {max_err_rho_10000:.3e}")
-    print(f"   Growth factor (final/1):      {growth_rho:.1f}x")
+    print(f"   Max |Δρ|/ρ at t={t_1:.6e}:    {max_err_rho_1:.3e}")
+    if t_100 != t_10000:
+        print(f"   Max |Δρ|/ρ at t={t_100:.6e}:  {max_err_rho_100:.3e}")
+    print(f"   Max |Δρ|/ρ at t={t_10000:.6e}: {max_err_rho_10000:.3e}")
+    print(f"   Growth factor (final/1):        {growth_rho:.1f}x")
 
     print(f"\n4. PRESSURE ERROR (max over domain):")
-    print(f"   Max |ΔP|/P at t={t_1:.4f}:    {max_err_P_1:.3e}")
-    print(f"   Max |ΔP|/P at t={t_100:.4f}:  {max_err_P_100:.3e}")
-    print(f"   Max |ΔP|/P at t={t_10000:.4f}: {max_err_P_10000:.3e}")
-    print(f"   Growth factor (final/1):      {growth_P:.1f}x")
+    print(f"   Max |ΔP|/P at t={t_1:.6e}:    {max_err_P_1:.3e}")
+    if t_100 != t_10000:
+        print(f"   Max |ΔP|/P at t={t_100:.6e}:  {max_err_P_100:.3e}")
+    print(f"   Max |ΔP|/P at t={t_10000:.6e}: {max_err_P_10000:.3e}")
+    print(f"   Growth factor (final/1):        {growth_P:.1f}x")
 
     print(f"\n5. CONS2PRIM STATUS:")
-    print(f"   Success at t=0:           {np.sum(prim_0['success'])}/{grid.N}")
-    print(f"   Success at t={t_1:.4f}:   {np.sum(prim_1['success'])}/{grid.N}")
-    print(f"   Success at t={t_100:.4f}:   {np.sum(prim_100['success'])}/{grid.N}")
-    print(f"   Success at t={t_10000:.4f}: {np.sum(prim_10000['success'])}/{grid.N}")
+    print(f"   Success at t=0:               {np.sum(prim_0['success'])}/{grid.N}")
+    print(f"   Success at t={t_1:.6e}:   {np.sum(prim_1['success'])}/{grid.N}")
+    if t_100 != t_10000:
+        print(f"   Success at t={t_100:.6e}:   {np.sum(prim_100['success'])}/{grid.N}")
+    print(f"   Success at t={t_10000:.6e}: {np.sum(prim_10000['success'])}/{grid.N}")
 
     if not np.all(prim_10000['success']):
         failed_idx = np.where(~prim_10000['success'])[0]
@@ -1079,9 +1261,13 @@ def main():
 
     print("\n" + "="*70)
     print("Evolution complete. Plots saved:")
-    print("  1. tov_solution.png              - TOV solution (ρ, P, M, α)")
+    print("  1. tov_solution.png                - TOV solution (ρ, P, M, α)")
     print("  2. tov_initial_data_comparison.png - TOV vs Initial data at t=0")
-    print(f"  3. tov_evolution.png             - Evolution: t=0 → t={t_1:.4f} → t={t_100:.4f} → t={t_10000:.4f}")
+    if t_100 != t_10000:
+        print(f"  3. tov_evolution.png               - Hydro evolution: t=0 → t={t_1:.6e} → t={t_100:.6e} → t={t_10000:.6e}")
+    else:
+        print(f"  3. tov_evolution.png               - Hydro evolution: t=0 → t={t_1:.6e} → t={t_10000:.6e}")
+    print(f"  4. tov_bssn_evolution.png          - BSSN variables: t=0 → t={t_10000:.6e} (Cowling check)")
     print("="*70)
 
 
