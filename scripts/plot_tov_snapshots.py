@@ -43,7 +43,7 @@ from source.bssn.bssnstatevariables import NUM_BSSN_VARS
 from source.matter.hydro.perfect_fluid import PerfectFluid
 from source.matter.hydro.eos import IdealGasEOS
 from source.matter.hydro.reconstruction import create_reconstruction
-from source.matter.hydro.riemann import HLLERiemannSolver
+from source.matter.hydro.riemann import HLLRiemannSolver
 
 
 SNAP_RE = re.compile(r"state_t([0-9]+(?:\.[0-9]+)?)\.npy$")
@@ -70,7 +70,7 @@ def build_grid_for_snapshot(N: int, r_max: float, spacing: str = 'linear') -> Gr
         eos=IdealGasEOS(gamma=2.0),
         spacetime_mode='dynamic',
         reconstructor=create_reconstruction('mp5'),
-        riemann_solver=HLLERiemannSolver(),
+        riemann_solver=HLLRiemannSolver(),
     )
     # Choose spacing
     if spacing == 'cubic':

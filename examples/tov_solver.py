@@ -14,7 +14,13 @@ from scipy.integrate import ode
 
 
 class TOVSolver:
-    """TOV solver in Schwarzschild coordinates."""
+    """TOV solver in Schwarzschild coordinates.
+
+    Supports two solve modes:
+    - Grid-driven: provide r_grid to sample the solution exactly at those radii.
+    - Adaptive-step (NRPy+-style): no r_grid provided; an ODE integrator advances with an
+      adaptively-updated target step based on local derivatives, then extends to r_max.
+    """
 
     def __init__(self, K, Gamma):
         self.K = K
@@ -71,15 +77,20 @@ class TOVSolver:
 
         return np.array([dP_dr, dnu_dr, dM_dr])
 
-    def solve(self, rho_central, r_grid=None, r_max=20.0, dr=0.0001):
+    def solve(self, rho_central, r_grid=None, r_max=20.0,
+              accuracy: str = "high", integrator_type: str = "default",
+              dr: float = 1.0e-4):
         """
         Solve TOV equations.
 
         Args:
             rho_central: Central baryon density
-            r_grid: Optional radial grid to interpolate onto
+            r_grid: Optional radial grid to sample the solution on (grid-driven mode)
             r_max: Maximum radius
-            dr: Step size (if r_grid not provided)
+            accuracy: Adaptive-step presets ("verylow", "low", "medium", "high", "veryhigh")
+            integrator_type: Force specific integrator (default uses preset)
+            dr: Deprecated fixed step (kept for backward compatibility); superseded by
+                adaptive-step presets if r_grid is None.
 
         Returns:
             dict with solution arrays
@@ -88,7 +99,37 @@ class TOVSolver:
         nu_c = 0.0
         M_c = 0.0
 
-        solver = ode(self.tov_rhs).set_integrator('dopri5')
+        # Choose integrator & step presets
+        if accuracy == "medium":
+            min_step_size = 1e-5
+            max_step_size = 1e-2
+            integrator = 'dop853'
+        elif accuracy == "low":
+            min_step_size = 1e-3
+            max_step_size = 1e-1
+            integrator = 'dopri5'
+        elif accuracy == "verylow":
+            min_step_size = 1e-1
+            max_step_size = 5e-1
+            integrator = 'dopri5'
+        elif accuracy == "high":
+            min_step_size = 1e-5
+            max_step_size = 1e-5
+            integrator = 'dop853'
+        elif accuracy == "veryhigh":
+            min_step_size = 1e-7
+            max_step_size = 1e-6
+            integrator = 'dop853'
+        else:
+            # Fallback to sensible defaults
+            min_step_size = 1e-5
+            max_step_size = 1e-2
+            integrator = 'dop853'
+
+        if integrator_type != "default":
+            integrator = integrator_type
+
+        solver = ode(self.tov_rhs).set_integrator(integrator)
         solver.set_initial_value([P_c, nu_c, M_c], 0.0001)
 
         if r_grid is not None:
@@ -150,25 +191,48 @@ class TOVSolver:
             nu_arr = np.array(nu_arr)
             M_arr = np.array(M_arr)
         else:
-            # Integrate with adaptive step
             r_schw_arr = [0.001]
             P_arr = [P_c]
             nu_arr = [nu_c]
             M_arr = [M_c]
 
+            # Start with the minimum step
+            dr_schw = min_step_size if min_step_size is not None else dr
+
             while solver.successful() and solver.y[0] > 1e-10 and solver.t < r_max:
-                solver.integrate(solver.t + dr)
-                r_schw_arr.append(solver.t)
-                P_arr.append(solver.y[0])
-                nu_arr.append(solver.y[1])
-                M_arr.append(solver.y[2])
+                # Advance to next target radius; dopri5/dop853 will substep as needed
+                solver.integrate(solver.t + dr_schw)
+
+                r_now = solver.t
+                P_now, nu_now, M_now = solver.y
+
+                r_schw_arr.append(r_now)
+                P_arr.append(P_now)
+                nu_arr.append(nu_now)
+                M_arr.append(M_now)
+
+                # Update target step using local derivatives (limit to [min,max])
+                dPdr, dnudr, dMdr = self.tov_rhs(r_now, [P_now, nu_now, M_now])
+                # Use safe denominator to avoid division by ~0
+                def _safe_ratio(val, der):
+                    den = abs(der) if abs(der) > 1e-30 else 1e-30
+                    return abs(val / den)
+
+                # Heuristic: choose step proportional to local scale length
+                est1 = _safe_ratio(P_now, dPdr)
+                est2 = _safe_ratio(M_now if M_now != 0 else 1.0, dMdr)
+                dr_schw = 0.1 * min(est1, est2)
+                # Clip to preset bounds
+                dr_schw = max(min_step_size, min(dr_schw, max_step_size))
 
             R_star = r_schw_arr[-1]
             M_star = M_arr[-1]
             nu_star = nu_arr[-1]
 
-            # Extend to exterior
-            r_current = R_star + dr
+            # Extend to exterior (simple uniform extension is sufficient here)
+            # Use a conservative step for extension
+            dr_ext = max_step_size
+            r_current = R_star + dr_ext
             while r_current <= r_max:
                 r_schw_arr.append(r_current)
                 P_arr.append(0.0)
@@ -180,7 +244,7 @@ class TOVSolver:
                     nu_ext = nu_star
                 nu_arr.append(nu_ext)
                 M_arr.append(M_star)
-                r_current += dr
+                r_current += dr_ext
 
             r_schw_arr = np.array(r_schw_arr)
             P_arr = np.array(P_arr)

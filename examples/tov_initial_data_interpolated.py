@@ -44,10 +44,10 @@ def interpolate_tov_avoiding_surface(r_target, tov_solution, field_name,
 
     Args:
         r_target: Radius where to interpolate
-        tov_solution: Dict with TOV solution (must have 'r', 'R', and field_name)
+        tov_solution: Dict with TOV solution (must have 'r', 'R', 'M_star', and field_name)
         field_name: Name of field to interpolate ('rho_baryon', 'P', 'exp4phi', 'alpha', etc.)
         interp_order: Interpolation order 11
-        atmosphere_value: Value to return if r_target is outside star
+        atmosphere_value: Value to return if r_target is outside star (deprecated, will use Schwarzschild)
 
     Returns:
         Interpolated value at r_target
@@ -56,19 +56,42 @@ def interpolate_tov_avoiding_surface(r_target, tov_solution, field_name,
     - Uses Lagrange polynomial interpolation
     - Finds stellar surface index (Rbar_idx)
     - If r_target < R_star: stencil stays INSIDE star (idx_max ≤ surf_idx+1)
-    - If r_target ≥ R_star: stencil stays OUTSIDE star (idx_min ≥ surf_idx)
+    - If r_target ≥ R_star:
+        * For metric quantities (exp4phi, alpha): uses Schwarzschild solution
+        * For matter quantities (rho_baryon, P): uses atmosphere_value or zero
     - This prevents interpolation across discontinuity → no Gibbs phenomenon
     """
     r_tov = tov_solution['r']
     field_tov = tov_solution[field_name]
     R_star = tov_solution['R']
+    M_star = tov_solution['M_star']
 
     # Handle negative radii (spherical symmetry: f(r) = f(-r))
     r_use = abs(r_target)
 
-    # If outside star and atmosphere value provided, return it directly
-    if r_use > R_star and atmosphere_value is not None:
-        return atmosphere_value
+    # If outside star, use exact Schwarzschild solution for metric quantities
+    # or atmosphere values for matter quantities
+    if r_use > R_star:
+        if field_name == 'exp4phi':
+            # Schwarzschild: exp4phi = (1 - 2M/r)^(-1)
+            one_minus = max(1.0 - 2.0 * M_star / max(r_use, 0.1), 1e-10)
+            return 1.0 / one_minus
+        elif field_name == 'alpha':
+            # Schwarzschild: alpha = sqrt(1 - 2M/r)
+            one_minus = max(1.0 - 2.0 * M_star / max(r_use, 0.1), 1e-10)
+            return np.sqrt(one_minus)
+        elif field_name in ['rho_baryon', 'P', 'rho', 'epsilon']:
+            # Matter quantities: use atmosphere or zero
+            if atmosphere_value is not None:
+                return atmosphere_value
+            else:
+                return 0.0
+        else:
+            # Unknown field: fallback to atmosphere_value or zero
+            if atmosphere_value is not None:
+                return atmosphere_value
+            else:
+                return 0.0
 
     # Clamp to data range
     r_use = max(r_use, r_tov[0])

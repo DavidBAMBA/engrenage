@@ -23,7 +23,7 @@ from source.bssn.bssnrhs import get_bssn_rhs
 from source.matter.hydro.perfect_fluid import PerfectFluid
 from source.matter.hydro.eos import PolytropicEOS, IdealGasEOS
 from source.matter.hydro.reconstruction import create_reconstruction
-from source.matter.hydro.riemann import HLLERiemannSolver
+from source.matter.hydro.riemann import HLLRiemannSolver
 from source.matter.hydro.cons2prim import prim_to_cons
 from source.matter.hydro.atmosphere import AtmosphereParams  
 from source.bssn.tensoralgebra import get_bar_gamma_LL
@@ -1056,7 +1056,7 @@ def main():
     # CONFIGURATION
     # ==================================================================
     r_max = 16.0
-    num_points = 5000
+    num_points = 1000
     K = 100.0
     Gamma = 2.0
     rho_central = 1.280e-3
@@ -1097,9 +1097,9 @@ def main():
     hydro = PerfectFluid(
         eos=eos,
         spacetime_mode="dynamic",
-        atmosphere=ATMOSPHERE,  
+        atmosphere=ATMOSPHERE,
         reconstructor=create_reconstruction("wenoz"),
-        riemann_solver=HLLERiemannSolver()
+        riemann_solver=HLLRiemannSolver()
     )
 
     state_vector = StateVector(hydro)

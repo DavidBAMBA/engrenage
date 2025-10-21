@@ -395,7 +395,7 @@ def main():
     rho_central = 0.129285  # Central density (NRPy+ value)
 
     # Grid will be set AFTER solving TOV to get stellar radius
-    num_points = 1000        # Coarser for testing (NRPy+ uses 72 radial)
+    num_points = 500        # Coarser for testing (NRPy+ uses 72 radial)
 
     print(f"\nEOS: K={K}, Gamma={Gamma}")
     print(f"Central density: ρ_c={rho_central:.3e}")
@@ -470,7 +470,6 @@ def main():
         tov_solution, grid, background, eos,
         atmosphere=ATMOSPHERE,
         polytrope_K=K, polytrope_Gamma=Gamma,
-        use_isotropic=False
     )
 
     # Extract and freeze fluid primitives

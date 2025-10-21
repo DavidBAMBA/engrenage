@@ -29,7 +29,7 @@ from source.backgrounds.sphericalbackground import FlatSphericalBackground, i_r,
 from source.matter.hydro.perfect_fluid import PerfectFluid
 from source.matter.hydro.eos import PolytropicEOS
 from source.matter.hydro.reconstruction import create_reconstruction
-from source.matter.hydro.riemann import HLLERiemannSolver
+from source.matter.hydro.riemann import HLLRiemannSolver
 from source.bssn.bssnstatevariables import (
     NUM_BSSN_VARS,
     idx_phi, idx_hrr, idx_htt, idx_hpp,
@@ -282,7 +282,7 @@ def run_hwh_test_enhanced(
         spacetime_mode='dynamic',
         atmosphere_rho=atmosphere,
         reconstructor=create_reconstruction("mp5"),
-        riemann_solver=HLLERiemannSolver()
+        riemann_solver=HLLRiemannSolver()
     )
     state_vec = StateVector(hydro)
     grid = Grid(spacing, state_vec)

@@ -16,8 +16,8 @@ sys.path.append(os.path.join(os.path.dirname(__file__), '..', '..'))
 
 from source.core.spacing import NUM_GHOSTS
 from source.matter.hydro.eos import IdealGasEOS
-from source.matter.hydro.reconstruction import MinmodReconstruction, HighOrderReconstruction, create_reconstruction
-from source.matter.hydro.riemann import HLLERiemannSolver
+from source.matter.hydro.reconstruction import Reconstruction, create_reconstruction
+from source.matter.hydro.riemann import HLLRiemannSolver
 from source.matter.hydro.cons2prim import cons_to_prim
 from source.matter.hydro.valencia_reference_metric import ValenciaReferenceMetric
 
@@ -202,7 +202,7 @@ def run_single_test(args):
         # Setup physics objects
         eos = IdealGasEOS(gamma=gamma_gas)
         recon = create_reconstruction(reconstructor_name)
-        rsolve = HLLERiemannSolver()
+        rsolve = HLLRiemannSolver()
         valencia = ValenciaReferenceMetric()
 
         # Initial conditions - Gaussian pulse with constant velocity

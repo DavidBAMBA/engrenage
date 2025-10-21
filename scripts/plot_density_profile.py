@@ -25,7 +25,7 @@ def build_grid_and_hydro(spacing_type: str, r_max: float, min_dr: float, max_dr:
     from source.matter.hydro.perfect_fluid import PerfectFluid
     from source.matter.hydro.eos import IdealGasEOS
     from source.matter.hydro.reconstruction import create_reconstruction
-    from source.matter.hydro.riemann import HLLERiemannSolver
+    from source.matter.hydro.riemann import HLLRiemannSolver
 
     spacing_type = spacing_type.lower()
     if spacing_type == "cubic":
@@ -52,7 +52,7 @@ def build_grid_and_hydro(spacing_type: str, r_max: float, min_dr: float, max_dr:
         spacetime_mode="dynamic",
         atmosphere_rho=1e-13,
         reconstructor=create_reconstruction("mp5"),
-        riemann_solver=HLLERiemannSolver(),
+        riemann_solver=HLLRiemannSolver(),
     )
 
     state_vector = StateVector(hydro)

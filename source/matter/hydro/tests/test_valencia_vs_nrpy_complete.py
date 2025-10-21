@@ -214,11 +214,11 @@ dummy_D = alpha_val * e6phi_val * rho0 * W
 dummy_tau = alpha_val * e6phi_val * (rho0 * h * W**2 - pressure) - dummy_D
 dummy_S = dummy_D[:, np.newaxis] * v_U  # Broadcasting: (N,) × (N,3) → (N,3)
 
-from source.matter.hydro.riemann import HLLERiemannSolver
-from source.matter.hydro.reconstruction import MinmodReconstruction
+from source.matter.hydro.riemann import HLLRiemannSolver
+from source.matter.hydro.reconstruction import Reconstruction
 
-reconstructor = MinmodReconstruction()
-riemann_solver = HLLERiemannSolver()
+reconstructor = Reconstruction(method="minmod")
+riemann_solver = HLLRiemannSolver()
 
 valencia.compute_rhs(
     dummy_D, dummy_S, dummy_tau, rho0, v_U, pressure, W, h,

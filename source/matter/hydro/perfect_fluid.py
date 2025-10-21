@@ -73,8 +73,8 @@ class PerfectFluid:
         )
 
         # Numerical methods for Valencia evolution
+        # Note: Boundary conditions now handled by Grid.fill_boundaries()
         self.valencia = ValenciaReferenceMetric(
-            boundary_mode="parity",
             atmosphere=self.atmosphere  # Pass centralized atmosphere
         )
         self.reconstructor = reconstructor

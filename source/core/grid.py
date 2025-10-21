@@ -76,23 +76,38 @@ class Grid:
             self.fill_outer_boundary_single_variable(state[::-1])
             
     def fill_outer_boundary(self, state, indices=None):
-        # For outer boundaries, we assume a law of the form: a + b * r**n
-        # "a" is ASYMP_OFFSET and "n" is ASYMP_POWER, "b" is to be determined
-        # on last point before ghost points.
+        # For outer boundaries:
+        # - BSSN variables: asymptotic extrapolation (a + b * r**n)
+        # - Hydro variables (last 3): outflow/zero-gradient (copy from interior)
+        # This follows GRoovy convention (see Jacques et al. 2024)
 
         # Default to all indices if none were specified
-        #if (indices == None) :  #CAMBIOOOO
-        if indices is None: 
-            indices = self.ALL_INDICES        
-        
+        if indices is None:
+            indices = self.ALL_INDICES
+
         idx = -NUM_GHOSTS - 1
         outer_state = state[:, -NUM_GHOSTS:]
-        b = (state[indices, idx] - self.ASYMP_OFFSET[indices]) / self.r[idx] ** self.ASYMP_POWER[indices]
 
-        outer_state[indices, -NUM_GHOSTS:] = (
-            self.ASYMP_OFFSET[indices, None]
-            + b[..., None] * self.r[-NUM_GHOSTS:] ** self.ASYMP_POWER[indices, None]
-        )
+        # Identify BSSN vs Hydro variables
+        # Hydro variables are the last 3: [NUM_VARS-3, NUM_VARS-2, NUM_VARS-1]
+        num_hydro_vars = 3
+        hydro_start_idx = self.NUM_VARS - num_hydro_vars
+
+        # Separate BSSN and Hydro indices
+        bssn_indices = indices[indices < hydro_start_idx]
+        hydro_indices = indices[indices >= hydro_start_idx]
+
+        # BSSN variables: asymptotic extrapolation
+        if len(bssn_indices) > 0:
+            b = (state[bssn_indices, idx] - self.ASYMP_OFFSET[bssn_indices]) / self.r[idx] ** self.ASYMP_POWER[bssn_indices]
+            outer_state[bssn_indices, -NUM_GHOSTS:] = (
+                self.ASYMP_OFFSET[bssn_indices, None]
+                + b[..., None] * self.r[-NUM_GHOSTS:] ** self.ASYMP_POWER[bssn_indices, None]
+            )
+
+        # Hydro variables: outflow (zero-gradient/copy from last interior point)
+        if len(hydro_indices) > 0:
+            outer_state[hydro_indices, :] = state[hydro_indices, idx:idx+1]
 
     def fill_outer_boundary_single_variable(self, state, asymp_power=0, asymp_offset=0):
         # For outer boundaries, we assume a law of the form: a + b * r**n
