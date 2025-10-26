@@ -145,19 +145,13 @@ class PerfectFluid:
 
         Returns array [dD/dt, dS_r/dt, dτ/dt] for state vector evolution.
         """
-        import time
-        start_matter = time.time()
-
         assert self.matter_vars_set, 'Matter vars not set'
         self.background = background
 
         # Convert to primitive variables
-        start_cons2prim = time.time()
         primitives = self._get_primitives(bssn_vars, r)
-        end_cons2prim = time.time()
 
         # Valencia evolution equations
-        start_valencia = time.time()
         dDdt, dSrdt, dtaudt = self.valencia.compute_rhs(
             self.D, self.Sr, self.tau,
             primitives['rho0'], primitives['vr'], primitives['p'],
@@ -166,10 +160,6 @@ class PerfectFluid:
             self.spacetime_mode, self.eos, self.grid,
             self.reconstructor, self.riemann_solver
         )
-        end_valencia = time.time()
-
-        end_matter = time.time()
-        # print(f"  MATTER BREAKDOWN: cons2prim={end_cons2prim-start_cons2prim:.4f}s, valencia={end_valencia-start_valencia:.4f}s, total={end_matter-start_matter:.4f}s")
 
         return np.array([dDdt, dSrdt, dtaudt])
 

@@ -145,7 +145,7 @@ def volume_integrals(D, tau, r, grid):
 # RK3 TIME INTEGRATION USING PERFECT FLUID
 # ============================================================================
 
-def rk3_step(valencia_or_hydro, D, Sr, tau, rho0, v, p, r, grid, eos, recon, rsolve, cfl=0.5,
+def rk3_step(valencia_or_hydro, D, Sr, tau, rho0, v, p, r, grid, eos, recon, rsolve, cfl=0.2,
              spacetime_mode="fixed_minkowski"):
     """
     RK3 Shu-Osher step using PerfectFluid infrastructure.
@@ -279,7 +279,7 @@ def test_uniform_state():
     print("TEST 1: Estado uniforme (Minkowski, engrenage infrastructure)")
     print("="*60)
 
-    r, grid, Nin = build_grid(n_interior=256, r_min=1e-3, r_max=1.0)
+    r, grid, Nin = build_grid(n_interior=100, r_min=1e-3, r_max=1.0)
     N = len(r)
     eos = IdealGasEOS(gamma=1.4)
     recon = create_reconstruction("minmod")
@@ -338,22 +338,22 @@ def test_riemann_sod():
     print("="*60)
 
     # Configuración base
-    r, grid, Nin = build_grid(n_interior=100, r_min=1e-3, r_max=1.0)
+    r, grid, Nin = build_grid(n_interior=500, r_min=1e-3, r_max=1.0)
     N = len(r)
-    eos = IdealGasEOS(gamma=1.4)
+    eos = IdealGasEOS(gamma=5.0/3.0)
     rsolve = HLLRiemannSolver()
 
     # Discontinuidad en el punto medio del dominio interior
     r_mid = 0.5*(r[NUM_GHOSTS] + r[-NUM_GHOSTS-1])
     rho0_base = np.where(r < r_mid, 10.0, 1.0)
-    p_base = np.where(r < r_mid, 40.0/3.0, 1.0e-6)
+    p_base = np.where(r < r_mid, 40000.0/3.0, 1.0e-6)
     v_base = np.zeros(N)
 
     # Lista de métodos de reconstrucción a probar
     methods = ["mp5"]  # Can add: "wenoz", "mp5_hires"
     colors = ["blue"]
     labels = ["MP5"]
-    linestyles = ["--"]
+    linestyles = ["-"]
 
     # Guardar resultados para cada método
     results = {}
@@ -368,7 +368,7 @@ def test_riemann_sod():
 
             r_mid_hires = 0.5*(r_hires[NUM_GHOSTS] + r_hires[-NUM_GHOSTS-1])
             rho0 = np.where(r_hires < r_mid_hires, 10.0, 1.0)
-            p = np.where(r_hires < r_mid_hires, 40.0/3.0, 1.0e-6)
+            p = np.where(r_hires < r_mid_hires, 40000.0/3.0, 1.0e-6)
             v = np.zeros(N_hires)
 
             rho0, v, p = fill_ghosts_primitives(rho0, v, p)
@@ -395,7 +395,7 @@ def test_riemann_sod():
         val = None
 
         # Evolución temporal
-        t, Tfinal = 0.0, 0.2
+        t, Tfinal = 0.0, 0.35
         steps = 0
         while t < Tfinal and steps < 5000:
             dt, D, Sr, tau, rho0, v, p = rk3_step(
@@ -425,7 +425,7 @@ def test_riemann_sod():
 
     # PLOTEO (same as original)
     rho0_init = np.where(r < r_mid, 10.0, 1.0)
-    p_init = np.where(r < r_mid, 40.0/3.0, 1.0e-6)
+    p_init = np.where(r < r_mid, 40000.0/3.0, 1.0e-6)
     v_init = np.zeros(N)
     rho0_init, v_init, p_init = fill_ghosts_primitives(rho0_init, v_init, p_init)
 
@@ -458,7 +458,19 @@ def test_riemann_sod():
     ax1_zoom.set_xlabel('r')
     ax1_zoom.set_ylabel('Densidad ρ₀')
     ax1_zoom.set_xlim(0.6, 0.7)
-    ax1_zoom.set_ylim(4.5, 7.5)
+    # Auto-compute ylim from data in zoom region
+    rho_zoom_data = []
+    for method in methods:
+        mask_zoom = (results[method]['r'] >= 0.6) & (results[method]['r'] <= 0.7)
+        if np.any(mask_zoom):
+            rho_zoom_data.extend(results[method]['rho'][mask_zoom])
+    if rho_zoom_data:
+        rho_min, rho_max = np.min(rho_zoom_data), np.max(rho_zoom_data)
+        # Add 10% margin
+        rho_range = rho_max - rho_min
+        rho_min_plot = rho_min - 0.1 * rho_range
+        rho_max_plot = rho_max + 0.1 * rho_range
+        ax1_zoom.set_ylim(rho_min_plot, rho_max_plot)
     ax1_zoom.grid(True, alpha=0.3)
     ax1_zoom.legend()
     ax1_zoom.set_title('Densidad - Zoom Shock')
@@ -477,7 +489,7 @@ def test_riemann_sod():
     ax2.set_xlabel('r')
     ax2.set_ylabel('Presión p')
     ax2.set_xlim(0, 1)
-    ax2.set_yscale('log')
+    #ax2.set_yscale('log')
     ax2.grid(True, alpha=0.3)
     ax2.legend()
     ax2.set_title('Presión - Dominio Completo')
@@ -489,7 +501,19 @@ def test_riemann_sod():
     ax2_zoom.set_xlabel('r')
     ax2_zoom.set_ylabel('Presión p')
     ax2_zoom.set_xlim(0.6, 0.7)
-    ax2_zoom.set_ylim(1e-1, 1e1)
+    # Auto-compute ylim from data in zoom region
+    p_zoom_data = []
+    for method in methods:
+        mask_zoom = (results[method]['r'] >= 0.6) & (results[method]['r'] <= 0.7)
+        if np.any(mask_zoom):
+            p_zoom_data.extend(results[method]['p'][mask_zoom])
+    if p_zoom_data:
+        p_min, p_max = np.min(p_zoom_data), np.max(p_zoom_data)
+        # Add 20% margin in log space
+        p_range = np.log10(p_max / p_min)
+        p_min_plot = p_min / (10 ** (0.2 * p_range))
+        p_max_plot = p_max * (10 ** (0.2 * p_range))
+        ax2_zoom.set_ylim(p_min_plot, p_max_plot)
     ax2_zoom.set_yscale('log')
     ax2_zoom.grid(True, alpha=0.3)
     ax2_zoom.legend()
@@ -520,7 +544,19 @@ def test_riemann_sod():
     ax3_zoom.set_xlabel('r')
     ax3_zoom.set_ylabel('Velocidad v^r')
     ax3_zoom.set_xlim(0.5, 0.7)
-    ax3_zoom.set_ylim(0.6, 0.85)
+    # Auto-compute ylim from data in zoom region
+    v_zoom_data = []
+    for method in methods:
+        mask_zoom = (results[method]['r'] >= 0.5) & (results[method]['r'] <= 0.7)
+        if np.any(mask_zoom):
+            v_zoom_data.extend(results[method]['v'][mask_zoom])
+    if v_zoom_data:
+        v_min, v_max = np.min(v_zoom_data), np.max(v_zoom_data)
+        # Add 10% margin
+        v_range = v_max - v_min
+        v_min_plot = v_min - 0.1 * v_range
+        v_max_plot = v_max + 0.1 * v_range
+        ax3_zoom.set_ylim(v_min_plot, v_max_plot)
     ax3_zoom.grid(True, alpha=0.3)
     ax3_zoom.legend()
     ax3_zoom.set_title('Velocidad - Zoom Shock')

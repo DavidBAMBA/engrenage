@@ -17,8 +17,6 @@ class IdealGasEOS:
         """
         if gamma <= 1.0:
             raise ValueError("Adiabatic index must be > 1")
-        if gamma > 2.0:
-            print(f"Warning: γ = {gamma} > 2 may be unphysical for relativistic gas")
 
         self.gamma = float(gamma)
         self.gamma_minus_1 = self.gamma - 1.0

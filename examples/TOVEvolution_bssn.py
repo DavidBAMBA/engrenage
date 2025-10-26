@@ -1,6 +1,9 @@
 import numpy as np
 import sys
 import os
+import h5py
+import json
+from datetime import datetime
 import matplotlib.pyplot as plt
 from scipy.integrate import ode, trapezoid
 from scipy.interpolate import interp1d
@@ -33,6 +36,219 @@ import examples.tov_initial_data_interpolated as tov_id
 
 # Directory for saving plots
 PLOT_DIR = "tov-bssn-plots"
+
+
+class SimulationDataManager:
+    """Manages data storage for long TOV simulations."""
+
+    def __init__(self, output_dir, grid, hydro, enable_saving=False):
+        """
+        Initialize data manager.
+
+        Args:
+            output_dir: Directory for output files
+            grid: Grid object
+            hydro: Hydro object
+            enable_saving: If True, saves data to files
+        """
+        self.enable_saving = enable_saving
+        if not self.enable_saving:
+            return
+
+        self.output_dir = output_dir
+        self.grid = grid
+        self.hydro = hydro
+
+        # Create output directory
+        os.makedirs(output_dir, exist_ok=True)
+
+        # Initialize HDF5 files
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        self.snapshot_file = os.path.join(output_dir, f"tov_snapshots_{timestamp}.h5")
+        self.evolution_file = os.path.join(output_dir, f"tov_evolution_{timestamp}.h5")
+        self.metadata_file = os.path.join(output_dir, f"tov_metadata_{timestamp}.json")
+
+        # Initialize evolution data lists (for buffering)
+        self.evolution_buffer = {
+            'step': [],
+            'time': [],
+            'rho_central': [],
+            'p_central': [],
+            'max_rho_error': [],
+            'max_p_error': [],
+            'max_velocity': [],
+            'l1_rho_error': [],
+            'l2_rho_error': [],
+            'max_D': [],
+            'max_Sr': [],
+            'max_tau': [],
+            'c2p_fails': []
+        }
+
+        # Initialize HDF5 files
+        self._init_hdf5_files()
+
+    def _init_hdf5_files(self):
+        """Initialize HDF5 files with proper structure."""
+        if not self.enable_saving:
+            return
+
+        # Snapshot file
+        with h5py.File(self.snapshot_file, 'w') as f:
+            # Create groups
+            f.create_group('snapshots')
+            f.create_group('grid')
+
+            # Save grid data
+            f['grid/r'] = self.grid.r
+            f['grid/N'] = self.grid.N
+            f['grid/r_max'] = self.grid.r[-1]
+
+        # Evolution file
+        with h5py.File(self.evolution_file, 'w') as f:
+            # Create expandable datasets for time series
+            for key in self.evolution_buffer.keys():
+                f.create_dataset(key, shape=(0,), maxshape=(None,),
+                               dtype=np.float64, chunks=True)
+
+    def save_metadata(self, tov_solution, atmosphere_params, dt, integration_method, K=None, Gamma=None, rho_central=None):
+        """Save simulation metadata."""
+        if not self.enable_saving:
+            return
+
+        metadata = {
+            'tov_solution': {
+                'M_star': float(tov_solution['M_star']),
+                'R': float(tov_solution['R']),
+                'C': float(tov_solution['C']),
+                'K': float(K) if K is not None else float(tov_solution.get('K', 0)),
+                'Gamma': float(Gamma) if Gamma is not None else float(tov_solution.get('Gamma', 0)),
+                'rho_central': float(rho_central) if rho_central is not None else float(tov_solution.get('rho_central', 0))
+            },
+            'atmosphere': {
+                'rho_floor': float(atmosphere_params.rho_floor),
+                'p_floor': float(atmosphere_params.p_floor),
+                'v_max': float(atmosphere_params.v_max),
+                'W_max': float(atmosphere_params.W_max)
+            },
+            'simulation': {
+                'dt': float(dt) if dt is not None else None,
+                'integration_method': integration_method,
+                'grid_N': int(self.grid.N),
+                'grid_r_max': float(self.grid.r[-1])
+            },
+            'timestamp': datetime.now().isoformat()
+        }
+
+        with open(self.metadata_file, 'w') as f:
+            json.dump(metadata, f, indent=2)
+
+    def save_snapshot(self, step, time, state_2d, primitives=None):
+        """Save full domain snapshot."""
+        if not self.enable_saving:
+            return
+
+        with h5py.File(self.snapshot_file, 'a') as f:
+            # Check if snapshot already exists, if so skip or overwrite
+            snap_name = f'step_{step:08d}'
+            if snap_name in f['snapshots']:
+                print(f"Warning: Snapshot {snap_name} already exists, skipping...")
+                return
+            snap_group = f['snapshots'].create_group(snap_name)
+
+            # Save metadata for this snapshot
+            snap_group.attrs['step'] = step
+            snap_group.attrs['time'] = time
+
+            # Save conservative variables
+            cons_group = snap_group.create_group('conservatives')
+            cons_group['D'] = state_2d[self.hydro.idx_D, :]
+            cons_group['Sr'] = state_2d[self.hydro.idx_Sr, :]
+            cons_group['tau'] = state_2d[self.hydro.idx_tau, :]
+
+            # Save BSSN variables
+            bssn_group = snap_group.create_group('bssn')
+            bssn_group['phi'] = state_2d[0, :]
+            bssn_group['a'] = state_2d[1, :]
+            bssn_group['alpha'] = state_2d[2, :]
+            bssn_group['betaR'] = state_2d[3, :]
+            bssn_group['Br'] = state_2d[4, :]
+            bssn_group['K'] = state_2d[5, :]
+
+            # Save primitives if provided
+            if primitives is not None:
+                prim_group = snap_group.create_group('primitives')
+                prim_group['rho0'] = primitives['rho0']
+                prim_group['p'] = primitives['p']
+                prim_group['eps'] = primitives['eps']
+                prim_group['vr'] = primitives['vr']
+                prim_group['W'] = primitives['W']
+
+    def add_evolution_point(self, step, time, state_2d, primitives, reference_primitives):
+        """Add a point to the evolution time series."""
+        if not self.enable_saving:
+            return
+
+        interior = slice(NUM_GHOSTS, -NUM_GHOSTS)
+
+        # Calculate errors
+        delta_rho = np.abs(primitives['rho0'][interior] - reference_primitives['rho0'][interior])
+        rel_delta_rho = delta_rho / (np.abs(reference_primitives['rho0'][interior]) + 1e-20)
+
+        delta_p = np.abs(primitives['p'][interior] - reference_primitives['p'][interior])
+        rel_delta_p = delta_p / (np.abs(reference_primitives['p'][interior]) + 1e-20)
+
+        # L1 and L2 norms of density error (inside star only)
+        star_mask = reference_primitives['rho0'][interior] > 10 * self.hydro.atmosphere.rho_floor
+        if np.any(star_mask):
+            l1_rho = np.mean(delta_rho[star_mask])
+            l2_rho = np.sqrt(np.mean(delta_rho[star_mask]**2))
+        else:
+            l1_rho = 0.0
+            l2_rho = 0.0
+
+        # Store in buffer
+        self.evolution_buffer['step'].append(step)
+        self.evolution_buffer['time'].append(time)
+        self.evolution_buffer['rho_central'].append(primitives['rho0'][NUM_GHOSTS])
+        self.evolution_buffer['p_central'].append(primitives['p'][NUM_GHOSTS])
+        self.evolution_buffer['max_rho_error'].append(np.max(rel_delta_rho))
+        self.evolution_buffer['max_p_error'].append(np.max(rel_delta_p))
+        self.evolution_buffer['max_velocity'].append(np.max(np.abs(primitives['vr'])))
+        self.evolution_buffer['l1_rho_error'].append(l1_rho)
+        self.evolution_buffer['l2_rho_error'].append(l2_rho)
+        self.evolution_buffer['max_D'].append(np.max(state_2d[self.hydro.idx_D, :]))
+        self.evolution_buffer['max_Sr'].append(np.max(np.abs(state_2d[self.hydro.idx_Sr, :])))
+        self.evolution_buffer['max_tau'].append(np.max(state_2d[self.hydro.idx_tau, :]))
+        self.evolution_buffer['c2p_fails'].append(np.sum(~primitives['success']))
+
+    def flush_evolution_buffer(self):
+        """Write buffered evolution data to HDF5 file."""
+        if not self.enable_saving or not self.evolution_buffer['step']:
+            return
+
+        with h5py.File(self.evolution_file, 'a') as f:
+            for key, values in self.evolution_buffer.items():
+                dataset = f[key]
+                old_size = dataset.shape[0]
+                new_size = old_size + len(values)
+                dataset.resize(new_size, axis=0)
+                dataset[old_size:new_size] = values
+
+        # Clear buffer
+        for key in self.evolution_buffer:
+            self.evolution_buffer[key] = []
+
+    def finalize(self):
+        """Finalize data storage (flush buffers, close files)."""
+        if not self.enable_saving:
+            return
+
+        self.flush_evolution_buffer()
+        print(f"\nData saved to:")
+        print(f"  - Snapshots: {self.snapshot_file}")
+        print(f"  - Evolution: {self.evolution_file}")
+        print(f"  - Metadata:  {self.metadata_file}")
 
 
 def diagnose_t0_residuals(state_2d, grid, background, hydro):
@@ -490,6 +706,27 @@ def _apply_atmosphere_reset(state_2d, grid, hydro, atmosphere, rho_threshold=Non
     return state_2d
 
 
+def enforce_origin_symmetry(state_2d):
+    """
+    Enforce spherical symmetry at origin: set momentum S^r = 0 at first interior cell.
+
+    By spherical symmetry, velocity must be exactly zero at r=0. This prevents
+    spurious mass creation from connection terms -Γ*F near origin where Γ ~ 200/M.
+
+    Args:
+        state_2d: State array with shape (NUM_VARS, N)
+
+    Returns:
+        Modified state_2d with S^r = 0 at first interior cell
+    """
+    NUM_GHOSTS = 3
+    # S^r_tilde is at index 7 (after 6 BSSN variables + D)
+    # Index ordering: [phi, h_rr, h_tt, h_pp, K, a_rr, D, Sr, tau]
+    #                  0    1     2     3     4   5     6  7   8
+    state_2d[7, NUM_GHOSTS] = 0.0
+    return state_2d
+
+
 def rk4_step(state_flat, dt, grid, background, hydro, atmosphere):
     """
     Single RK4 (classical 4th order Runge-Kutta) timestep with atmosphere reset.
@@ -503,14 +740,23 @@ def rk4_step(state_flat, dt, grid, background, hydro, atmosphere):
 
     # Stage 2
     state_2 = state_flat + 0.5 * dt * k1
+    s2 = state_2.reshape((grid.NUM_VARS, grid.N))
+    enforce_origin_symmetry(s2)
+    state_2 = s2.flatten()
     k2 = get_rhs_full(0, state_2, grid, background, hydro)
 
     # Stage 3
     state_3 = state_flat + 0.5 * dt * k2
+    s3 = state_3.reshape((grid.NUM_VARS, grid.N))
+    enforce_origin_symmetry(s3)
+    state_3 = s3.flatten()
     k3 = get_rhs_full(0, state_3, grid, background, hydro)
 
     # Stage 4
     state_4 = state_flat + dt * k3
+    s4 = state_4.reshape((grid.NUM_VARS, grid.N))
+    enforce_origin_symmetry(s4)
+    state_4 = s4.flatten()
     k4 = get_rhs_full(0, state_4, grid, background, hydro)
 
     # Combine
@@ -525,7 +771,8 @@ def rk4_step(state_flat, dt, grid, background, hydro, atmosphere):
 
 def evolve_fixed_timestep(state_initial, dt, num_steps, grid, background, hydro,
                           atmosphere, method='rk4', t_start=0.0,
-                          reference_state=None, step_offset=0):
+                          reference_state=None, step_offset=0, data_manager=None,
+                          snapshot_interval=None, evolution_interval=None):
     """Evolve with fixed timestep using RK4 (full BSSN + hydro).
 
     Args:
@@ -534,6 +781,9 @@ def evolve_fixed_timestep(state_initial, dt, num_steps, grid, background, hydro,
         reference_state: Reference state for error calculation (default: state_initial)
                         Use this to maintain consistent error measurement across multiple segments
         step_offset: Offset for step numbering in output (default: 0)
+        data_manager: SimulationDataManager object for data saving (optional)
+        snapshot_interval: Save full domain snapshot every N steps (optional)
+        evolution_interval: Save evolution data every N steps (optional)
     """
     state_flat = state_initial.flatten()
 
@@ -551,6 +801,11 @@ def evolve_fixed_timestep(state_initial, dt, num_steps, grid, background, hydro,
     if reference_state is None:
         reference_state = state_initial
     prim_initial, s_initial = primitives_from_state(reference_state.flatten())
+
+    # Save initial snapshot if data manager provided
+    if data_manager and data_manager.enable_saving:
+        data_manager.save_snapshot(step_offset, t_start, state_initial, prim_initial)
+        data_manager.add_evolution_point(step_offset, t_start, state_initial, prim_initial, prim_initial)
 
     print("\n===== Evolution diagnostics (per step) =====")
     print("Columns: step | t | ρ_central | max_Δρ/ρ | max_vʳ | max_D | max_Sʳ | max_τ | c2p_fails")
@@ -601,9 +856,24 @@ def evolve_fixed_timestep(state_initial, dt, num_steps, grid, background, hydro,
 
         t_curr = t_start + (step + 1) * dt
         step_num = step_offset + step + 1
-        print(f"step {step_num:4d}  t={t_curr:.6e}:  ρ_c={rho_central:.6e}  max_Δρ/ρ={max_rel_rho_err:.3e}  "
+        if step_num % 100 == 0:
+            print(f"step {step_num:4d}  t={t_curr:.6e}:  ρ_c={rho_central:.6e}  max_Δρ/ρ={max_rel_rho_err:.3e}  "
               f"max_vʳ={max_abs_v:.3e}  max_D={max_D:.3e}  max_Sʳ={max_Sr:.3e}  "
               f"max_τ={max_tau:.3e}  c2p_fail={c2p_fail_count}")
+
+        # Save data if data manager provided
+        if data_manager and data_manager.enable_saving:
+            # Save evolution data at specified interval
+            if evolution_interval and step_num % evolution_interval == 0:
+                data_manager.add_evolution_point(step_num, t_curr, s_next, prim_next, prim_initial)
+
+                # Periodic buffer flush
+                if step_num % (evolution_interval * 10) == 0:
+                    data_manager.flush_evolution_buffer()
+
+            # Save full snapshot at specified interval
+            if snapshot_interval and step_num % snapshot_interval == 0:
+                data_manager.save_snapshot(step_num, t_curr, s_next, prim_next)
 
         # Detect first signs of instability / non-physical values
         issues = []
@@ -669,6 +939,10 @@ def evolve_fixed_timestep(state_initial, dt, num_steps, grid, background, hydro,
         # Light progress marker
         if (step + 1) % 20 == 0:
             print(f"  Step {step_num}/{step_offset + num_steps} OK  (t={t_curr:.6e})")
+
+    # Final flush of buffers if data manager is provided
+    if data_manager and data_manager.enable_saving:
+        data_manager.flush_evolution_buffer()
 
     actual_time = t_start + num_steps * dt
     return state_flat.reshape((grid.NUM_VARS, grid.N)), num_steps, actual_time
@@ -1056,10 +1330,27 @@ def main():
     # CONFIGURATION
     # ==================================================================
     r_max = 16.0
-    num_points = 1000
+    num_points = 500
     K = 100.0
     Gamma = 2.0
-    rho_central = 1.280e-3
+    rho_central = 1.28e-3
+    num_steps_total = 10000
+
+
+    # ==================================================================
+    # DATA SAVING CONFIGURATION
+    # ==================================================================
+    ENABLE_DATA_SAVING = True  # Set to True to save data to files
+    OUTPUT_DIR = "tov_evolution_data_bssn"  # Directory for output data (differentiated with 'bssn')
+    SNAPSHOT_INTERVAL = 100  # Save full domain every N timesteps (None to disable)
+    EVOLUTION_INTERVAL = 100  # Save time series every N timesteps (None to disable)
+
+    if ENABLE_DATA_SAVING:
+        print(f"Data saving enabled:")
+        print(f"  Output directory: {OUTPUT_DIR}")
+        print(f"  Snapshot interval: {SNAPSHOT_INTERVAL} timesteps")
+        print(f"  Evolution tracking: {EVOLUTION_INTERVAL} timesteps")
+        print()
 
     # ==================================================================
     # ATMOSPHERE CONFIGURATION (Centralized floor management)
@@ -1115,22 +1406,22 @@ def main():
     # ==================================================================
     print("Solving TOV equations directly on evolution grid...")
     # Strategy: Solve TOV at exact grid points to minimize interpolation error
+    # This ensures discrete hydrostatic equilibrium is satisfied at grid points
     tov_solver = TOVSolver(K=K, Gamma=Gamma)
 
-    print(f"  TOV grid: using evolution grid ({grid.N} points)")
+    print(f"  TOV solver: adaptive-step integration on independent grid")
 
-    # Solve TOV directly at evolution grid points
-    tov_solution = tov_solver.solve(rho_central, r_grid=grid.r, r_max=r_max)
+    # Solve TOV with adaptive step; interpolation to evolution grid will be applied below
+    tov_solution = tov_solver.solve(rho_central, r_max=r_max)
 
     print(f"TOV Solution: M={tov_solution['M_star']:.6f}, R={tov_solution['R']:.3f}, C={tov_solution['C']:.4f}\n")
 
     plot_tov_diagnostics(tov_solution, r_max)
 
     # ==================================================================
-    # INITIAL DATA (HIGH-ORDER INTERPOLATION, NRPy+ STRATEGY)
+    # INITIAL DATA (HIGH-ORDER INTERPOLATION)
     # ==================================================================
     print("Creating initial data from TOV solution...")
-    # Strategy (following NRPy+ tutorial):
     # 1. Interpolate ρ, P ONLY up to stellar radius R
     # 2. Outside R: use atmosphere values directly (no interpolation)
     # 3. Interpolate geometry (α, exp4φ) everywhere
@@ -1146,21 +1437,34 @@ def main():
     diagnose_t0_residuals(initial_state_2d, grid, background, hydro)
 
     # Initial-data diagnostics
-    tov_id.plot_initial_comparison(tov_solution, initial_state_2d, grid, hydro, output_dir=PLOT_DIR)
+    tov_id.plot_initial_comparison(tov_solution, initial_state_2d, grid, hydro)
+
+    # ==================================================================
+    # DATA MANAGER INITIALIZATION
+    # ==================================================================
+    # Initialize data manager for saving
+    data_manager = SimulationDataManager(OUTPUT_DIR, grid, hydro, enable_saving=ENABLE_DATA_SAVING)
+
+    # Save metadata
+    if ENABLE_DATA_SAVING:
+        data_manager.save_metadata(tov_solution, ATMOSPHERE, None, integration_method, K=K, Gamma=Gamma, rho_central=rho_central)
 
     # ==================================================================
     # EVOLUTION
     # ==================================================================
     if integration_method == 'fixed':
-        dt = 0.15 * grid.min_dr  # CFL condition
-        num_steps_total = 10000
-        print(f"\nEvolving with fixed dt={dt:.6f} (CFL=0.15) for {num_steps_total} steps using RK4")
+        dt = 0.2 * grid.min_dr  # CFL condition
+        print(f"\nEvolving with fixed dt={dt:.6f} (CFL=0.2) for {num_steps_total} steps using RK4")
+
+        # Update metadata with dt
+        if ENABLE_DATA_SAVING:
+            data_manager.save_metadata(tov_solution, ATMOSPHERE, dt, integration_method, K=K, Gamma=Gamma, rho_central=rho_central)
 
         # Single step for comparison
         state_t1 = rk4_step(initial_state_2d.flatten(), dt, grid, background, hydro,
                            ATMOSPHERE).reshape((grid.NUM_VARS, grid.N))
-        t_1 = dt  
-        
+        t_1 = dt
+
         # Plot only the first step changes
         plot_first_step(initial_state_2d, state_t1, grid, hydro, tov_solution)
         plot_surface_zoom(tov_solution, initial_state_2d, state_t1, grid, hydro, window=0.1)
@@ -1170,22 +1474,30 @@ def main():
             checkpoint_mid = max(10, num_steps_total // 10)
         else:
             checkpoint_mid = 100
-        
+
         # Evolve incrementally to intermediate checkpoint
         print(f"\nEvolving to step {checkpoint_mid}...")
-        state_t100, steps_100, t_100 = evolve_fixed_timestep(initial_state_2d, dt, checkpoint_mid, grid, background,
-                                                              hydro, ATMOSPHERE, method='rk4',
-                                                              reference_state=initial_state_2d)
+        state_t100, steps_100, t_100 = evolve_fixed_timestep(
+            initial_state_2d, dt, checkpoint_mid, grid, background,
+            hydro, ATMOSPHERE, method='rk4',
+            reference_state=initial_state_2d,
+            data_manager=data_manager,
+            snapshot_interval=SNAPSHOT_INTERVAL,
+            evolution_interval=EVOLUTION_INTERVAL)
         print(f"  -> Reached step {steps_100}, t={t_100:.6e}")
 
         # Continue evolution to num_steps_total (or until it breaks)
         if num_steps_total > checkpoint_mid and steps_100 == checkpoint_mid:
             remaining_steps = num_steps_total - checkpoint_mid
             print(f"\nContinuing evolution from step {checkpoint_mid} to {num_steps_total} ({remaining_steps} more steps)...")
-            state_tfinal, steps_more, t_final = evolve_fixed_timestep(state_t100, dt, remaining_steps, grid, background,
-                                                                      hydro, ATMOSPHERE, method='rk4',
-                                                                      t_start=t_100, reference_state=initial_state_2d,
-                                                                      step_offset=checkpoint_mid)
+            state_tfinal, steps_more, t_final = evolve_fixed_timestep(
+                state_t100, dt, remaining_steps, grid, background,
+                hydro, ATMOSPHERE, method='rk4',
+                t_start=t_100, reference_state=initial_state_2d,
+                step_offset=checkpoint_mid,
+                data_manager=data_manager,
+                snapshot_interval=SNAPSHOT_INTERVAL,
+                evolution_interval=EVOLUTION_INTERVAL)
             # t_final already includes t_start from evolve_fixed_timestep
             steps_final = checkpoint_mid + steps_more
             print(f"  -> Reached step {steps_final}, t={t_final:.6e}")
@@ -1342,6 +1654,10 @@ def main():
         failed_idx = np.where(~prim_10000['success'])[0]
         print(f"   Failed points: {failed_idx[:5]} (first 5)")
         print(f"   Failed radii:  {grid.r[failed_idx[:5]]}")
+
+    # Finalize data manager (flush buffers and close files)
+    if ENABLE_DATA_SAVING:
+        data_manager.finalize()
 
     print("\n" + "="*70)
     print(f"Evolution complete. Plots saved to {PLOT_DIR}/:")

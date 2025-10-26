@@ -170,7 +170,9 @@ class FlatSphericalBackground:
     def get_hat_christoffel(self) :
         
         hat_chris = np.zeros([self.N, SPACEDIM, SPACEDIM, SPACEDIM])
-        one_over_r = 1.0 / self.r
+        #one_over_r = 1.0 / self.r
+        one_over_r = 1.0 / np.maximum(self.r, 1e-30)  # En vez de 1.0 / self.r
+
         
         # non zero r comps \Gamma^r_ab
         hat_chris[:,i_r,i_t,i_t] = - self.r
@@ -193,7 +195,9 @@ class FlatSphericalBackground:
     def get_d1_hat_christoffel(self) :
     
         ones = np.ones_like(self.r)
-        one_over_r = 1.0 / self.r
+        #one_over_r = 1.0 / self.r
+        one_over_r = 1.0 / np.maximum(self.r, 1e-30)  # En vez de 1.0 / self.r
+
         one_over_r2 = one_over_r * one_over_r
         
         d1_hat_chris_dx = np.zeros([self.N, SPACEDIM, SPACEDIM, SPACEDIM, SPACEDIM])

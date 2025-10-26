@@ -150,7 +150,12 @@ class SimulationDataManager:
             return
 
         with h5py.File(self.snapshot_file, 'a') as f:
-            snap_group = f['snapshots'].create_group(f'step_{step:08d}')
+            # Check if snapshot already exists, if so skip or overwrite
+            snap_name = f'step_{step:08d}'
+            if snap_name in f['snapshots']:
+                print(f"Warning: Snapshot {snap_name} already exists, skipping...")
+                return
+            snap_group = f['snapshots'].create_group(snap_name)
 
             # Save metadata for this snapshot
             snap_group.attrs['step'] = step
@@ -569,6 +574,102 @@ def plot_surface_zoom(tov_solution, state_t0, state_t1, grid, hydro, window=0.5)
     plt.close(fig)
 
 
+def plot_tov_vs_initial_data_zoom(tov_solution, initial_state_2d, grid, hydro, window=0.5):
+    """Zoom near the stellar surface R to compare TOV solution vs interpolated initial data.
+
+    This plot helps identify interpolation errors and differences between the analytic
+    TOV solution and the discretized initial data on the evolution grid.
+
+    Plots overlays for (ρ0, P, v^r, D, S_r, τ) in a window [R−window, R+window].
+    """
+    R = float(tov_solution['R'])
+    r = grid.r
+    mask = (r >= R - window) & (r <= R + window)
+    if not np.any(mask):
+        return
+
+    # Get primitives from initial data
+    bssn_init = BSSNVars(grid.N)
+    bssn_init.set_bssn_vars(initial_state_2d[:NUM_BSSN_VARS, :])
+    hydro.set_matter_vars(initial_state_2d, bssn_init, grid)
+    prim_init = hydro._get_primitives(bssn_init, r)
+
+    # Get conservatives from initial data
+    D_init = initial_state_2d[NUM_BSSN_VARS + 0, :]
+    Sr_init = initial_state_2d[NUM_BSSN_VARS + 1, :]
+    tau_init = initial_state_2d[NUM_BSSN_VARS + 2, :]
+
+    # Interpolate TOV solution to zoom region
+    r_tov = tov_solution['r']
+    rho_tov = tov_solution['rho']
+    P_tov = tov_solution['P']
+
+    from scipy.interpolate import interp1d
+    rho_tov_interp = interp1d(r_tov, rho_tov, kind='cubic', fill_value=0.0, bounds_error=False)
+    P_tov_interp = interp1d(r_tov, P_tov, kind='cubic', fill_value=0.0, bounds_error=False)
+
+    rho_tov_zoom = rho_tov_interp(r)
+    P_tov_zoom = P_tov_interp(r)
+
+    rZ = r[mask]
+    fig, ax = plt.subplots(2, 3, figsize=(14, 8))
+
+    # Row 1: ρ0, P, v^r
+    ax[0, 0].semilogy(rZ, np.maximum(rho_tov_zoom[mask], 1e-20), 'k-', linewidth=2, label='TOV (analytic)')
+    ax[0, 0].semilogy(rZ, np.maximum(prim_init['rho0'][mask], 1e-20), 'b--', linewidth=1.5, label='Initial Data')
+    ax[0, 0].axvline(R, color='gray', ls=':', linewidth=1.5, label=f'R={R:.3f}')
+    ax[0, 0].set_title('ρ₀ (zoom near surface)', fontsize=11)
+    ax[0, 0].legend(fontsize=9)
+    ax[0, 0].grid(True, alpha=0.3)
+    ax[0, 0].set_ylabel('ρ₀', fontsize=10)
+
+    ax[0, 1].semilogy(rZ, np.maximum(P_tov_zoom[mask], 1e-20), 'k-', linewidth=2)
+    ax[0, 1].semilogy(rZ, np.maximum(prim_init['p'][mask], 1e-20), 'b--', linewidth=1.5)
+    ax[0, 1].axvline(R, color='gray', ls=':', linewidth=1.5)
+    ax[0, 1].set_title('P (zoom near surface)', fontsize=11)
+    ax[0, 1].grid(True, alpha=0.3)
+    ax[0, 1].set_ylabel('P', fontsize=10)
+
+    # v^r should be zero in TOV equilibrium
+    ax[0, 2].plot(rZ, prim_init['vr'][mask], 'b-', linewidth=1.5, label='Initial Data')
+    ax[0, 2].axhline(0, color='k', ls='--', linewidth=2, label='TOV (v=0)')
+    ax[0, 2].axvline(R, color='gray', ls=':', linewidth=1.5)
+    ax[0, 2].set_title('v^r (zoom near surface)', fontsize=11)
+    ax[0, 2].legend(fontsize=9)
+    ax[0, 2].grid(True, alpha=0.3)
+    ax[0, 2].set_ylabel('v^r', fontsize=10)
+
+    # Row 2: D, Sr, tau (conservative variables)
+    ax[1, 0].semilogy(rZ, np.maximum(D_init[mask], 1e-22), 'b-', linewidth=1.5)
+    ax[1, 0].axvline(R, color='gray', ls=':', linewidth=1.5)
+    ax[1, 0].set_title('D (conserved density)', fontsize=11)
+    ax[1, 0].grid(True, alpha=0.3)
+    ax[1, 0].set_ylabel('D', fontsize=10)
+
+    ax[1, 1].plot(rZ, Sr_init[mask], 'b-', linewidth=1.5)
+    ax[1, 1].axhline(0, color='k', ls='--', linewidth=1, label='Expected (S^r=0)')
+    ax[1, 1].axvline(R, color='gray', ls=':', linewidth=1.5)
+    ax[1, 1].set_title('S_r (conserved momentum)', fontsize=11)
+    ax[1, 1].legend(fontsize=9)
+    ax[1, 1].grid(True, alpha=0.3)
+    ax[1, 1].set_ylabel('S_r', fontsize=10)
+
+    ax[1, 2].semilogy(rZ, np.maximum(np.abs(tau_init[mask]), 1e-22), 'b-', linewidth=1.5)
+    ax[1, 2].axvline(R, color='gray', ls=':', linewidth=1.5)
+    ax[1, 2].set_title('τ (conserved energy)', fontsize=11)
+    ax[1, 2].grid(True, alpha=0.3)
+    ax[1, 2].set_ylabel('|τ|', fontsize=10)
+
+    for a in ax.ravel():
+        a.set_xlabel('r [M]', fontsize=10)
+
+    plt.suptitle(f'TOV Solution vs Initial Data: Surface Zoom [R−{window}, R+{window}]',
+                 fontsize=13, y=0.995)
+    plt.tight_layout()
+    plt.savefig(os.path.join(plots_dir, 'tov_vs_initial_zoom.png'), dpi=150, bbox_inches='tight')
+    plt.close(fig)
+
+
 def get_rhs_cowling(t, y, grid, background, hydro, bssn_fixed, bssn_d1_fixed):
     """RHS for Cowling evolution (fixed spacetime)."""
     state = y.reshape((grid.NUM_VARS, grid.N))
@@ -685,6 +786,27 @@ def _apply_atmosphere_reset(state_2d, grid, hydro, atmosphere, rho_threshold=Non
     return state_2d
 
 
+def enforce_origin_symmetry(state_2d):
+    """
+    Enforce spherical symmetry at origin: set momentum S^r = 0 at first interior cell.
+
+    By spherical symmetry, velocity must be exactly zero at r=0. This prevents
+    spurious mass creation from connection terms -Γ*F near origin where Γ ~ 200/M.
+
+    Args:
+        state_2d: State array with shape (NUM_VARS, N)
+
+    Returns:
+        Modified state_2d with S^r = 0 at first interior cell
+    """
+    NUM_GHOSTS = 3
+    # S^r_tilde is at index 7 (after 6 BSSN variables + D)
+    # Index ordering: [phi, h_rr, h_tt, h_pp, K, a_rr, D, Sr, tau]
+    #                  0    1     2     3     4   5     6  7   8
+    state_2d[7, NUM_GHOSTS] = 0.0
+    return state_2d
+
+
 def rk4_step(state_flat, dt, grid, background, hydro, bssn_fixed, bssn_d1_fixed, atmosphere):
     """
     Single RK4 (classical 4th order Runge-Kutta) timestep with atmosphere reset.
@@ -697,14 +819,23 @@ def rk4_step(state_flat, dt, grid, background, hydro, bssn_fixed, bssn_d1_fixed,
 
     # Stage 2
     state_2 = state_flat + 0.5 * dt * k1
+    s2 = state_2.reshape((grid.NUM_VARS, grid.N))
+    enforce_origin_symmetry(s2)
+    state_2 = s2.flatten()
     k2 = get_rhs_cowling(0, state_2, grid, background, hydro, bssn_fixed, bssn_d1_fixed)
 
     # Stage 3
     state_3 = state_flat + 0.5 * dt * k2
+    s3 = state_3.reshape((grid.NUM_VARS, grid.N))
+    enforce_origin_symmetry(s3)
+    state_3 = s3.flatten()
     k3 = get_rhs_cowling(0, state_3, grid, background, hydro, bssn_fixed, bssn_d1_fixed)
 
     # Stage 4
     state_4 = state_flat + dt * k3
+    s4 = state_4.reshape((grid.NUM_VARS, grid.N))
+    enforce_origin_symmetry(s4)
+    state_4 = s4.flatten()
     k4 = get_rhs_cowling(0, state_4, grid, background, hydro, bssn_fixed, bssn_d1_fixed)
 
     # Combine
@@ -813,7 +944,8 @@ def evolve_fixed_timestep(state_initial, dt, num_steps, grid, background, hydro,
 
         t_curr = t_start + (step + 1) * dt
         step_num = step_offset + step + 1
-        print(f"step {step_num:4d}  t={t_curr:.6e}:  ρ_c={rho_central:.6e}  max_Δρ/ρ={max_rel_rho_err:.3e}  "
+        if step_num % 200 == 0:
+            print(f"step {step_num:4d}  t={t_curr:.6e}:  ρ_c={rho_central:.6e}  max_Δρ/ρ={max_rel_rho_err:.3e}  "
               f"max_vʳ={max_abs_v:.3e}  max_D={max_D:.3e}  max_Sʳ={max_Sr:.3e}  "
               f"max_τ={max_tau:.3e}  c2p_fail={c2p_fail_count}")
 
@@ -902,9 +1034,6 @@ def evolve_fixed_timestep(state_initial, dt, num_steps, grid, background, hydro,
         state_flat = state_flat_next
         prim_prev, s_prev = prim_next, s_next
 
-        # Light progress marker
-        if (step + 1) % 20 == 0:
-            print(f"  Step {step_num}/{step_offset + num_steps} OK  (t={t_curr:.6e})")
 
     # Final flush of buffers if data manager is provided
     if data_manager and data_manager.enable_saving:
@@ -1396,7 +1525,7 @@ def main():
     # CONFIGURATION
     # ==================================================================
     r_max = 16.0
-    num_points = 800
+    num_points = 500
     K = 100.0
     Gamma = 2.0
     rho_central = 1.28e-3
@@ -1408,7 +1537,7 @@ def main():
     # ==================================================================
     ENABLE_DATA_SAVING = True  # Set to True to save data to files
     OUTPUT_DIR = "tov_evolution_data2"  # Directory for output data
-    SNAPSHOT_INTERVAL = 1000  # Save full domain every N timesteps (None to disable)
+    SNAPSHOT_INTERVAL = 100  # Save full domain every N timesteps (None to disable)
     EVOLUTION_INTERVAL = 100  # Save time series every N timesteps (None to disable)
 
     if ENABLE_DATA_SAVING:
@@ -1504,6 +1633,9 @@ def main():
 
     # Initial-data diagnostics
     tov_id.plot_initial_comparison(tov_solution, initial_state_2d, grid, hydro)
+
+    # Zoom comparison: TOV solution vs interpolated initial data
+    plot_tov_vs_initial_data_zoom(tov_solution, initial_state_2d, grid, hydro, window=0.1)
 
     # ==================================================================
     # EVOLUTION

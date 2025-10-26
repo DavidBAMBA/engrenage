@@ -31,7 +31,6 @@ from source.bssn.tensoralgebra import (
     get_bar_A_LL,
     get_hat_D_bar_gamma_LL,
 )
-from source.backgrounds.sphericalbackground import i_r, i_t, i_p
 from source.core.spacing import NUM_GHOSTS
 from source.matter.hydro.cons2prim import prim_to_cons
 from source.matter.hydro.atmosphere import AtmosphereParams
@@ -41,10 +40,7 @@ class ValenciaReferenceMetric:
     """Valencia formulation - full 3D tensor algebra following BSSN pattern."""
 
     def __init__(self, boundary_mode="parity", *, atmosphere=None,
-                 atmosphere_rho=None, p_floor=None, v_max=None,
-                 enable_surface_flattening=True,
-                 rho_surface_threshold=1.0e-6,
-                 surface_jump_max=50.0):
+                 atmosphere_rho=None, p_floor=None, v_max=None):
         """
         Initialize Valencia formulation.
 
@@ -54,7 +50,7 @@ class ValenciaReferenceMetric:
             "parity" - Parity boundary conditions at inner boundary (r=0)
             "outflow" - Outflow (zero-gradient) at both boundaries
         atmosphere : AtmosphereParams, optional
-            Centralized atmosphere configuration 
+            Centralized atmosphere configuration
         atmosphere_rho : float, optional
             Deprecated - use atmosphere instead
         p_floor : float, optional
@@ -78,11 +74,6 @@ class ValenciaReferenceMetric:
                 atmosphere = AtmosphereParams()
 
         self.atmosphere = atmosphere
-
-        # Controls for added robustness at the stellar surface
-        self.enable_surface_flattening = bool(enable_surface_flattening)
-        self.rho_surface_threshold = float(rho_surface_threshold)
-        self.surface_jump_max = float(surface_jump_max)
 
         # Geometric quantities
         # These will be computed by _extract_geometry()
@@ -484,27 +475,6 @@ class ValenciaReferenceMetric:
         src_S_vector = alpha[:, None] * vol_element[:, None] * (
             first_term + second_term + third_term
         )
-        
-        # --- Debug: print once contributions at first interior cell (r ~ 0) ---
-        if not getattr(self, '_debug_source_once', False):
-            try:
-                i0 = NUM_GHOSTS
-                print("\n[Valencia debug] Source-term internals (first interior cell):")
-                print(f"  r[i0]={r[i0]:.6e}, alpha={alpha[i0]:.6e}, e6phi={vol_element[i0]:.6e} (≈√γ)")
-                # Angular velocities should be zero by spherical symmetry
-                print(f"  v_theta={v_U[i0,1]:.6e}, v_phi={v_U[i0,2]:.6e}")
-                # T^{θθ}, T^{φφ}
-                print(f"  T4UU[θθ]={T4UU['ij'][i0,1,1]:.6e}, T4UU[φφ]={T4UU['ij'][i0,2,2]:.6e}")
-                # ∇̂_r γ_{θθ}, ∇̂_r γ_{φφ}
-                print(f"  hatD_gamma_LL[r,θ,θ]={hatD_gamma_LL[i0, i_r, i_t, i_t]:.6e}, hatD_gamma_LL[r,φ,φ]={hatD_gamma_LL[i0, i_r, i_p, i_p]:.6e}")
-                # ∂_r α
-                print(f"  dalpha_dr={dalpha_dx[i0, i_r]:.6e}")
-                # Momentum source terms components
-                print(f"  first_term[r]={first_term[i0]:.6e}, second_term[r]={second_term[i0]:.6e}, third_term[r]={third_term[i0]:.6e}")
-                print(f"  src_S_vector[r]={src_S_vector[i0,0]:.6e}")
-            except Exception:
-                pass
-            self._debug_source_once = True
 
         # Return full 3D momentum source vector and energy source
         return src_S_vector, src_tau  # (N, 3), (N,)
@@ -572,6 +542,16 @@ class ValenciaReferenceMetric:
         elif v_U.shape[1] != SPACEDIM:
             raise ValueError(f"Velocity shape {v_U.shape} incompatible with SPACEDIM={SPACEDIM}")
 
+        # ====================================================================
+        # SPHERICAL SYMMETRY: Enforce v^r = 0 at origin (first interior cell)
+        # ====================================================================
+        # By spherical symmetry, radial velocity MUST be exactly zero at r=0.
+        # Even tiny numerical drift (v^r ~ 1e-6) gets amplified by large
+        # Christoffel symbols (Γ ~ 200/M) near origin, creating spurious
+        # connection terms that act as mass sources.
+        if self.boundary_mode == "parity":
+            v_U[NUM_GHOSTS, 0] = 0.0  # Force v^r = 0 at r ≈ 0
+
         # Extract geometry (α, β^i, γ_ij, √γ, √ĝ, dr, etc.) early, as W may need γ_ij
         self._extract_geometry(r, bssn_vars, spacetime_mode, background, grid)
 
@@ -592,7 +572,7 @@ class ValenciaReferenceMetric:
         tau = tau.copy()
 
         # Compute NRPy-style partial fluxes at interfaces using α e^{6φ} at faces
-        F_D_face, F_S_tildeD_face, F_tau_face, debug_faces = self._compute_interface_fluxes(
+        F_D_face, F_S_tildeD_face, F_tau_face = self._compute_interface_fluxes(
             rho0, v_U, pressure, r, eos, reconstructor, riemann_solver, bssn_vars
         )
 
@@ -657,48 +637,6 @@ class ValenciaReferenceMetric:
             for i in range(SPACEDIM):
                 F_S_no_ghat[:, j, i] = alpha * e6phi_c * T4UD['i_j'][:, j, i]
 
-        # Debug print once: inspect first-interior-cell flux balance near origin
-        if not getattr(self, '_debug_printed_once', False):
-            try:
-                i0 = NUM_GHOSTS
-                kL = i0 - 1
-                kR = i0
-                print("\n[Valencia debug] First interior cell diagnostics:")
-                print(f"  i0={i0}, r={r[i0]:.6e}")
-                # Face fluxes (densitized) entering divergence
-                print(f"  Faces kL={kL}, kR={kR} (len faces={len(F_D_face)})")
-                print(f"    F_D_face[kL:kR]    = {[F_D_face[kL], F_D_face[kR]] if kR < len(F_D_face) else 'n/a'}")
-                print(f"    F_tau_face[kL:kR]  = {[F_tau_face[kL], F_tau_face[kR]] if kR < len(F_tau_face) else 'n/a'}")
-                print(f"    F_S_face_r[kL:kR]  = {[F_S_tildeD_face[kL,0], F_S_tildeD_face[kR,0]] if kR < len(F_S_tildeD_face) else 'n/a'}")
-                # Center flux pieces
-                print(f"  Center densitization: alpha={alpha[i0]:.6e}, e6phi={e6phi_c[i0]:.6e}")
-                print(f"    fD_U[i0,0]   = {fD_U[i0,0]:.6e}")
-                print(f"    fTau_U[i0,0] = {fTau_U[i0,0]:.6e}")
-                print(f"    F_S_c_r[i0]  = {F_S_no_ghat[i0,0,0]:.6e}")
-                # Connection pieces
-                Gamma_trace = np.einsum('xkkj->xj', hat_chris)
-                print(f"  Gamma_trace_r[i0] = {Gamma_trace[i0,0]:.6e}")
-                # Face densitization params if available
-                if debug_faces:
-                    af = debug_faces.get('alpha_f', None)
-                    e6f = debug_faces.get('e6phi_f', None)
-                    rhoL = debug_faces.get('rhoL', None)
-                    rhoR = debug_faces.get('rhoR', None)
-                    vL = debug_faces.get('vL', None)
-                    vR = debug_faces.get('vR', None)
-                    pL = debug_faces.get('pL', None)
-                    pR = debug_faces.get('pR', None)
-                    if af is not None and e6f is not None and kR < len(af):
-                        print(f"  Face params: alpha_f[kL:kR]={[af[kL], af[kR]] if kR < len(af) else 'n/a'}, e6phi_f[kL:kR]={[e6f[kL], e6f[kR]] if kR < len(e6f) else 'n/a'}")
-                    if rhoL is not None and vL is not None and pL is not None:
-                        print(f"  Reconstructed at kL: rhoL={rhoL[kL]:.6e}, vL={vL[kL]:.6e}, pL={pL[kL]:.6e}")
-                    if rhoR is not None and vR is not None and pR is not None:
-                        print(f"  Reconstructed at kL: rhoR={rhoR[kL]:.6e}, vR={vR[kL]:.6e}, pR={pR[kL]:.6e}")
-                self._debug_printed_once = True
-            except Exception as _e:
-                # Don't let debugging break evolution
-                self._debug_printed_once = True
-
         # Connection contributions
         Gamma_trace = np.einsum('xkkj->xj', hat_chris)
         conn_D = -np.einsum('xj,xj->x', Gamma_trace, fD_U)
@@ -723,27 +661,6 @@ class ValenciaReferenceMetric:
 
         rhs_S_tildeD += src_S_tildeD  # Vector addition - all three components
         rhs_tau += src_tau
-
-        # Second debug block: full balance in first interior cell
-        if not getattr(self, '_debug_balance_printed', False):
-            try:
-                i0 = NUM_GHOSTS
-                kL = i0 - 1
-                kR = i0
-                inv_vol = 1.0 / (self.dr + 1e-30)
-                divS_i0 = -(F_S_tildeD_face[kR, 0] - F_S_tildeD_face[kL, 0]) * inv_vol
-                # Connection term at center for i=radial
-                Gamma_trace = np.einsum('xkkj->xj', hat_chris)
-                term1 = -np.einsum('j,ji->', Gamma_trace[i0, :], F_S_no_ghat[i0, :, :][:, 0])
-                term2 = np.einsum('lji,jl->', hat_chris[i0, :, :, 0], F_S_no_ghat[i0, :, :])
-                connS_i0 = term1 + term2
-                srcS_i0 = src_S_tildeD[i0, 0]
-                print("[Valencia debug] Balance at first interior cell:")
-                print(f"  divS = {divS_i0:.6e}, connS = {connS_i0:.6e}, srcS = {srcS_i0:.6e}")
-                print(f"  rhs_S(i0) = {rhs_S_tildeD[i0,0]:.6e}")
-                self._debug_balance_printed = True
-            except Exception:
-                self._debug_balance_printed = True
 
         # Preserve backward-compatible shape: if input momentum was 1D, return RHS radial as (N,)
         if _return_radial_only:
@@ -779,7 +696,6 @@ class ValenciaReferenceMetric:
                 F_D_face: (N_faces,) density flux
                 F_S_tildeD_face: (N_faces, 3) momentum flux (only [:, 0] non-zero)
                 F_tau_face: (N_faces,) energy flux
-                debug_info: dict with diagnostic information
         """
         N = len(r)
 
@@ -831,66 +747,6 @@ class ValenciaReferenceMetric:
                 rhoR[0] = rho_ref
                 pL[0] = p_ref
                 pR[0] = p_ref
-        
-        # ========== COMMENTED OUT:  ==========
-        # This "atmosphere flattening" code averages reconstructed states near
-        # low-density regions. However:
-        # 1. NRPy+ does NOT implement this (confirmed via codebase search)
-        # 2. Not mentioned in GRHD literature (Font, Baumgarte, etc.)
-        # 3. Destroys high-order reconstruction (WENO5 → order-0 averaging)
-        # 4. The diagnostic shows WENO5 produces negative density overshoots
-        #    at the sharp surface discontinuity (rhoL = -4e-7), but flattening
-        #    hides this rather than fixing the root cause
-        #
-        # The correct approach is to use apply_physical_limiters() in
-        # reconstruction.py which applies floors WITHOUT destroying high-order
-        # reconstruction everywhere.
-        #
-        # Original code:
-        # dens_floor = max(self.atmosphere.rho_floor, 1e-20)
-        # thr = 30.0 * dens_floor
-        # if len(rhoL) > 0:
-        #     mask = (rhoL < thr) | (rhoR < thr)
-        #     if np.any(mask):
-        #         rho_avg = 0.5 * (rhoL + rhoR)
-        #         p_avg = np.maximum(0.5 * (pL + pR), self.atmosphere.p_floor)
-        #         rhoL[mask] = rho_avg[mask]
-        #         rhoR[mask] = rho_avg[mask]
-        #         pL[mask] = p_avg[mask]
-        #         pR[mask] = p_avg[mask]
-        #         vL[mask] = 0.0
-        #         vR[mask] = 0.0
-        # ========== END COMMENT ==========
-
-        # ========== ALSO COMMENTED OUT: Surface-aware flattening ==========
-        # This is another averaging/flattening strategy that is not in NRPy+.
-        # Same issues as above: destroys high-order reconstruction.
-        #
-        # Original code:
-        # if self.enable_surface_flattening and len(rhoL) > 0:
-        #     surface_thr = max(self.rho_surface_threshold, 100.0 * self.atmosphere.rho_floor)
-        #     denom = np.maximum(np.minimum(rhoL, rhoR), 1e-30)
-        #     jump_ratio = np.maximum(rhoL, rhoR) / denom
-        #     mask_surf = (rhoL < surface_thr) | (rhoR < surface_thr) | (jump_ratio > 10.0)
-        #     if np.any(mask_surf):
-        #         extreme_jump = jump_ratio > 1000.0
-        #         rho_avg = 0.5 * (rhoL + rhoR)
-        #         p_avg = np.maximum(0.5 * (pL + pR), self.atmosphere.p_floor)
-        #         rhoL[mask_surf] = np.maximum(rho_avg[mask_surf], self.atmosphere.rho_floor)
-        #         rhoR[mask_surf] = np.maximum(rho_avg[mask_surf], self.atmosphere.rho_floor)
-        #         pL[mask_surf] = p_avg[mask_surf]
-        #         pR[mask_surf] = p_avg[mask_surf]
-        #         vL[mask_surf] = 0.0
-        #         vR[mask_surf] = 0.0
-        #         if np.any(extreme_jump):
-        #             rhoL[extreme_jump] = self.atmosphere.rho_floor
-        #             rhoR[extreme_jump] = self.atmosphere.rho_floor
-        #             pL[extreme_jump] = self.atmosphere.p_floor
-        #             pR[extreme_jump] = self.atmosphere.p_floor
-        #             vL[extreme_jump] = 0.0
-        #             vR[extreme_jump] = 0.0
-        # ========== END COMMENT ==========
-        
         # Apply physical limiters if available
         if hasattr(reconstructor, "apply_physical_limiters"):
             (rhoL, vL, pL), (rhoR, vR, pR) = reconstructor.apply_physical_limiters(
@@ -947,14 +803,5 @@ class ValenciaReferenceMetric:
         # F_S_tildeD_face[:, 1] = 0  # Secondary direction (no flux in 1D)
         # F_S_tildeD_face[:, 2] = 0  # Tertiary direction (no flux in 1D)
 
-        # Debug info for diagnostics
-        debug_info = {
-            'alpha_f': alpha_f,
-            'e6phi_f': e6phi_f,
-            'rhoL': rhoL, 'rhoR': rhoR,
-            'vL': vL, 'vR': vR,
-            'pL': pL, 'pR': pR,
-        }
-
-        return F_batch[:, 0], F_S_tildeD_face, F_batch[:, 2], debug_info
+        return F_batch[:, 0], F_S_tildeD_face, F_batch[:, 2]
 

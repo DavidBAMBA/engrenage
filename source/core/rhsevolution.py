@@ -9,6 +9,7 @@ from source.core.grid import Grid
 from source.bssn.tensoralgebra import *
 from source.bssn.bssnrhs import *
 from source.bssn.bssnvars import BSSNVars
+from source.bssn.bssnstatevariables import NUM_BSSN_VARS
 
 # function that returns the rhs for each of the field vars
 # track whether we've already performed the initial determinant check to avoid
@@ -147,17 +148,25 @@ def get_rhs(t_i, current_state: np.ndarray, grid: Grid, background, matter, prog
         check_time_4 = time.time()
         print("time for rhs is, ", check_time_4-check_time_3)    
     
-    ####################################################################################################            
+    ####################################################################################################
     # Add Kreiss Oliger dissipation which removes noise at frequency of grid resolution
-    
+    # NOTE: KO dissipation is ONLY applied to BSSN variables, NOT to hydrodynamic variables.
+    # Hydro variables already have dissipation from the HLL Riemann solver.
+
     # kreiss-oliger damping coefficient, max_step should be limited to avoid instability
-    # max sigma ~ dx / dt so dt max = dx / sigma. 
+    # max sigma ~ dx / dt so dt max = dx / sigma.
     # Since dt < 0.5 dx_min for stability anyway we can usually quite safely pick sigma = 1.0
     # but it seems to work best when weighted by the lapse and conformal factor too
     sigma = 1.0 * bssn_vars.lapse * np.exp(-2.0*bssn_vars.phi)
-    
-    diss = sigma * grid.get_kreiss_oliger_diss(unflattened_state)
-    rhs_state += sigma * diss 
+
+    # Create indices for BSSN variables only (first NUM_BSSN_VARS variables)
+    bssn_indices = np.arange(NUM_BSSN_VARS, dtype=np.uint8)
+
+    # Compute KO dissipation only for BSSN variables
+    diss_bssn = grid.get_kreiss_oliger_diss(unflattened_state, indices=bssn_indices)
+
+    # Apply dissipation only to BSSN part of rhs_state
+    rhs_state[:NUM_BSSN_VARS] += sigma * diss_bssn[:NUM_BSSN_VARS] 
     
     if (timing_on) :    
         check_time_5 = time.time()
