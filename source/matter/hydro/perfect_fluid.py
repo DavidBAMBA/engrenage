@@ -10,13 +10,14 @@ from .valencia_reference_metric import ValenciaReferenceMetric
 from .cons2prim import Cons2PrimSolver
 from .eos import IdealGasEOS
 from .atmosphere import AtmosphereParams, create_default_atmosphere
+from .geometry import ADMGeometry
+from .stress_energy import StressEnergyTensor
 
 
 class PerfectFluid:
     """
     Relativistic perfect fluid implementation for engrenage.
 
-    Follows the engrenage matter interface pattern used by ScalarMatter and NoMatter.
     Implements Valencia formulation for conservative evolution and provides
     stress-energy tensor for BSSN coupling.
 
@@ -53,7 +54,7 @@ class PerfectFluid:
         self.eos = eos if eos is not None else IdealGasEOS()
         self.spacetime_mode = spacetime_mode
 
-        # Atmosphere configuration (centralized)
+        # Atmosphere configuration
         if atmosphere is None:
             self.atmosphere = AtmosphereParams()  # Default
         elif isinstance(atmosphere, (int, float)):
@@ -69,15 +70,15 @@ class PerfectFluid:
             self.eos,
             atmosphere=self.atmosphere,
             tol=1e-10,
-            max_iter=200
+            max_iter=100
         )
 
         # Numerical methods for Valencia evolution
-        # Note: Boundary conditions now handled by Grid.fill_boundaries()
-        self.valencia = ValenciaReferenceMetric(
-            atmosphere=self.atmosphere  # Pass centralized atmosphere
-        )
+        self.valencia = ValenciaReferenceMetric(atmosphere=self.atmosphere )
         self.reconstructor = reconstructor
+        # CRITICAL FIX: Pass atmosphere to reconstructor so floors are applied
+        if self.reconstructor is not None:
+            self.reconstructor.atmosphere = self.atmosphere
         self.riemann_solver = riemann_solver
 
         # State variables (engrenage pattern)
@@ -109,34 +110,46 @@ class PerfectFluid:
         N = len(r)
         emtensor = EMTensor(N)
 
-        # Primitivas
+        # Primitive variables
         prim = self._get_primitives(bssn_vars, r)
         rho0, vr, p, W, h = prim['rho0'], prim['vr'], prim['p'], prim['W'], prim['h']
 
-        # Geometría coherente con BSSN
-        from source.bssn.tensoralgebra import get_bar_gamma_LL
+        # Build ADM geometry from BSSN variables
+        from source.bssn.tensoralgebra import get_bar_gamma_LL as _get_bar_gamma_LL
         phi = np.asarray(bssn_vars.phi, dtype=float)
-        e4phi = np.exp(4.0*phi)
-        bar_gamma_LL = get_bar_gamma_LL(r, bssn_vars.h_LL, background)   # \bar γ_ij
-        gamma_LL = e4phi[:,None,None] * bar_gamma_LL                     # γ_ij
-        gamma_UU = np.linalg.inv(gamma_LL)                               # γ^{ij}
+        e4phi = np.exp(4.0 * phi)
+        bar_gamma_LL = _get_bar_gamma_LL(r, bssn_vars.h_LL, background)
+        gamma_LL = e4phi[:, None, None] * bar_gamma_LL
 
-        # Energía: ρ = ρ0 h W^2 - p
-        emtensor.rho = rho0*h*W*W - p
+        # Shift and lapse
+        if hasattr(bssn_vars, 'lapse') and bssn_vars.lapse is not None:
+            alpha = np.asarray(bssn_vars.lapse, dtype=float)
+        else:
+            alpha = np.ones(N)
 
-        # Velocidades espacial abajo: v_i = γ_ij v^j (v^θ=v^φ=0)
-        vU = np.zeros((N, 3))
-        vU[:,0] = vr
-        vD = np.einsum('xij,xj->xi', gamma_LL, vU)
+        beta_U = np.zeros((N, SPACEDIM))
+        if hasattr(bssn_vars, 'shift_U') and bssn_vars.shift_U is not None:
+            shift_arr = np.asarray(bssn_vars.shift_U)
+            if shift_arr.ndim >= 2:
+                for i in range(min(SPACEDIM, shift_arr.shape[1])):
+                    beta_U[:, i] = shift_arr[:, i]
 
-        # Momentum abajo y tensores de esfuerzo abajo
-        pref = (rho0 * h * W * W)
-        emtensor.Si  = pref[:, None] * vD  # S_i with proper broadcasting
-        emtensor.Sij = pref[:, None, None] * np.einsum('xi,xj->xij', vD, vD) \
-                       + p[:, None, None] * gamma_LL  # S_ij
+        geom = ADMGeometry(alpha=alpha, beta_U=beta_U, gamma_LL=gamma_LL)
 
-        # Traza S = γ^{ij} S_{ij}
-        emtensor.S   = np.einsum('xij,xij->x', gamma_UU, emtensor.Sij)
+        # 3-velocity vector (spherical symmetry -> only radial component non-zero)
+        v_U = np.zeros((N, SPACEDIM))
+        v_U[:, 0] = vr
+
+        # Compute stress-energy tensor and ADM projections
+        st = StressEnergyTensor(geometry=geom, rho0=rho0, v_U=v_U,
+                                pressure=p, W=W, h=h)
+        em = st.project_to_ADM()
+
+        # Map to BSSN EMTensor object for compatibility
+        emtensor.rho = em.rho
+        emtensor.Si = em.S_D
+        emtensor.Sij = em.S_DD
+        emtensor.S = em.S
         return emtensor
 
     def get_matter_rhs(self, r, bssn_vars, bssn_d1, background):
@@ -151,15 +164,28 @@ class PerfectFluid:
         # Convert to primitive variables
         primitives = self._get_primitives(bssn_vars, r)
 
-        # Valencia evolution equations
-        dDdt, dSrdt, dtaudt = self.valencia.compute_rhs(
-            self.D, self.Sr, self.tau,
-            primitives['rho0'], primitives['vr'], primitives['p'],
+        # Prepare 3D inputs for Valencia (spherical symmetry: only radial components non-zero)
+        N = len(r)
+        v_U = np.zeros((N, SPACEDIM))
+        v_U[:, 0] = primitives['vr']  # Radial velocity
+        # Angular velocities remain zero for spherical symmetry
+
+        S_tildeD = np.zeros((N, SPACEDIM))
+        S_tildeD[:, 0] = self.Sr  # Radial momentum
+        # Angular momenta remain zero for spherical symmetry
+
+        # Valencia evolution equations (now fully 3D)
+        dDdt, dS_tildeD, dtaudt = self.valencia.compute_rhs(
+            self.D, S_tildeD, self.tau,
+            primitives['rho0'], v_U, primitives['p'],
             primitives['W'], primitives['h'],
             r, bssn_vars, bssn_d1, background,
             self.spacetime_mode, self.eos, self.grid,
             self.reconstructor, self.riemann_solver
         )
+
+        # Extract radial component for state vector (maintaining 1D storage in PerfectFluid)
+        dSrdt = dS_tildeD[:, 0]
 
         return np.array([dDdt, dSrdt, dtaudt])
 
@@ -175,17 +201,14 @@ class PerfectFluid:
         beta_r = self.valencia.beta_U[:, 0]
         gamma_rr = self.valencia.gamma_LL[:, 0, 0]
 
-        metric = {
-            "alpha": alpha,
-            "beta_r": beta_r,
-            "gamma_rr": gamma_rr,
-        }
+        # Pass arrays directly as tuples (more efficient than dicts)
+        metric = (alpha, beta_r, gamma_rr)
+        U = (self.D, self.Sr, self.tau)
 
         # Use pressure cache if available
         p_guess = self.pressure_cache
 
         # Call cons2prim solver (now with intelligent floor application)
-        U = {"D": self.D, "Sr": self.Sr, "tau": self.tau}
         primitives = self.cons2prim_solver.convert(
             U=U,
             metric=metric,

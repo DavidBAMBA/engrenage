@@ -20,7 +20,7 @@ class AtmosphereParams:
     Centralized atmospheric parameters for hydrodynamics.
 
     These parameters control floors, ceilings, and fallback values throughout
-    the hydrodynamics evolution pipeline.
+    the hydrodynamics evolution pipeline, following IllinoisGRMHD/NRPy.
 
     Attributes
     ----------
@@ -36,12 +36,14 @@ class AtmosphereParams:
         Safety factor for tau atmosphere: tau_atm = factor * p_floor. Default: 1.0
     conservative_floor_safety : float
         Safety factor for conservative variable floors (0.999999 in IllinoisGRMHD)
+    mb : float
+        Baryon mass for ideal gas EOS (in geometric units). Default: 1.0
 
     Usage
     -----
     Create once at the top level (e.g., in TOVEvolution script):
 
-        atm_params = AtmosphereParams(rho_floor=1e-14, p_floor=1e-16)
+        atm_params = AtmosphereParams(rho_floor=1e-14, T_floor=1e-8)
         matter = PerfectFluid(eos=eos, atmosphere=atm_params)
 
     All subsystems (cons2prim, valencia, reconstruction, riemann) will use
@@ -49,8 +51,10 @@ class AtmosphereParams:
     """
 
     # Primary floors
-    rho_floor: float = 1e-13
-    p_floor: float = 1e-15
+    rho_floor: float = 1e-10
+    p_floor: float = 1e-11
+    # No explicit temperature or threshold here; NRPy floors rely on
+    # p_floor and rho_floor directly.
 
     # Velocity and Lorentz factor limits
     v_max: float = 0.999999
@@ -60,12 +64,16 @@ class AtmosphereParams:
     tau_atm_factor: float = 1.0  # tau_atm = tau_atm_factor * p_floor
     conservative_floor_safety: float = 0.999999  # Safety factor for inequalities
 
+    # Baryon mass for ideal gas EOS
+    mb: float = 1.0
+
     def __post_init__(self):
         """Validate parameters."""
         if self.rho_floor <= 0:
             raise ValueError(f"rho_floor must be positive, got {self.rho_floor}")
         if self.p_floor <= 0:
             raise ValueError(f"p_floor must be positive, got {self.p_floor}")
+        # No temperature or rho_threshold checks in NRPy-style params
         if not 0 < self.v_max < 1:
             raise ValueError(f"v_max must be in (0, 1), got {self.v_max}")
         if self.W_max <= 1:
@@ -75,6 +83,8 @@ class AtmosphereParams:
     def tau_atm(self):
         """Atmosphere value for tau (energy density)."""
         return self.tau_atm_factor * self.p_floor
+
+
 
     def to_cons2prim_params(self):
         """Export parameters in format expected by Cons2PrimSolver."""
@@ -112,7 +122,7 @@ class FloorApplicator:
 
     def apply_primitive_floors(self, rho0, vr, p, gamma_rr):
         """
-        Apply floors to primitive variables.
+        Apply floors to primitive variables (NRPy/IllinoisGRMHD-style).
 
         Parameters
         ----------
@@ -130,19 +140,30 @@ class FloorApplicator:
         rho0_floor, vr_floor, p_floor : arrays
             Floored primitive variables
         """
-        # Density floor
-        rho0_floor = np.maximum(rho0, self.atm.rho_floor)
+        # Atmosphere: if rho < rho_floor, apply full atmosphere
+        atmosphere_mask = rho0 < self.atm.rho_floor
 
-        # Pressure floor (can depend on EOS if needed)
-        p_floor = np.maximum(p, self.atm.p_floor)
-
-        # Velocity limit
+        rho0_floor = np.copy(rho0)
         vr_floor = np.copy(vr)
-        v2 = gamma_rr * vr**2
+        p_floor = np.copy(p)
+
+        # Apply atmosphere where below floor
+        if np.any(atmosphere_mask):
+            rho0_floor[atmosphere_mask] = self.atm.rho_floor
+            vr_floor[atmosphere_mask] = 0.0  # Zero velocity in atmosphere
+            # Use pressure floor directly
+            p_floor[atmosphere_mask] = self.atm.p_floor
+
+        # Also apply minimum floors regardless
+        rho0_floor = np.maximum(rho0_floor, self.atm.rho_floor)
+        p_floor = np.maximum(p_floor, self.atm.p_floor)
+
+        # Velocity limit (apply everywhere)
+        v2 = gamma_rr * vr_floor**2
         violation_mask = v2 >= self.atm.v_max**2
         if np.any(violation_mask):
             vr_floor[violation_mask] = (
-                np.sign(vr[violation_mask]) * self.atm.v_max /
+                np.sign(vr_floor[violation_mask]) * self.atm.v_max /
                 np.sqrt(np.maximum(gamma_rr[violation_mask], 1e-30))
             )
 
@@ -239,6 +260,168 @@ class FloorApplicator:
         else:
             # Ideal gas: h = 1 + ε + P/ρ
             h[mask] = 1.0 + eps[mask] + self.atm.p_floor / self.atm.rho_floor
+
+
+def apply_atmosphere_to_state(state, atmosphere, NUM_BSSN_VARS=12, gamma=2.0):
+    """
+    Apply atmosphere floors to the complete state array after RK substeps.
+
+    Following AthenaK approach: apply floors to conserved variables directly
+    when density falls below threshold.
+
+    Parameters
+    ----------
+    state : array
+        State array with shape (NUM_VARS, N) containing conservative variables
+    atmosphere : AtmosphereParams
+        Atmosphere parameters
+    NUM_BSSN_VARS : int
+        Number of BSSN variables (default 12)
+    gamma : float
+        Adiabatic index for EOS (default 2.0)
+
+    Returns
+    -------
+    None (modifies state in-place)
+    """
+    # Extract conservative variables
+    # Hydro variables start after BSSN variables: D, Sr, tau
+    D = state[NUM_BSSN_VARS + 0, :]
+    Sr = state[NUM_BSSN_VARS + 1, :]
+    tau = state[NUM_BSSN_VARS + 2, :]
+
+    # Check where atmosphere should be applied based on density floor
+    # D ≈ rho for our purpose here
+    atmosphere_mask = D < atmosphere.rho_floor
+
+    if np.any(atmosphere_mask):
+        # Set atmosphere values following AthenaK
+        D[atmosphere_mask] = atmosphere.rho_floor  # Conservative density
+        Sr[atmosphere_mask] = 0.0  # Zero momentum
+
+        # For tau (energy), compute for fluid at rest (v=0, W=1)
+        # tau = rho * h * W^2 - P - rho * W = rho * h - P - rho
+        # For polytropic EOS: h = 1 + eps + P/rho
+        # where eps = P/(rho*(gamma-1)) for polytrope
+        # So: tau = rho*(1 + eps + P/rho) - P - rho = rho*eps
+        # For our polytrope: eps = P/(rho*(gamma-1))
+        # Use the atmosphere pressure for consistency
+        # gamma now comes from parameter, ensuring consistency with EOS
+        eps_atm = atmosphere.p_floor / (atmosphere.rho_floor * (gamma - 1.0))
+        tau[atmosphere_mask] = atmosphere.rho_floor * eps_atm
+
+        # Update state array
+        state[NUM_BSSN_VARS + 0, :] = D
+        state[NUM_BSSN_VARS + 1, :] = Sr
+        state[NUM_BSSN_VARS + 2, :] = tau
+
+    # Also apply minimum floors to ensure no negative values
+    state[NUM_BSSN_VARS + 0, :] = np.maximum(state[NUM_BSSN_VARS + 0, :], atmosphere.rho_floor)
+    state[NUM_BSSN_VARS + 2, :] = np.maximum(state[NUM_BSSN_VARS + 2, :], atmosphere.tau_atm)
+
+
+def apply_floors_to_state(state_2d, grid, hydro, rho_threshold=None):
+    """
+    IllinoisGRMHD/NRPy-style floor application to both primitives and conservatives.
+
+    This function centralizes atmosphere handling following the IllinoisGRMHD
+    strategy (Etienne+ 2012, Appendix A):
+      1) Recover primitives (cons2prim)
+      2) Apply floors/limits to primitives (ρ, v, P)
+      3) Apply conservative consistency floors (τ floor, S^2 ≤ safety·τ(τ+2D))
+      4) Recompute conservatives from floored primitives where needed
+
+    Notes on definitions (no densitization here):
+      - D is the non-densitized conserved rest-mass density (D = ρ0 W)
+      - S_r is the conserved momentum density (non-densitized)
+      - τ is the conserved energy density (non-densitized), with τ ≥ τ_atm
+      - γ_rr is the physical metric component used for v^2 and S^2
+
+    Parameters
+    ----------
+    state_2d : ndarray
+        Full state array with BSSN + hydro; modified in-place
+    grid : Grid
+        Grid object (for r, ghost counts, metric builders)
+    hydro : PerfectFluid
+        Hydrodynamics object (provides EOS, cons2prim and valencia metrics)
+    rho_threshold : float, optional
+        Threshold for atmosphere mask; default 10·rho_floor
+
+    Returns
+    -------
+    state_2d : ndarray
+        Modified state with floors applied consistently
+    """
+    from source.bssn.bssnvars import BSSNVars
+    from source.bssn.bssnstatevariables import NUM_BSSN_VARS
+    from source.core.spacing import NUM_GHOSTS
+    from source.bssn.tensoralgebra import get_bar_gamma_LL
+    
+    atm = hydro.atmosphere
+    if rho_threshold is None:
+        rho_threshold = 10.0 * atm.rho_floor
+
+    # Extract conservatives
+    D = state_2d[NUM_BSSN_VARS + 0, :]
+    Sr = state_2d[NUM_BSSN_VARS + 1, :]
+    tau = state_2d[NUM_BSSN_VARS + 2, :]
+
+    # Build BSSN geometry to compute γ_rr (physical)
+    bssn_vars = BSSNVars(grid.N)
+    bssn_vars.set_bssn_vars(state_2d[:NUM_BSSN_VARS, :])
+    bar_gamma_LL = get_bar_gamma_LL(grid.r, bssn_vars.h_LL, hydro.background)
+    phi = np.asarray(bssn_vars.phi, dtype=float)
+    e4phi = np.exp(4.0 * phi)
+    gamma_rr = e4phi * bar_gamma_LL[:, 0, 0]
+
+    # Recover primitives (cons2prim has its own floors for invalid points)
+    hydro.set_matter_vars(state_2d, bssn_vars, grid)
+    prim = hydro._get_primitives(bssn_vars, grid.r)
+    rho0 = prim['rho0']
+    vr = prim['vr']
+    p = prim['p']
+
+    # Create floor applicator
+    floor_app = FloorApplicator(atmosphere=atm, eos=hydro.eos)
+
+    # STEP 1: Apply primitive floors (ρ, v, P)
+    rho0_f, vr_f, p_f = floor_app.apply_primitive_floors(rho0, vr, p, gamma_rr)
+
+    # Force v=0 in atmosphere regions (ρ below threshold)
+    atm_mask = rho0_f < rho_threshold
+    if np.any(atm_mask):
+        vr_f[atm_mask] = 0.0
+
+    # STEP 2: Apply conservative floors (τ floor, S^2 constraint)
+    D_f, Sr_f, tau_f, cons_mask = floor_app.apply_conservative_floors(D, Sr, tau, gamma_rr)
+
+    # STEP 3: Identify points where primitives changed
+    prim_mask = (
+        (np.abs(rho0_f - rho0) > 1e-14) |
+        (np.abs(vr_f - vr) > 1e-14) |
+        (np.abs(p_f - p) > 1e-14)
+    )
+
+    # STEP 4: Recompute conservatives from floored primitives where needed
+    needs = prim_mask | cons_mask
+    if np.any(needs):
+        from source.matter.hydro.cons2prim import prim_to_cons
+        D_new, Sr_new, tau_new = prim_to_cons(rho0_f, vr_f, p_f, gamma_rr, hydro.eos)
+        # Apply cons floors again to ensure final consistency
+        D_new, Sr_new, tau_new, _ = floor_app.apply_conservative_floors(D_new, Sr_new, tau_new, gamma_rr)
+
+        state_2d[NUM_BSSN_VARS + 0, needs] = D_new[needs]
+        state_2d[NUM_BSSN_VARS + 1, needs] = Sr_new[needs]
+        state_2d[NUM_BSSN_VARS + 2, needs] = tau_new[needs]
+
+    # STEP 5: Force zero momentum in outer ghost cells when in atmosphere
+    outer = slice(-NUM_GHOSTS, None)
+    outer_mask = state_2d[NUM_BSSN_VARS + 0, outer] < rho_threshold
+    if np.any(outer_mask):
+        state_2d[NUM_BSSN_VARS + 1, outer][outer_mask] = 0.0
+
+    return state_2d
 
 
 def create_default_atmosphere(rho_floor: Optional[float] = None) -> AtmosphereParams:

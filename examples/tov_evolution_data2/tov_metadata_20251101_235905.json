@@ -1,0 +1,23 @@
+{
+  "tov_solution": {
+    "M_star": 1.4001543871988074,
+    "R": 9.576349999806629,
+    "C": 0.14620960879949876,
+    "K": 100.0,
+    "Gamma": 2.0,
+    "rho_central": 0.00128
+  },
+  "atmosphere": {
+    "rho_floor": 1.2800000000000002e-11,
+    "p_floor": 1e-10,
+    "v_max": 0.9999,
+    "W_max": 100.0
+  },
+  "simulation": {
+    "dt": 0.006445115810674196,
+    "integration_method": "fixed",
+    "grid_N": 500,
+    "grid_r_max": 16.0
+  },
+  "timestamp": "2025-11-01T23:59:05.797617"
+}

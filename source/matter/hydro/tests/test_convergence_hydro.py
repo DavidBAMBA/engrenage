@@ -1,402 +1,386 @@
 #!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 """
-Convergence test for relativistic hydrodynamics in Engrenage.
-Tests advection of a Gaussian pulse with multiple grid resolutions and reconstructors.
-Uses valencia.compute_rhs directly with fixed_minkowski spacetime.
+Adiabatic smooth flow (isentropic) — Convergence test (Cartesian 1D, Minkowski)
+
+Corrección clave respecto al quick-check previo:
+- Geometría cartesiana (Γ̂ = 0) y BCs *outflow* en ambos extremos → no hay
+  términos geométricos que distorsionen la onda suave.
+- Se usa Valencia (reference-metric) + reconstructores + HLL + cons↔prim
+
+EOS: politrópica  p = K rho^Gamma  (K=100, Gamma=5/3 por defecto)
+IC:  ρ(x) = 1 + exp(-1/(1-ξ^2)) para |ξ|<1; v(x) de J_- constante ⇒ onda hacia la derecha
+     sin tocar fronteras para el tiempo seleccionado.
+
+Salida: CSV con L1(ρ,v,p) y órdenes, y gráficas de convergencia por método.
 """
 
+import os, sys, argparse, csv
 import numpy as np
+import matplotlib
+matplotlib.use("Agg")
 import matplotlib.pyplot as plt
-import os, sys
-import multiprocessing as mp
-import pandas as pd
+from concurrent.futures import ProcessPoolExecutor, as_completed
+from tqdm import tqdm
 
-# Add source path
-sys.path.append(os.path.join(os.path.dirname(__file__), '..', '..'))
+# ---------------------------------------------------------------------
+# Añade la ruta del repo (igual patrón que tus tests)
+repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..', '..', '..'))
+sys.path.insert(0, repo_root)
 
-from source.core.spacing import NUM_GHOSTS
-from source.matter.hydro.eos import IdealGasEOS
-from source.matter.hydro.reconstruction import Reconstruction, create_reconstruction
-from source.matter.hydro.riemann import HLLRiemannSolver
-from source.matter.hydro.cons2prim import cons_to_prim
-from source.matter.hydro.valencia_reference_metric import ValenciaReferenceMetric
+# Núcleo engrenage
+from source.core.grid import Grid
+from source.core.spacing import LinearSpacing, NUM_GHOSTS
+from source.core.statevector import StateVector
 
-# ── Global parameters ───────────────────────────────────────────────────
-# Grid resolutions for convergence test
-Ns = [50, 100, 200, 400, 800]
+# BSSN (congelado en Minkowski)
+from source.bssn.bssnvars import BSSNVars
+from source.bssn.bssnstatevariables import NUM_BSSN_VARS, idx_phi, idx_K, idx_lapse
 
-# Reconstructors to test
-reconstructors = ["minmod", "mp5", "weno5", "wenoz"]
+# Hidro (tus módulos)
+from source.matter.hydro.perfect_fluid import PerfectFluid           # ← usa Valencia ref-metric :contentReference[oaicite:6]{index=6}
+from source.matter.hydro.eos import PolytropicEOS                    # ← EOS politrópica                :contentReference[oaicite:7]{index=7}
+from source.matter.hydro.reconstruction import create_reconstruction # ← reconstructores (MP5/WENOZ)    :contentReference[oaicite:8]{index=8}
+from source.matter.hydro.riemann import HLLRiemannSolver             # ← Riemann HLL                    :contentReference[oaicite:9]{index=9}
+from source.matter.hydro.cons2prim import prim_to_cons               # ← prim→cons                      :contentReference[oaicite:10]{index=10}
+from source.matter.hydro.atmosphere import AtmosphereParams          # ← floors/atmósfera centralizada  :contentReference[oaicite:11]{index=11}
 
-# Test parameters
-velocity = 0.3       # Gaussian advection velocity (v_r < 1)
-t_final = 0.3        # Final evolution time
-gamma_gas = 1.4      # Ideal gas EOS gamma
-cfl = 0.4            # CFL number
+# -----------------------------
+# Background cartesiano plano
+# -----------------------------
+class FlatCartesianBackground:
+    """
+    Background mínimo cartesiano para Valencia ref-metric:
+      det_hat_gamma = 1, Γ̂ = 0, inverse_scaling_vector = 1.
+    """
+    def __init__(self, x):
+        N = len(x)
+        self.det_hat_gamma = np.ones(N, dtype=float)
+        self.hat_christoffel = np.zeros((N, 3, 3, 3), dtype=float)
+        self.inverse_scaling_vector = np.ones((N, 3), dtype=float)
+        self.d1_inverse_scaling_vector = np.zeros((N, 3, 3), dtype=float)
 
-# Grid parameters (similar to test.py)
-n_interior = 400     # Will vary for convergence test
-r_min = 1e-3
-r_max = 1.0
+# -----------------------------
+# Utilidades del test
+# -----------------------------
+def build_grid_and_hydro(N=200, xmax=2.5, eos=None, recon="mp5"):
+    spacing = LinearSpacing(N + 2*NUM_GHOSTS, xmax)
+    eos = eos or PolytropicEOS(K=100.0, gamma=5.0/3.0)
+    atmosphere = AtmosphereParams(rho_floor=1e-13, p_floor=1e-15, v_max=0.999999, W_max=1e3)
+    hydro = PerfectFluid(eos=eos, spacetime_mode="fixed_minkowski",
+                         atmosphere=atmosphere,
+                         reconstructor=create_reconstruction(recon),
+                         riemann_solver=HLLRiemannSolver())
+    # ¡Forzamos BCs outflow en Valencia!
+    hydro.valencia.boundary_mode = "outflow"     # evita paridad del origen (cartesiano)
+    state_vector = StateVector(hydro)
+    grid = Grid(spacing, state_vector)
+    background = FlatCartesianBackground(grid.r)
+    hydro.background = background
+    return grid, hydro, background
 
-# Gaussian parameters
-gauss_center = 0.5
-gauss_width = 0.05
-gauss_amplitude = 0.1
-background_rho = 1e-3
+def bump_density(x, center=0.6, L=0.3):
+    xi = (x - center)/L
+    return 1.0 + np.where(np.abs(xi) < 1.0, np.exp(-1.0/(1.0 - xi**2)), 0.0)
 
-# Setup data folders
-os.makedirs("convergence_data", exist_ok=True)
-os.makedirs("convergence_errors", exist_ok=True)
+def cs_from_eos(eos, rho):
+    p = eos.pressure(rho)
+    eps = eos.eps_from_rho(rho)  # barotrópica
+    cs2 = eos.sound_speed_squared(rho, p, eps)
+    return np.sqrt(np.clip(cs2, 0.0, 1.0-1e-12))
 
-# ── Helper classes (similar to test.py) ────────────────────────────────────
-class Grid:
-    def __init__(self, dx):
-        self.dr = float(dx)
+def A_of_cs(cs, gamma):
+    q = np.sqrt(gamma - 1.0)
+    cs = np.minimum(cs, q - 1e-14)
+    return (1.0/q) * np.log((q + cs)/(q - cs))
 
-class _DummyBSSNVars:
-    """Placeholders no usados en Minkowski fijo."""
-    def __init__(self, N):
-        self.lapse   = np.ones(N)
-        self.shift_U = np.zeros((N,3,3))
-        self.phi     = np.zeros(N)
-        self.K       = np.zeros(N)
+def v_from_Jminus_constant(rho, eos, gamma):
+    cs  = cs_from_eos(eos, rho)
+    cs0 = float(cs_from_eos(eos, 1.0))
+    return np.tanh(A_of_cs(cs, gamma) - A_of_cs(cs0, gamma))
 
-class _DummyBSSND1:
-    def __init__(self, N):
-        self.lapse   = np.zeros((N,3))
-        self.shift_U = np.zeros((N,3,3))
-        self.phi     = np.zeros((N,3))
-
-# ── Grid and primitive functions (from test.py) ─────────────────────────
-def build_grid(n_interior=256, r_min=1.0e-3, r_max=1.0, ng=NUM_GHOSTS):
-    """Centros de celda uniformes + ghosts extrapolados linealmente."""
-    Nin = int(n_interior)
-    r_in = np.linspace(r_min, r_max, Nin)
-    dr = (r_max - r_min) / (Nin - 1)
-    # Extiende a la izquierda (ghosts) y derecha por extrapolación
-    left_ghosts  = r_in[0]  - dr*np.arange(ng,0,-1)
-    right_ghosts = r_in[-1] + dr*np.arange(1,ng+1)
-    r_full = np.concatenate([left_ghosts, r_in, right_ghosts])
-    return r_full, Grid(dr), Nin
-
-def fill_ghosts_primitives(rho, v, p, ng=NUM_GHOSTS):
-    """Paridades correctas en r≈0: rho/p pares; v impar. Outflow en borde derecho."""
-    N = len(rho)
-    # lado izquierdo (centro)
+def fill_ghosts_outflow_prims(rho, v, p, ng=NUM_GHOSTS):
+    # outflow en ambos extremos (copia del primer/último interior)
+    left = ng; right = len(rho) - ng - 1
     for i in range(ng):
-        mir = 2*ng - 1 - i
-        rho[i] = rho[mir]     # par
-        p[i]   = p[mir]       # par
-        v[i]   = -v[mir]      # impar
-    # lado derecho (outflow/zero-gradient)
-    last = N - ng - 1
-    for k in range(1, ng+1):
-        idx = last + k
-        rho[idx] = rho[last]
-        p[idx]   = p[last]
-        v[idx]   = v[last]
+        rho[i] = rho[left];    v[i] = v[left];    p[i] = p[left]
+        rho[-1-i] = rho[right]; v[-1-i] = v[right]; p[-1-i] = p[right]
     return rho, v, p
 
-def to_conserved(rho0, v, p, eos):
-    """Convert primitives to conservatives (from test.py)."""
-    eps = eos.eps_from_rho_p(rho0, p)
-    h   = 1.0 + eps + p/np.maximum(rho0, 1e-300)
-    W   = 1.0/np.sqrt(np.maximum(1.0 - v*v, 1e-16))
-    D   = rho0 * W
-    Sr  = rho0 * h * W*W * v
-    tau = rho0 * h * W*W - p - D
-    return D, Sr, tau
+def fill_boundaries_outflow_state(state_2d, ng=NUM_GHOSTS):
+    left = ng; right = state_2d.shape[1] - ng - 1
+    for i in range(ng):
+        state_2d[:, i]      = state_2d[:, left]
+        state_2d[:, -1 - i] = state_2d[:, right]
+    return state_2d
 
-def to_primitives(D, Sr, tau, eos, p_guess=None):
-    """Convert conservatives to primitives using cons2prim, with optional pressure guess."""
-    res = cons_to_prim(
-        (D, Sr, tau), eos,
-        metric=(np.ones_like(D), np.zeros_like(D), np.ones_like(D)),
-        p_guess=p_guess,
-    )
-    return res['rho0'], res['vr'], res['p']
+def prim_to_cons_array(rho0, vr, p, grid, hydro):
+    gamma_xx = np.ones_like(rho0)
+    return prim_to_cons(rho0, vr, p, gamma_xx, hydro.eos)
 
-def max_signal_speed(rho0, v, p, eos, cfl_guard=1e-6):
-    """Calculate maximum signal speed for CFL condition."""
-    eps = eos.eps_from_rho_p(rho0, p)
-    h   = 1.0 + eps + p/np.maximum(rho0, 1e-300)
-    cs2 = np.clip(eos.gamma * p / np.maximum(rho0*h, 1e-300), 0.0, 1.0 - 1e-10)
-    cs  = np.sqrt(cs2)
-    return np.max(np.abs(v) + cs) + cfl_guard
+def conservatives_to_primitives(state_2d, grid, hydro, bssn_vars):
+    hydro.set_matter_vars(state_2d, bssn_vars, grid)
+    return hydro._get_primitives(bssn_vars, grid.r)
 
-# ── Gaussian pulse functions ────────────────────────────────────────────
-def gaussian_pulse_1d(r, center=0.5, amplitude=0.1, width=0.05, background_rho=1e-3):
-    """Create a Gaussian density pulse for advection test."""
-    return background_rho + amplitude * np.exp(-((r - center) / width)**2)
+def max_signal_speed(prims, eos):
+    rho, v, p = prims['rho0'], prims['vr'], prims['p']
+    eps = eos.eps_from_rho_p(rho, p)
+    cs = np.sqrt(np.clip(eos.sound_speed_squared(rho, p, eps), 0.0, 1.0-1e-12))
+    return float(np.max(np.abs(v) + cs) + 1e-8)
 
-def analytic_solution(r, t, center=0.5, amplitude=0.1, width=0.05,
-                      velocity=0.3, background_rho=1e-3):
-    """Analytic solution for advected Gaussian in flat spacetime."""
-    new_center = center + velocity * t
-    return gaussian_pulse_1d(r, new_center, amplitude, width, background_rho)
+# RHS y paso temporal (RK4)
+def rhs_cartesian(state_flat, grid, hydro, background, bssn_fixed, bssn_d1_fixed):
+    st2 = state_flat.reshape((grid.NUM_VARS, grid.N))
+    grid.fill_boundaries(st2)  # BCs del grid
+    #fill_boundaries_outflow_state(st2)  # BCs outflow para todo el estado
+    bssn_vars = BSSNVars(grid.N); bssn_vars.set_bssn_vars(bssn_fixed)
+    hydro.set_matter_vars(st2, bssn_vars, grid)
+    rhs_hydro = hydro.get_matter_rhs(grid.r, bssn_vars, bssn_d1_fixed, background)
+    out = np.zeros_like(st2)
+    out[NUM_BSSN_VARS:, :] = rhs_hydro
+    return out.flatten()
 
-# ── RK3 evolution (adapted from test.py) ────────────────────────────────
-def rk3_step(valencia, D, Sr, tau, rho0, v, p, r, grid, eos, recon, rsolve,
-             dt=None, spacetime_mode="fixed_minkowski"):
-    """Una etapa RK3 Shu–Osher usando compute_rhs (full approach)."""
-    # Use fixed timestep if provided, otherwise CFL
-    if dt is None:
-        amax = max_signal_speed(rho0, v, p, eos)
-        dt = 0.4 * grid.dr / amax
+def rk4_step(state_2d, grid, hydro, background, bssn_fixed, bssn_d1_fixed, cfl=0.2):
+    bssn_vars = BSSNVars(grid.N); bssn_vars.set_bssn_vars(bssn_fixed)
+    hydro.set_matter_vars(state_2d, bssn_vars, grid)
+    prims = hydro._get_primitives(bssn_vars, grid.r)
+    dt = 0.1*cfl * grid.min_dr / max_signal_speed(prims, hydro.eos)
+    y0 = state_2d.flatten()
+    k1 = rhs_cartesian(y0, grid, hydro, background, bssn_fixed, bssn_d1_fixed)
+    k2 = rhs_cartesian(y0 + 0.5*dt*k1, grid, hydro, background, bssn_fixed, bssn_d1_fixed)
+    k3 = rhs_cartesian(y0 + 0.5*dt*k2, grid, hydro, background, bssn_fixed, bssn_d1_fixed)
+    k4 = rhs_cartesian(y0 + dt*k3, grid, hydro, background, bssn_fixed, bssn_d1_fixed)
+    yN = y0 + (dt/6.0)*(k1 + 2*k2 + 2*k3 + k4)
+    return yN.reshape((grid.NUM_VARS, grid.N)), dt
 
-    # Dummy BSSN (no usado en Minkowski, pero la firma lo pide)
-    bssn_vars = _DummyBSSNVars(len(r))
-    bssn_d1   = _DummyBSSND1(len(r))
-    background = None
+# Evolución una vez (devuelve primitivos interiores al tfinal)
+def evolve_solution(n_interior, r_max, eos, reconstructor, center, L, t_final, cfl, progress_callback=None):
+    grid, hydro, background = build_grid_and_hydro(n_interior, r_max, eos, reconstructor)
 
-    # Stage 1
-    rhsD, rhsSr, rhsTau = valencia.compute_rhs(D, Sr, tau, rho0, v, p,
-                                               W=None, h=None,
-                                               r=r, bssn_vars=bssn_vars, bssn_d1=bssn_d1,
-                                               background=background, spacetime_mode=spacetime_mode,
-                                               eos=eos, grid=grid, reconstructor=recon, riemann_solver=rsolve)
-    D1   = D   + dt*rhsD
-    Sr1  = Sr  + dt*rhsSr
-    tau1 = tau + dt*rhsTau
-    rho1, v1, p1 = to_primitives(D1, Sr1, tau1, eos, p_guess=p)
-    rho1, v1, p1 = fill_ghosts_primitives(rho1, v1, p1)
+    # IC: ρ bump + J_- cte
+    rho0 = bump_density(grid.r, center=center, L=L)
+    p = eos.pressure(rho0)
+    vr = v_from_Jminus_constant(rho0, eos, eos.gamma)
+    rho0, vr, p = fill_ghosts_outflow_prims(rho0, vr, p)
 
-    # Stage 2
-    rhsD, rhsSr, rhsTau = valencia.compute_rhs(D1, Sr1, tau1, rho1, v1, p1,
-                                               W=None, h=None,
-                                               r=r, bssn_vars=bssn_vars, bssn_d1=bssn_d1,
-                                               background=background, spacetime_mode=spacetime_mode,
-                                               eos=eos, grid=grid, reconstructor=recon, riemann_solver=rsolve)
-    D2   = 0.75*D   + 0.25*(D1  + dt*rhsD)
-    Sr2  = 0.75*Sr  + 0.25*(Sr1 + dt*rhsSr)
-    tau2 = 0.75*tau + 0.25*(tau1+ dt*rhsTau)
-    rho2, v2, p2 = to_primitives(D2, Sr2, tau2, eos, p_guess=p1)
-    rho2, v2, p2 = fill_ghosts_primitives(rho2, v2, p2)
+    # Conservadas
+    D, Sr, tau = prim_to_cons_array(rho0, vr, p, grid, hydro)
 
-    # Stage 3
-    rhsD, rhsSr, rhsTau = valencia.compute_rhs(D2, Sr2, tau2, rho2, v2, p2,
-                                               W=None, h=None,
-                                               r=r, bssn_vars=bssn_vars, bssn_d1=bssn_d1,
-                                               background=background, spacetime_mode=spacetime_mode,
-                                               eos=eos, grid=grid, reconstructor=recon, riemann_solver=rsolve)
-    Dn   = (1.0/3.0)*D   + (2.0/3.0)*(D2   + dt*rhsD)
-    Snn  = (1.0/3.0)*Sr  + (2.0/3.0)*(Sr2  + dt*rhsSr)
-    taun = (1.0/3.0)*tau + (2.0/3.0)*(tau2 + dt*rhsTau)
-    rhon, vn, pn = to_primitives(Dn, Snn, taun, eos, p_guess=p2)
-    rhon, vn, pn = fill_ghosts_primitives(rhon, vn, pn)
+    # Estado completo
+    state_2d = np.zeros((grid.NUM_VARS, grid.N))
+    state_2d[idx_lapse,:] = 1.0; state_2d[idx_phi,:] = 0.0; state_2d[idx_K,:] = 0.0
+    state_2d[hydro.idx_D,:] = D; state_2d[hydro.idx_Sr,:] = Sr; state_2d[hydro.idx_tau,:] = tau
 
-    return dt, Dn, Snn, taun, rhon, vn, pn
+    # BSSN congelado (Minkowski)
+    bssn_fixed = state_2d[:NUM_BSSN_VARS,:].copy()
+    bssn_d1_fixed = grid.get_d1_metric_quantities(state_2d)
 
-def run_single_test(args):
-    """Run convergence test for single grid resolution and reconstructor."""
-    N, reconstructor_name = args
+    # Evolución
+    t = 0.0; steps = 0
+    while t < t_final and steps < 300000:
+        state_2d, dt = rk4_step(state_2d, grid, hydro, background, bssn_fixed, bssn_d1_fixed, cfl=cfl)
+        t += dt; steps += 1
 
-    print(f"[START] {reconstructor_name} N={N}")
+        # Callback de progreso
+        if progress_callback is not None:
+            progress_callback(t, t_final, steps)
 
-    try:
-        # Setup grid (using test.py approach)
-        r, grid, Nin = build_grid(n_interior=N, r_min=r_min, r_max=r_max)
-        N_total = len(r)
+    # Primitivos (interior)
+    bssn_vars = BSSNVars(grid.N); bssn_vars.set_bssn_vars(bssn_fixed)
+    prims = conservatives_to_primitives(state_2d, grid, hydro, bssn_vars)
+    ng = NUM_GHOSTS
+    rin = grid.r[ng:-ng].copy()
+    rho = prims['rho0'][ng:-ng].copy()
+    v = prims['vr'][ng:-ng].copy()
+    p  = prims['p'][ng:-ng].copy()
+    return rin, rho, v, p
 
-        # Setup physics objects
-        eos = IdealGasEOS(gamma=gamma_gas)
-        recon = create_reconstruction(reconstructor_name)
-        rsolve = HLLRiemannSolver()
-        valencia = ValenciaReferenceMetric()
+# Métricas de error y orden
+def l1_error_against_reference(r_in, u_in, r_ref, u_ref):
+    u_ref_interp = np.interp(r_in, r_ref, u_ref)
+    return float(np.mean(np.abs(u_in - u_ref_interp)))
 
-        # Initial conditions - Gaussian pulse with constant velocity
-        rho0 = gaussian_pulse_1d(r, center=gauss_center, amplitude=gauss_amplitude,
-                                width=gauss_width, background_rho=background_rho)
-        v = np.full_like(r, velocity)  # Constant advection velocity
-        # For ideal gas EOS: need eps to calculate pressure P = (gamma-1)*rho*eps
-        # Use a simple assumption: eps = p/(gamma-1)/rho, with p ~ rho (isothermal)
-        eps = np.ones_like(rho0) * 0.1  # Small constant specific energy
-        p = eos.pressure(rho0, eps)  # Pressure from EOS
+def compute_orders(h_list, e_list):
+    p = []
+    for i in range(len(e_list)-1):
+        if e_list[i+1] <= 0 or e_list[i] <= 0:
+            p.append(np.nan)
+        else:
+            p.append(np.log(e_list[i]/e_list[i+1]) / np.log(h_list[i]/h_list[i+1]))
+    return p
 
-        # Apply boundary conditions
-        rho0, v, p = fill_ghosts_primitives(rho0, v, p)
+# Función wrapper para ejecutar una simulación individual (para paralelización)
+def run_single_simulation(N, rmax, eos_params, method, center, L, tfinal, cfl, position):
+    """
+    Ejecuta una sola simulación y devuelve los resultados.
+    eos_params es un dict con K y gamma para reconstruir el EOS.
+    position: posición de la barra en la terminal
+    """
+    eos = PolytropicEOS(K=eos_params['K'], gamma=eos_params['gamma'])
 
-        # Convert to conservative variables
-        D, Sr, tau = to_conserved(rho0, v, p, eos)
+    # Crear barra de progreso para esta simulación
+    desc = f"{method.upper():6s} N={N:4d}"
+    pbar = tqdm(total=100, desc=desc, position=position, leave=True,
+                bar_format='{desc}: {percentage:3.0f}%|{bar}| {elapsed}<{remaining}')
 
-        # Fixed timestep (like reference script: dt = 0.1 * dx^2)
-        dr = grid.dr
-        dt_fixed = 0.1 * dr * dr
+    # Callback para actualizar la barra (actualizar cada 1% para reducir overhead)
+    last_update = [0]  # usar lista para modificar en closure
+    def update_progress(t, t_final, steps):
+        # Solo actualizar cada 100 pasos o cuando cambia el porcentaje
+        if steps % 100 == 0 or t >= t_final:
+            percent = int(100 * t / t_final)
+            if percent > last_update[0]:
+                pbar.update(percent - last_update[0])
+                last_update[0] = percent
 
-        # Evolve using RK3 with fixed timestep
-        t, steps = 0.0, 0
-        while t < t_final and steps < 10000000:
-            dt_step, D, Sr, tau, rho0, v, p = rk3_step(
-                valencia, D, Sr, tau, rho0, v, p, r, grid, eos, recon, rsolve,
-                dt=dt_fixed, spacetime_mode="fixed_minkowski"
-            )
-            t += dt_step
-            steps += 1
+    r, rho, v, p = evolve_solution(N, rmax, eos, method, center, L, tfinal, cfl,
+                                   progress_callback=update_progress)
 
-        # Compare with analytic solution
-        rho_analytic = analytic_solution(r, t, center=gauss_center,
-                                       amplitude=gauss_amplitude, width=gauss_width,
-                                       velocity=velocity, background_rho=background_rho)
+    # Asegurar que llega al 100%
+    pbar.update(100 - last_update[0])
+    pbar.close()
 
-        # Compute errors (focus on interior to avoid boundary effects)
-        ng = NUM_GHOSTS
-        inner = slice(ng, -ng)
-        err = rho0[inner] - rho_analytic[inner]
+    h = rmax / N
+    return {
+        'method': method,
+        'N': N,
+        'h': h,
+        'r': r,
+        'rho': rho,
+        'v': v,
+        'p': p
+    }
 
-        err_L1 = np.mean(np.abs(err))
-        err_L2 = np.sqrt(np.mean(err**2))
-        err_Linf = np.max(np.abs(err))
-
-        print(f"[DONE] {reconstructor_name} N={N} L1={err_L1:.2e} L2={err_L2:.2e} L∞={err_Linf:.2e} t={t:.3f}")
-
-        # Save solution data
-        save_data = {
-            'r': r[inner],
-            'rho_numerical': rho0[inner],
-            'rho_analytic': rho_analytic[inner],
-            't_final': t,
-            'velocity': velocity,
-            'steps': steps
-        }
-
-        filename = f"convergence_data/{reconstructor_name}_N{N}_solution.npz"
-        np.savez(filename, **save_data)
-
-        return (reconstructor_name, N, err_L1, err_L2, err_Linf)
-
-    except Exception as e:
-        print(f"[ERROR] Exception in {reconstructor_name} N={N}: {e}")
-        import traceback
-        traceback.print_exc()
-        return (reconstructor_name, N, np.nan, np.nan, np.nan)
-
+# -----------------------------
+# Programa principal
+# -----------------------------
 def main():
-    """Main convergence analysis routine."""
-    print("Starting Engrenage hydrodynamics convergence test")
-    print(f"Domain: [{r_min}, {r_max}], velocity: {velocity}, t_final: {t_final}")
-    print(f"Grid resolutions: {Ns}")
-    print(f"Reconstructors: {reconstructors}")
+    ap = argparse.ArgumentParser(description="Convergence test: adiabatic smooth flow (Cartesian)")
+    ap.add_argument("--methods", nargs="+", default=["mp5", "minmod", "weno5", "wenoz"], help="Reconstrutores: minmod, ppm, mp5, weno5, wenoz")
+    ap.add_argument("--res", nargs="+", type=int, default=[50, 200, 400, 800, 1600], help="N de celdas interiores")
+    ap.add_argument("--ref-mult", type=int, default=8, help="Resolución de referencia = ref_mult * max(res)")
+    ap.add_argument("--rmax", type=float, default=2.5, help="Extremo derecho del dominio")
+    ap.add_argument("--center", type=float, default=0.6, help="Centro del bump")
+    ap.add_argument("--L", type=float, default=0.3, help="Semianchura del bump")
+    ap.add_argument("--gamma", type=float, default=5.0/3.0, help="Índice politrópico Γ")
+    ap.add_argument("--K", type=float, default=100.0, help="Constante politrópica K")
+    ap.add_argument("--tfinal", type=float, default=0.8, help="Tiempo final (antes de la cáustica)")
+    ap.add_argument("--cfl", type=float, default=0.2, help="Factor CFL")
+    ap.add_argument("--out-prefix", type=str, default="smoothflow_cart", help="Prefijo de ficheros de salida")
+    args = ap.parse_args()
 
-    # Prepare tasks for parallel execution
-    tasks = [(N, recon) for recon in reconstructors for N in Ns]
+    eos = PolytropicEOS(K=args.K, gamma=args.gamma)
+    eos_params = {'K': args.K, 'gamma': args.gamma}
 
-    # Run in parallel
-    with mp.Pool(processes=min(1, 1)) as pool:
-        results = pool.map(run_single_test, tasks)
+    # --- solución de referencia (alta resolución, WENO-Z por defecto) ---
+    n_ref = args.ref_mult * max(args.res)
+    print(f"[REF] corriendo referencia: recon=wenoz, N={n_ref}, tf={args.tfinal}")
+    r_ref, rho_ref, v_ref, p_ref = evolve_solution(
+        n_ref, args.rmax, eos, "wenoz", args.center, args.L, args.tfinal, args.cfl
+    )
+    print(f"[REF] referencia completada\n")
 
-    # Organize results by reconstructor
-    errors_by_reconstructor = {recon: [] for recon in reconstructors}
+    # --- Preparar todas las tareas para ejecutar en paralelo ---
+    tasks = []
+    for method in args.methods:
+        for N in args.res:
+            tasks.append((N, args.rmax, eos_params, method, args.center, args.L, args.tfinal, args.cfl))
 
-    for recon, N, e1, e2, ei in results:
-        if not np.isnan(e1):  # Only store successful results
-            errors_by_reconstructor[recon].append((N, e1, e2, ei))
+    print(f"[INFO] Ejecutando {len(tasks)} simulaciones en paralelo...\n")
 
-    # Save error data
-    for i, norm_name in enumerate(["L1", "L2", "Linf"]):
-        with open(f"convergence_errors/errors_{norm_name}.csv", "w") as f:
-            f.write("Reconstructor,N,Error\n")
-            for recon in reconstructors:
-                for entry in sorted(errors_by_reconstructor[recon]):
-                    N = entry[0]
-                    error = entry[i + 1]
-                    f.write(f"{recon},{N},{error:.8e}\n")
+    # --- Ejecutar todas las simulaciones en paralelo ---
+    results = {}  # dict: (method, N) -> resultado
 
-    # Calculate convergence orders
-    print("\n=== Convergence Analysis ===")
-    print(f"{'Reconstructor':<12} {'N':>5} {'L1':>10} {'L2':>10} {'Linf':>10} {'p_L1':>7} {'p_L2':>7} {'p_Inf':>7}")
+    # Reservar espacio para las barras de progreso
+    print("\n" * len(tasks))
 
-    convergence_table = []
+    with ProcessPoolExecutor() as executor:
+        # Enviar todas las tareas con posición para las barras
+        future_to_info = {}
+        for i, task in enumerate(tasks):
+            future = executor.submit(run_single_simulation, *task, i)
+            future_to_info[future] = (task[3], task[0])  # (method, N)
 
-    with open("convergence_errors/convergence_orders.csv", "w") as fcsv:
-        fcsv.write("Reconstructor,N,L1,L2,Linf,p_L1,p_L2,p_Linf\n")
+        # Recolectar resultados a medida que se completan
+        for future in as_completed(future_to_info):
+            result = future.result()
+            method, N = result['method'], result['N']
+            results[(method, N)] = result
 
-        for recon in reconstructors:
-            rows = sorted(errors_by_reconstructor[recon])
-            prev = None
+    print(f"\n\n[INFO] Todas las simulaciones completadas. Calculando errores y órdenes...\n")
 
-            for i, (N, L1, L2, Linf) in enumerate(rows):
-                if prev is None:
-                    p1 = p2 = pInf = ""
-                else:
-                    h1, h2 = 1.0 / prev[0], 1.0 / N
-                    p1 = (np.log(prev[1]) - np.log(L1)) / (np.log(h1) - np.log(h2))
-                    p2 = (np.log(prev[2]) - np.log(L2)) / (np.log(h1) - np.log(h2))
-                    pInf = (np.log(prev[3]) - np.log(Linf)) / (np.log(h1) - np.log(h2))
-                    p1, p2, pInf = f"{p1:.3f}", f"{p2:.3f}", f"{pInf:.3f}"
+    # --- Procesar resultados por método ---
+    all_rows = []
+    for method in args.methods:
+        print(f"=== {method.upper()} ===")
+        h_list, e_rho_list, e_v_list, e_p_list = [], [], [], []
+        for N in args.res:
+            res = results[(method, N)]
+            r, rho, v, p = res['r'], res['rho'], res['v'], res['p']
+            h = res['h']
+            h_list.append(h)
+            e_rho = l1_error_against_reference(r, rho, r_ref, rho_ref)
+            e_v   = l1_error_against_reference(r, v,   r_ref, v_ref)
+            e_p   = l1_error_against_reference(r, p,   r_ref, p_ref)
+            e_rho_list.append(e_rho); e_v_list.append(e_v); e_p_list.append(e_p)
+            print(f"  N={N:4d}  L1(ρ)={e_rho:.3e}  L1(v)={e_v:.3e}  L1(p)={e_p:.3e}")
 
-                print(f"{recon:<12} {N:5d} {L1:10.2e} {L2:10.2e} {Linf:10.2e} {p1:>7} {p2:>7} {pInf:>7}")
-                fcsv.write(f"{recon},{N},{L1:.8e},{L2:.8e},{Linf:.8e},{p1},{p2},{pInf}\n")
-                convergence_table.append([recon.upper(), N, L1, L2, Linf, p1, p2, pInf])
-                prev = (N, L1, L2, Linf)
+        # órdenes de convergencia (pareados)
+        p_rho = compute_orders(h_list, e_rho_list)
+        p_v   = compute_orders(h_list, e_v_list)
+        p_p   = compute_orders(h_list, e_p_list)
 
-    # Create convergence table plot
-    table_formatted = []
-    for row in convergence_table:
-        recon, N, L1, L2, Linf, p1, p2, pInf = row
-        table_formatted.append([
-            recon, N,
-            f"{L1:.2e}", f"{L2:.2e}", f"{Linf:.2e}",
-            p1, p2, pInf
-        ])
+        # registrar filas
+        for i, N in enumerate(args.res):
+            all_rows.append({
+                "method": method, "N": N, "h": h_list[i],
+                "L1_rho": e_rho_list[i], "L1_v": e_v_list[i], "L1_p": e_p_list[i],
+                "order_rho": (p_rho[i-1] if i>0 else np.nan),
+                "order_v":   (p_v[i-1]   if i>0 else np.nan),
+                "order_p":   (p_p[i-1]   if i>0 else np.nan),
+            })
 
-    df = pd.DataFrame(table_formatted,
-                      columns=["Reconstructor", "N", "L1", "L2", "Linf", "p_L1", "p_L2", "p_Linf"])
+        # Plot de convergencia (ρ)
+        plt.figure(figsize=(7,5))
+        plt.loglog(h_list, e_rho_list, 'o-', lw=2.0, label='L1(ρ₀)')
+        if len(h_list) >= 2:
+            h0, e0 = h_list[0], e_rho_list[0]
+            hs = np.array(h_list)
+            c2 = e0/(h0**2 + 1e-30); c5 = e0/(h0**5 + 1e-30)
+            plt.loglog(hs, c2*hs**2, ':', label='O(h²) guía')
+            plt.loglog(hs, c5*hs**5, ':', label='O(h⁵) guía')
+        plt.gca().invert_xaxis()
+        plt.xlabel('h = Δx'); plt.ylabel('L1(ρ₀)')
+        plt.title(f'Convergencia — {method.upper()} (t={args.tfinal})')
+        plt.grid(True, which='both', alpha=0.3); plt.legend()
+        plt.tight_layout()
+        plt.savefig(f"{args.out_prefix}_conv_rho_{method}.png", dpi=140, bbox_inches="tight")
+        plt.close()
 
-    fig_table, ax = plt.subplots(figsize=(14, len(df)*0.4))
-    ax.axis('off')
-    table_mpl = ax.table(cellText=df.values,
-                         colLabels=df.columns,
-                         cellLoc='center',
-                         loc='center')
-    table_mpl.auto_set_font_size(False)
-    table_mpl.set_fontsize(10)
-    table_mpl.scale(1, 1.5)
-    plt.title('Engrenage Hydrodynamics Convergence Analysis')
-    plt.tight_layout()
-    plt.savefig("convergence_hydro_table.png", dpi=300, bbox_inches='tight')
-    plt.close(fig_table)
+        # Comparación con la referencia (ρ) en la malla más fina de este método
+        Nfin = args.res[-1]
+        res_fin = results[(method, Nfin)]
+        r_fin, rho_fin = res_fin['r'], res_fin['rho']
+        plt.figure(figsize=(9,5))
+        plt.plot(r_ref, rho_ref, 'k-', lw=2.0, label='Referencia (WENO-Z, alta res.)')
+        plt.plot(r_fin, rho_fin, '--', lw=2.0, label=f'{method.upper()} (N={Nfin})')
+        plt.xlim(0, args.rmax); plt.xlabel('x'); plt.ylabel('ρ₀')
+        plt.title(f'Adiabatic smooth flow — {method.upper()}  (t={args.tfinal})')
+        plt.grid(True, alpha=0.3); plt.legend()
+        plt.tight_layout()
+        plt.savefig(f"{args.out_prefix}_rho_{method}_N{Nfin}.png", dpi=140, bbox_inches="tight")
+        plt.close()
 
-    # Create convergence plots
-    fig_plots, (ax1, ax2, ax3) = plt.subplots(1, 3, figsize=(18, 6))
-
-    for recon in reconstructors:
-        rows = sorted(errors_by_reconstructor[recon])
-        if len(rows) > 1:
-            Ns_plot = [row[0] for row in rows]
-            L1_errors = [row[1] for row in rows]
-            L2_errors = [row[2] for row in rows]
-            Linf_errors = [row[3] for row in rows]
-
-            ax1.loglog(Ns_plot, L1_errors, 'o-', label=recon, linewidth=2, markersize=6)
-            ax2.loglog(Ns_plot, L2_errors, 'o-', label=recon, linewidth=2, markersize=6)
-            ax3.loglog(Ns_plot, Linf_errors, 'o-', label=recon, linewidth=2, markersize=6)
-
-    # Add reference lines
-    N_ref = np.array(Ns)
-    for ax, order, label in [(ax1, 1, "1st order"), (ax2, 2, "2nd order"), (ax3, 3, "3rd order")]:
-        ax.loglog(N_ref, 1e-2 * (N_ref[0]/N_ref)**order, 'k--', alpha=0.5, label=f"{label} ref")
-
-    ax1.set(xlabel='N', ylabel='L1 Error', title='L1 Norm Convergence')
-    ax2.set(xlabel='N', ylabel='L2 Error', title='L2 Norm Convergence')
-    ax3.set(xlabel='N', ylabel='L∞ Error', title='L∞ Norm Convergence')
-
-    for ax in [ax1, ax2, ax3]:
-        ax.grid(True, alpha=0.3)
-        ax.legend()
-        ax.invert_xaxis()  # Higher resolution on right
-
-    plt.suptitle('Engrenage Hydrodynamics Convergence Test - Gaussian Advection')
-    plt.tight_layout()
-    plt.savefig("convergence_hydro_plots.png", dpi=200, bbox_inches='tight')
-    plt.close(fig_plots)
-
-    print(f"\n[INFO] Results saved:")
-    print(f"  - convergence_errors/errors_*.csv")
-    print(f"  - convergence_errors/convergence_orders.csv")
-    print(f"  - convergence_hydro_table.png")
-    print(f"  - convergence_hydro_plots.png")
-    print(f"  - convergence_data/*_solution.npz")
+    # Guardar CSV
+    csv_name = f"{args.out_prefix}_convergence.csv"
+    with open(csv_name, "w", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=list(all_rows[0].keys()))
+        w.writeheader()
+        for row in all_rows:
+            w.writerow(row)
+    print(f"\nResultados guardados en {csv_name}")
+    print("Gráficos: *_conv_rho_<method>.png y *_rho_<method>_N<fin>.png")
 
 if __name__ == "__main__":
+    np.set_printoptions(precision=3, suppress=True)
     main()

@@ -1,12 +1,15 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-# Hydro–without–Hydro: evoluciona BSSN con fuentes de materia estáticas (TOV).
-# Estilo y dependencias como en test.py / TOVEvolution.py.
+"""
+Hydro-without-Hydro Test: BSSN evolution with static TOV matter sources.
+Based on Baumgarte, Hughes, and Shapiro (https://arxiv.org/abs/gr-qc/9902024)
+"""
 
 import os, sys, time
 from pathlib import Path
 import numpy as np
 from matplotlib import pyplot as plt
+from matplotlib.patches import Circle
 # ---------- localizar repo root para importar `source.*` ----------
 def locate_repo_root(start: Path) -> Path:
     for cand in [start, *start.parents]:
@@ -27,7 +30,7 @@ from source.core.statevector import StateVector
 from source.core.rhsevolution import get_rhs
 from source.backgrounds.sphericalbackground import FlatSphericalBackground, i_r, i_t, i_p
 from source.matter.hydro.perfect_fluid import PerfectFluid
-from source.matter.hydro.eos import PolytropicEOS
+from source.matter.hydro.eos import PolytropicEOS, IdealGasEOS
 from source.matter.hydro.reconstruction import create_reconstruction
 from source.matter.hydro.riemann import HLLRiemannSolver
 from source.bssn.bssnstatevariables import (
@@ -37,250 +40,145 @@ from source.bssn.bssnstatevariables import (
     idx_lambdar, idx_shiftr, idx_br, idx_lapse
 )
 
-from scipy.integrate import odeint
 from scipy.interpolate import interp1d
 
-# -------------------- utilidades --------------------
-def fill_ghosts_primitives(rho, v, p, ng=NUM_GHOSTS):
-    """Paridades en r≈0: rho/p pares; v impar. Cero-gradiente en borde externo."""
-    rho = np.asarray(rho).copy(); v = np.asarray(v).copy(); p = np.asarray(p).copy()
-    N = len(rho)
-    # centro
-    for i in range(ng):
-        mir = 2*ng - 1 - i
-        rho[i] = rho[mir]     # par
-        p[i]   = p[mir]       # par
-        v[i]   = -v[mir]      # impar
-    # borde externo
-    last = N - ng - 1
-    for k in range(1, ng+1):
-        idx = last + k
-        rho[idx] = rho[last]
-        p[idx]   = p[last]
-        v[idx]   = v[last]
-    return rho, v, p
+# Import constraint diagnostic
+from source.bssn.constraintsdiagnostic import get_constraints_diagnostic
+from source.bssn.bssnvars import BSSNVars
 
-def primitives_to_conserved(rho0, v, p, eos):
-    eps = eos.eps_from_rho_p(rho0, p)
-    h   = 1.0 + eps + p/np.maximum(rho0, 1e-300)
-    W   = 1.0/np.sqrt(np.maximum(1.0 - v*v, 1e-16))
-    D   = rho0 * W
-    Sr  = rho0 * h * W*W * v
-    tau = rho0 * h * W*W - p - D
-    return D, Sr, tau, W, h
-
-# -------------------- solver TOV (como en tu TOVEvolution) --------------------
-def solve_tov_ode(r_max, rho_central, gamma, K=1.0, n_points=1000):
-    """Devuelve dict con r, rho, pressure, mass, alpha, R_star, M_star."""
-    p_central = K * rho_central**gamma
-
-    def e_from_p(P):
-        if P <= 0: return 1e-15
-        rho = (P / K)**(1.0/gamma)
-        eps = P / ((gamma - 1.0) * rho)
-        return rho * (1.0 + eps)
-
-    def tov_rhs(y, r):
-        m, p = y
-        if r < 1e-12: return np.array([0.0, 0.0])
-        e = e_from_p(p)
-        dmdr = 4.0 * np.pi * r**2 * e
-        denom = r * (r - 2.0*m)
-        dpdr = 0.0 if abs(denom) < 1e-15 else -(e + p) * (m + 4.0*np.pi * r**3 * p) / denom
-        return np.array([dmdr, dpdr])
-
-    r_start = 1e-6
-    m_start = (4.0*np.pi/3.0) * e_from_p(p_central) * r_start**3
-    y0 = np.array([m_start, p_central])
-
-    r_grid = np.linspace(r_start, r_max, n_points)
-    y  = odeint(lambda yy, rr: tov_rhs(yy, rr), y0, r_grid, atol=1e-12, rtol=1e-10, mxstep=10000)
-    m  = y[:,0]; p = y[:,1]
-
-    # superficie donde p≈0
-    i_surf = np.argmax(p <= 1e-12)
-    if i_surf == 0: i_surf = len(r_grid)-1
-    r = r_grid[:i_surf+1]
-    p = np.maximum(p[:i_surf+1], 1e-15)
-    rho = (p/K)**(1.0/gamma)
-    m   = m[:i_surf+1]
-
-    # lapse aproximado (suficiente para el test)
-    alpha = np.ones_like(r)
-    for i, ri in enumerate(r):
-        if ri > 1e-12 and m[i] > 0.0:
-            fac = 1.0 - 2.0*m[i] / ri
-            alpha[i] = np.sqrt(fac) if fac > 1e-12 else (alpha[i-1] if i>0 else 1.0)
-
-    return dict(r=r, rho=rho, pressure=p, mass=m, alpha=alpha,
-                R_star=float(r[-1]), M_star=float(m[-1]))
+# High-fidelity TOV initial data
+from examples.tov_initial_data_interpolated import create_initial_data_interpolated
+from examples.tov_solver import TOVSolver
 
 # -------------------- Progress monitor (dummy) --------------------
 class DummyProgress:
     def update(self, *args, **kwargs):
         pass
 
-
-
-# -------------------- estado inicial BSSN + materia --------------------
-def build_initial_state_hwh(grid: Grid, hydro: PerfectFluid, background, r, tov, rho0, pressure, velocity):
+# -------------------- RK4 Time Evolution --------------------
+def rk4_step_hwh(state, grid: Grid, background, matter, cfl=0.5):
     """
-    Métrica conformemente plana + lapse de TOV, shift=0, K=a_ij=Λ^r=0.
-    Materia en equilibrio hidrostático.
+    RK4 time integration for Hydro-without-Hydro test.
+    Evolves BSSN while keeping T^μν fixed (matter sources from TOV).
+
+    This mirrors a reference implementation where:
+    - BSSN equations are evolved with fixed T^μν source terms
+    - Matter variables are NOT evolved (RHS = 0)
+    - CFL default = 0.5
     """
-    state = np.zeros((grid.NUM_VARS, grid.N))
-
-    # BSSN variables: conformally flat + TOV lapse
-    state[idx_phi,   :] = 0.0
-    state[idx_hrr,   :] = 0.0
-    state[idx_htt,   :] = 0.0
-    state[idx_hpp,   :] = 0.0
-    state[idx_K,     :] = 0.0
-    state[idx_arr,   :] = 0.0
-    state[idx_att,   :] = 0.0
-    state[idx_app,   :] = 0.0
-    state[idx_lambdar,:] = 0.0
-    state[idx_shiftr, :] = 0.0
-    state[idx_br,     :] = 0.0
-
-    # TOV lapse
-    a_interp = interp1d(tov['r'], tov['alpha'], kind='linear', bounds_error=False,
-                        fill_value=(tov['alpha'][0], tov['alpha'][-1]))
-    state[idx_lapse, :] = a_interp(r)
-
-    # Matter: convert primitives to conservatives
-    eps = hydro.eos.eps_from_rho_p(rho0, pressure)
-    h = 1.0 + eps + pressure/np.maximum(rho0, 1e-300)
-    W = 1.0/np.sqrt(np.maximum(1.0 - velocity*velocity, 1e-16))
-    D = rho0 * W
-    Sr = rho0 * h * W*W * velocity
-    tau = rho0 * h * W*W - pressure - D
-
-    state[hydro.idx_D,   :] = D
-    state[hydro.idx_Sr,  :] = Sr
-    state[hydro.idx_tau, :] = tau
-
-    grid.fill_boundaries(state)
-    return state
-
-# -------------------- Evolución HWH usando fuentes TOV exactas --------------------
-def rk3_step_hwh(state, grid: Grid, background, matter, tov_data, cfl=0.25):
-    """
-    Un paso RK3 para HWH: evoluciona BSSN, inserta fuentes TOV exactas.
-    """
-    def update_matter_from_tov(state_arr, tov_data, grid, matter):
-        """Actualiza variables de materia desde solución TOV analítica."""
-        r = grid.r
-
-        # Interpolar solución TOV al grid actual
-        rho_interp = interp1d(tov_data['r'], tov_data['rho'], kind='linear',
-                             bounds_error=False, fill_value=1e-15)
-        p_interp = interp1d(tov_data['r'], tov_data['pressure'], kind='linear',
-                           bounds_error=False, fill_value=1e-15)
-
-        # Primitivas TOV (estáticas: v=0)
-        rho0 = np.maximum(rho_interp(r), 1e-15)
-        pressure = np.maximum(p_interp(r), 1e-15)
-        velocity = np.zeros_like(r)
-
-        # Aplicar condiciones de borde (paridades)
-        rho0, velocity, pressure = fill_ghosts_primitives(rho0, velocity, pressure)
-
-        # Convertir a conservadas
-        eps = matter.eos.eps_from_rho_p(rho0, pressure)
-        h = 1.0 + eps + pressure/np.maximum(rho0, 1e-300)
-        W = 1.0/np.sqrt(np.maximum(1.0 - velocity*velocity, 1e-16))
-        D = rho0 * W
-        Sr = rho0 * h * W*W * velocity
-        tau = rho0 * h * W*W - pressure - D
-
-        # Actualizar estado
-        state_arr[matter.idx_D,   :] = D
-        state_arr[matter.idx_Sr,  :] = Sr
-        state_arr[matter.idx_tau, :] = tau
-
-        return state_arr
-
     dummy_progress = DummyProgress()
     time_state = [0.0, 0.1]  # [last_t, deltat] format
 
-    # Determinar dt del CFL
+    # Determine timestep from CFL condition
     r = grid.r
-    dr = r[1] - r[0]
+    dr = r[1] - r[0] if len(r) > 1 else 0.1
     dt = cfl * dr
 
-    # RK3 stages
-    # Stage 1: actualizar materia desde TOV, luego computar RHS
-    s1 = state.copy()
-    update_matter_from_tov(s1, tov_data, grid, matter)
+    # RK4 stages (classical 4th-order Runge-Kutta)
+    # k1 = f(y_n)
+    rhs_full = get_rhs(0.0, state.flatten(), grid, background, matter, dummy_progress, time_state)
+    k1 = rhs_full.reshape(grid.NUM_VARS, -1)
 
-    rhs_full = get_rhs(0.0, s1.flatten(), grid, background, matter, dummy_progress, time_state)
-    rhs = rhs_full.reshape(grid.NUM_VARS, -1)
+    # Zero out matter RHS (Hydro WITHOUT Hydro)
+    k1[matter.idx_D,   :] = 0.0
+    k1[matter.idx_Sr,  :] = 0.0
+    k1[matter.idx_tau, :] = 0.0
 
-    # Solo evolucionar BSSN (congelar materia)
-    rhs[matter.idx_D,   :] = 0.0
-    rhs[matter.idx_Sr,  :] = 0.0
-    rhs[matter.idx_tau, :] = 0.0
+    # k2 = f(y_n + dt/2 * k1)
+    s_tmp = state + 0.5 * dt * k1
+    grid.fill_boundaries(s_tmp)
 
-    s1 = state + dt * rhs
-    grid.fill_boundaries(s1)
+    rhs_full = get_rhs(0.0, s_tmp.flatten(), grid, background, matter, dummy_progress, time_state)
+    k2 = rhs_full.reshape(grid.NUM_VARS, -1)
 
-    # Stage 2: actualizar materia desde TOV
-    update_matter_from_tov(s1, tov_data, grid, matter)
+    k2[matter.idx_D,   :] = 0.0
+    k2[matter.idx_Sr,  :] = 0.0
+    k2[matter.idx_tau, :] = 0.0
 
-    rhs_full = get_rhs(0.0, s1.flatten(), grid, background, matter, dummy_progress, time_state)
-    rhs = rhs_full.reshape(grid.NUM_VARS, -1)
+    # k3 = f(y_n + dt/2 * k2)
+    s_tmp = state + 0.5 * dt * k2
+    grid.fill_boundaries(s_tmp)
 
-    rhs[matter.idx_D,   :] = 0.0
-    rhs[matter.idx_Sr,  :] = 0.0
-    rhs[matter.idx_tau, :] = 0.0
+    rhs_full = get_rhs(0.0, s_tmp.flatten(), grid, background, matter, dummy_progress, time_state)
+    k3 = rhs_full.reshape(grid.NUM_VARS, -1)
 
-    s2 = 0.75*state + 0.25*(s1 + dt*rhs)
-    grid.fill_boundaries(s2)
+    k3[matter.idx_D,   :] = 0.0
+    k3[matter.idx_Sr,  :] = 0.0
+    k3[matter.idx_tau, :] = 0.0
 
-    # Stage 3: actualizar materia desde TOV
-    update_matter_from_tov(s2, tov_data, grid, matter)
+    # k4 = f(y_n + dt * k3)
+    s_tmp = state + dt * k3
+    grid.fill_boundaries(s_tmp)
 
-    rhs_full = get_rhs(0.0, s2.flatten(), grid, background, matter, dummy_progress, time_state)
-    rhs = rhs_full.reshape(grid.NUM_VARS, -1)
+    rhs_full = get_rhs(0.0, s_tmp.flatten(), grid, background, matter, dummy_progress, time_state)
+    k4 = rhs_full.reshape(grid.NUM_VARS, -1)
 
-    rhs[matter.idx_D,   :] = 0.0
-    rhs[matter.idx_Sr,  :] = 0.0
-    rhs[matter.idx_tau, :] = 0.0
+    k4[matter.idx_D,   :] = 0.0
+    k4[matter.idx_Sr,  :] = 0.0
+    k4[matter.idx_tau, :] = 0.0
 
-    sn = (1.0/3.0)*state + (2.0/3.0)*(s2 + dt*rhs)
+    # Combine: y_{n+1} = y_n + dt/6 * (k1 + 2*k2 + 2*k3 + k4)
+    sn = state + (dt/6.0) * (k1 + 2.0*k2 + 2.0*k3 + k4)
     grid.fill_boundaries(sn)
-
-    # Asegurar que el estado final tenga materia TOV correcta
-    update_matter_from_tov(sn, tov_data, grid, matter)
 
     return dt, sn
 
 
-# Modificaciones para tu función run_hwh_test() para guardar más datos
-
-def run_hwh_test_enhanced(
-    gamma=2.0, K=100.0, rho_central=1.28e-3,
-    r_max=16.0, dr=0.02, t_final=20.0, cfl=0.25,
-    atmosphere=1e-16, progress=True, save_interval=10
+# -------------------- Main Evolution Function --------------------
+def run_hwh_test(
+    # Reference default parameters
+    gamma=2.0,                # Polytropic index (n=1 → γ=2)
+    K=1.0,                    # Polytropic constant
+    rho_central=0.129285,     # Central density
+    cfl=0.1,                  # CFL factor
+    # Grid parameters
+    r_max=None,              # Will be set to 2*R_iso automatically
+    dr=0.01,                 # Spatial resolution
+    atmosphere=1e-12,        # Atmosphere threshold
+    # Evolution parameters
+    t_final_factor=1.8,      # t_final = t_final_factor * TOV_Mass
+    progress=True,           # Print progress
+    save_interval=10         # Save frequency for detailed data
 ):
     """
-    Versión mejorada que guarda más datos para plotting.
-    
-    Parameters:
-    -----------
-    save_interval : int
-        Cada cuántos steps guardar datos adicionales
+    Run Hydro-without-Hydro test using reference parameters.
+
+    This test evolves the BSSN equations with static TOV matter sources
+    to verify numerical stability, as described in Baumgarte, Hughes & Shapiro.
+
+    Parameters  defaults:
+    - gamma = 2.0 (polytropic EOS)
+    - K = 1.0 (polytropic constant)
+    - rho_central = 0.129285 (central baryon density)
+    - CFL = 0.1
+    - t_final = 1.8 * TOV_Mass
+
+    Returns:
+        dict: Contains evolution data for analysis and plotting
     """
-    # ... (código inicial igual) ...
-    
-    # grid & background
+    # High-fidelity TOV solution
+    solver = TOVSolver(K=K, Gamma=gamma)
+    if r_max is None:
+        # Probe solution to determine stellar radius (densely sampled)
+        r_probe = np.linspace(0.0, 200.0, 4096)
+        tov_probe = solver.solve(rho_central, r_max=r_probe[-1])
+        r_max = 2.0 * tov_probe['R']  # Domain = 2 * stellar radius (Schwarzschild)
+    else:
+        # Still generate a probe for reporting consistency
+        r_probe = np.linspace(0.0, r_max, 4096)
+        tov_probe = solver.solve(rho_central, r_max=r_max)
+
+    # Setup grid
     spacing = LinearSpacing(int(r_max/dr), r_max, SpacingExtent.HALF)
     r = spacing[0]
+
+    # Setup hydro with reference parameters
+    eos = IdealGasEOS(gamma=gamma)
+
     hydro = PerfectFluid(
-        eos=PolytropicEOS(K=K, gamma=gamma),
+        eos=eos,
         spacetime_mode='dynamic',
-        atmosphere_rho=atmosphere,
+        atmosphere=atmosphere,
         reconstructor=create_reconstruction("mp5"),
         riemann_solver=HLLRiemannSolver()
     )
@@ -288,220 +186,575 @@ def run_hwh_test_enhanced(
     grid = Grid(spacing, state_vec)
     background = FlatSphericalBackground(r)
 
-    # TOV en malla auxiliar -> interpola al grid
-    tov = solve_tov_ode(r_max=r[-1], rho_central=rho_central, gamma=gamma, K=K, n_points=2048)
-    rho_i = interp1d(tov['r'], tov['rho'], kind='linear', bounds_error=False, fill_value=atmosphere)
-    p_i   = interp1d(tov['r'], tov['pressure'], kind='linear', bounds_error=False, fill_value=atmosphere)
-    rho0  = np.maximum(rho_i(r), atmosphere)
-    p     = np.maximum(p_i(r), atmosphere)
-    v     = np.zeros_like(r)
-    rho0, v, p = fill_ghosts_primitives(rho0, v, p)
-    D, Sr, tau, W, h = primitives_to_conserved(rho0, v, p, hydro.eos)
+    # Set background in hydro object (required for get_emtensor)
+    hydro.background = background
 
-    # estado inicial BSSN (conforme‑plano + lapse TOV)
-    state = build_initial_state_hwh(grid, hydro, background, r, tov, rho0, p, v)
+    # Solve TOV covering our domain (Schwarzschild coordinate)
+    r_domain_max = float(np.max(np.abs(r)))
+    tov_solution = solver.solve(rho_central, r_max=r_domain_max)
+    M_star = tov_solution['M_star']
+    R_star = tov_solution['R']
 
-    # Arrays para guardar evolución temporal
-    t = 0.0; steps = 0
+    # Report TOV properties 
+    if progress:
+        print("Generated TOV star with:")
+        print(f"  M        = {M_star:.15e}")
+        print(f"  R_star   = {R_star:.15e}")
+        print(f"  M/R_star = {M_star/R_star:.15e}\n")
+
+    tov_data = dict(tov_solution)
+
+    # Build initial data (Schwarzschild-based interpolation + ADM→BSSN conversion)
+    state = create_initial_data_interpolated(
+        tov_solution,
+        grid,
+        background,
+        hydro.eos,
+        atmosphere=hydro.atmosphere,
+        polytrope_K=K,
+        polytrope_Gamma=gamma,
+        interp_order=11
+    )
+
+    # Extract primitive data for diagnostics
+    bssn_vars = BSSNVars(grid.N)
+    bssn_vars.set_bssn_vars(state[:NUM_BSSN_VARS, :])
+    hydro.set_matter_vars(state, bssn_vars, grid)
+    primitives = hydro._get_primitives(bssn_vars, grid.r, grid)
+    rho0 = primitives['rho0'].copy()
+    p = primitives['p'].copy()
+    v = primitives['vr'].copy()
+
+    # Set final time based on TOV mass 
+    t_final = t_final_factor * M_star
+
+    # Initialize data storage
+    t = 0.0
+    steps = 0
     center = NUM_GHOSTS
-    
-    # Datos en el centro
+
+    # Time series at center
     lapse_c = [state[idx_lapse, center]]
-    phi_c   = [state[idx_phi,   center]]
-    K_c     = [state[idx_K,     center]]
-    hrr_c   = [state[idx_hrr,   center]]
-    
-    # Perfiles completos (guardamos cada save_interval)
+    phi_c   = [state[idx_phi, center]]
+    K_c     = [state[idx_K, center]]
+    hrr_c   = [state[idx_hrr, center]]
+    times   = [0.0]
+
+    # Full state snapshots
     times_detailed = [0.0]
     states_detailed = [state.copy()]
-    
-    times = [0.0]
-    
-    if progress: print("Hydro-without-Hydro evolution: starting...")
 
+    # Calculate initial Hamiltonian constraint
+    Ham_init, Mom_init = get_constraints_diagnostic(state, 0.0, grid, background, hydro)
+    Ham_center = [Ham_init[0, center]]  # Hamiltonian constraint at center
+    Ham_snapshots = [Ham_init[0, :].copy()]  # Full Hamiltonian profile
+
+    if progress:
+        print("Starting Hydro-without-Hydro evolution...")
+        print(f"Grid: Nr={len(r)-2*NUM_GHOSTS}, r_max={r_max:.2f}")
+        print(f"Time: t_final={t_final:.4f}, CFL={cfl}")
+        print(f"TOV: M={M_star:.4f}, R={R_star:.4f}\n")
+
+    # Main evolution loop
     while t < t_final and steps < 200000:
-        dt, state = rk3_step_hwh(state, grid, background, hydro, tov, cfl=cfl)
-        t += dt; steps += 1
-        
-        # Guardar datos en el centro cada paso
+        # RK4 time step
+        dt, state = rk4_step_hwh(state, grid, background, hydro, cfl=cfl)
+        t += dt
+        steps += 1
+
+        # Save time series data
         if steps % 10 == 0:
             lapse_c.append(state[idx_lapse, center])
             phi_c.append(state[idx_phi, center])
             K_c.append(state[idx_K, center])
             hrr_c.append(state[idx_hrr, center])
             times.append(t)
-            
-        # Guardar estados completos menos frecuentemente
+
+            # Calculate Hamiltonian constraint
+            Ham, Mom = get_constraints_diagnostic(state, t, grid, background, hydro)
+            Ham_center.append(Ham[0, center])
+
+        # Save full snapshots
         if steps % save_interval == 0:
             times_detailed.append(t)
             states_detailed.append(state.copy())
-            
+
+            # Save Hamiltonian constraint snapshot
+            Ham_full, _ = get_constraints_diagnostic(state, t, grid, background, hydro)
+            Ham_snapshots.append(Ham_full[0, :].copy())
+
+        # Progress output
         if progress and steps % 100 == 0:
-            print(f" t={t:.3f}  α_c={lapse_c[-1]:.6f}  φ_c={phi_c[-1]:+.3e}  K_c={K_c[-1]:+.3e}")
+            print(f"  t/M={t/M_star:.3f}  dt/M={dt/M_star:.2e}  "
+                  f"α_c={lapse_c[-1]:.6f}  φ_c={phi_c[-1]:+.3e}  K_c={K_c[-1]:+.3e}")
 
     if progress:
-        print(f"Done. steps={steps}, t≈{t:.3f}")
-        print(f"Center: α(0)={lapse_c[0]:.6f} → α(t)={lapse_c[-1]:.6f},  Δα={lapse_c[-1]-lapse_c[0]:+.3e}")
-        print(f"Center: φ(0)={phi_c[0]:+.3e} → φ(t)={phi_c[-1]:+.3e}, Δφ={phi_c[-1]-phi_c[0]:+.3e}")
-        print(f"Center: K(0)={K_c[0]:+.3e} → K(t)={K_c[-1]:+.3e}, ΔK={K_c[-1]-K_c[0]:+.3e}")
+        print(f"\nEvolution completed:")
+        print(f"  Steps: {steps}")
+        print(f"  Final time: t={t:.4f} (t/M={t/M_star:.3f})")
+        print(f"  Center values:")
+        print(f"    α: {lapse_c[0]:.6f} → {lapse_c[-1]:.6f} (Δα={lapse_c[-1]-lapse_c[0]:+.3e})")
+        print(f"    φ: {phi_c[0]:+.3e} → {phi_c[-1]:+.3e} (Δφ={phi_c[-1]-phi_c[0]:+.3e})")
+        print(f"    K: {K_c[0]:+.3e} → {K_c[-1]:+.3e} (ΔK={K_c[-1]-K_c[0]:+.3e})")
 
     return dict(
-        time=t, steps=steps, r=r, state=state, 
-        # Evolución temporal en el centro
+        # Evolution results
+        time=t, steps=steps, r=r, state=state,
+        # Time series at center
         lapse_center=np.array(lapse_c),
-        phi_center=np.array(phi_c), 
+        phi_center=np.array(phi_c),
         K_center=np.array(K_c),
         hrr_center=np.array(hrr_c),
-        times=np.array(times), 
-        # Estados completos
+        Ham_center=np.array(Ham_center),  # Hamiltonian constraint at center
+        times=np.array(times),
+        # Full snapshots
         times_detailed=np.array(times_detailed),
         states_detailed=states_detailed,
-        # Datos iniciales
-        tov=tov, rho0=rho0, pressure0=p, velocity0=v,
-        # Parámetros
-        gamma=gamma, K_eos=K, rho_central=rho_central
+        Ham_snapshots=Ham_snapshots,  # Hamiltonian constraint profiles
+        # Initial data
+        tov=tov_data, rho0=rho0, pressure0=p, velocity0=v,
+        # Parameters
+        gamma=gamma, K_eos=K, rho_central=rho_central,
+        TOV_Mass=M_star, TOV_Radius=R_star
     )
 
-# Función de plotting mejorada para usar los nuevos datos
-def plot_hwh_enhanced(result, save_plots=True, plot_dir="plots"):
-    """Plot con los nuevos datos guardados."""
+# -------------------- Helper for 2D plots from 1D spherical data --------------------
+def create_2D_plot_from_1D_spherical(r_data, values_data, extent=2.0, resolution=100):
+    """
+    Create 2D plot data from 1D spherically symmetric data.
+
+    Since Engrenage uses 1D spherical symmetry ,
+
+    Parameters:
+    -----------
+    r_data : array
+        Radial coordinates of 1D data
+    values_data : array
+        Values at each radial point
+    extent : float
+        Plot extent in units of M (from -extent to +extent)
+    resolution : int
+        Number of points in each direction
+
+    Returns:
+    --------
+    X, Y, Z : arrays
+        2D meshgrids for plotting
+    """
+    from scipy.interpolate import interp1d
+
+    # Create 2D grid
+    x = np.linspace(-extent, extent, resolution)
+    y = np.linspace(-extent, extent, resolution)
+    X, Y = np.meshgrid(x, y)
+
+    # Calculate radius at each 2D point
+    R = np.sqrt(X**2 + Y**2)
+
+    # Interpolate 1D data to 2D
+    # Use linear interpolation, extrapolate with nearest value
+    interp_func = interp1d(r_data, values_data, kind='linear',
+                          bounds_error=False, fill_value=(values_data[0], values_data[-1]))
+
+    # Apply interpolation
+    Z = interp_func(R)
+
+    return X, Y, Z
+
+
+# -------------------- Plotting Functions --------------------
+def plot_hwh_results(result, save_plots=True, plot_dir="hwh_plots"):
+    """
+    Generate plots.
+
+    Plots:
+    1. Time evolution at center (φ, K, α vs t)
+    2. Spatial profiles at different times
+    3. Drift/error analysis
+
+    These match Fig. 1 from Baumgarte, Hughes & Shapiro paper.
+    """
     import os
     if save_plots:
         os.makedirs(plot_dir, exist_ok=True)
-    
-    # Extraer datos
+
+    # Extract data
     times = result['times']
     times_detailed = result['times_detailed']
     states_detailed = result['states_detailed']
     r = result['r']
     tov = result['tov']
-    
-    # ==================== PLOT 1: Evolución temporal (como Fig. 1 del paper) ====================
-    fig, (ax1, ax2, ax3) = plt.subplots(3, 1, figsize=(10, 12))
-    
-    # φ vs tiempo
-    ax1.plot(times, result['phi_center'], 'b-', linewidth=2, label='φ(center)')
-    ax1.set_ylabel('φ', fontsize=12)
-    ax1.set_title('Hydro-without-Hydro: Evolution at Center (like Fig. 1 of paper)', fontsize=14)
-    ax1.grid(True, alpha=0.3)
-    ax1.legend()
-    
-    # K vs tiempo (¡esta es la figura clave del paper!)
-    ax2.plot(times, result['K_center'], 'g-', linewidth=2, label='K(center)')
-    ax2.axhline(y=0, color='k', linestyle='--', alpha=0.5, label='K = 0 (equilibrium)')
-    ax2.set_ylabel('K (Trace of extrinsic curvature)', fontsize=12)
-    ax2.grid(True, alpha=0.3)
-    ax2.legend()
-    
-    # lapse vs tiempo
-    ax3.plot(times, result['lapse_center'], 'r-', linewidth=2, label='α(center)')
-    ax3.axhline(y=result['lapse_center'][0], color='r', linestyle='--', alpha=0.5, label='Initial α')
-    ax3.set_xlabel('Time', fontsize=12)
-    ax3.set_ylabel('Lapse α', fontsize=12)
-    ax3.grid(True, alpha=0.3)
-    ax3.legend()
-    
+    TOV_Mass = result['TOV_Mass']
+
+    # Normalize time by TOV mass
+    times_M = times / TOV_Mass
+    times_detailed_M = times_detailed / TOV_Mass
+
+    # ==================== PLOT 1: Time Evolution ====================
+    print("\nGenerating time evolution plots...")
+    fig, axes = plt.subplots(4, 1, figsize=(10, 12))
+
+    # Conformal factor φ vs time
+    axes[0].plot(times_M, result['phi_center'], 'b-', linewidth=2)
+    axes[0].set_ylabel('φ (conformal factor)', fontsize=12)
+    axes[0].set_title('Hydro-without-Hydro Test: Central Evolution', fontsize=14, fontweight='bold')
+    axes[0].grid(True, alpha=0.3)
+    axes[0].set_xlim(0, times_M[-1])
+
+    # Extrinsic curvature K vs time (KEY FIGURE!)
+    axes[1].plot(times_M, result['K_center'], 'g-', linewidth=2)
+    axes[1].axhline(y=0, color='k', linestyle='--', alpha=0.5)
+    axes[1].set_ylabel('K (extrinsic curvature)', fontsize=12)
+    axes[1].grid(True, alpha=0.3)
+    axes[1].set_xlim(0, times_M[-1])
+    # Add text showing maximum deviation
+    K_max = np.max(np.abs(result['K_center']))
+    axes[1].text(0.95, 0.95, f'max|K| = {K_max:.2e}',
+                transform=axes[1].transAxes, ha='right', va='top',
+                bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
+
+    # Lapse α vs time
+    axes[2].plot(times_M, result['lapse_center'], 'r-', linewidth=2)
+    axes[2].axhline(y=result['lapse_center'][0], color='r', linestyle='--', alpha=0.5)
+    axes[2].set_ylabel('α (lapse)', fontsize=12)
+    axes[2].grid(True, alpha=0.3)
+    axes[2].set_xlim(0, times_M[-1])
+
+    # Hamiltonian constraint vs time (NEW!)
+    if 'Ham_center' in result:
+        axes[3].semilogy(times_M, np.abs(result['Ham_center']) + 1e-16, 'purple', linewidth=2)
+        axes[3].set_ylabel('|H| (Ham. constraint)', fontsize=12)
+        axes[3].grid(True, alpha=0.3, which='both')
+        axes[3].set_xlim(0, times_M[-1])
+        Ham_max = np.max(np.abs(result['Ham_center']))
+        axes[3].text(0.95, 0.95, f'max|H| = {Ham_max:.2e}',
+                    transform=axes[3].transAxes, ha='right', va='top',
+                    bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
+
+    axes[-1].set_xlabel('t/M', fontsize=12)
+
     plt.tight_layout()
     if save_plots:
-        plt.savefig(f"{plot_dir}/hwh_time_evolution_paper_style.png", dpi=300, bbox_inches='tight')
-    plt.show()
-    
-    # ==================== PLOT 2: Snapshots de evolución ====================
-    fig, ((ax1, ax2), (ax3, ax4)) = plt.subplots(2, 2, figsize=(12, 10))
-    
-    # Seleccionar algunos tiempos para mostrar
-    n_snapshots = min(4, len(states_detailed))
+        plt.savefig(f"{plot_dir}/hwh_time_evolution.png", dpi=150, bbox_inches='tight')
+    plt.close()
+
+    # ==================== PLOT 2: Spatial Profiles ====================
+    print("Generating spatial profile plots...")
+    fig, axes = plt.subplots(2, 2, figsize=(12, 10))
+
+    # Select snapshots to plot
+    n_snapshots = min(5, len(states_detailed))
     indices = np.linspace(0, len(states_detailed)-1, n_snapshots, dtype=int)
-    
-    colors = ['blue', 'red', 'green', 'orange']
-    
+    colors = plt.cm.viridis(np.linspace(0, 0.9, n_snapshots))
+
     for i, idx in enumerate(indices):
-        color = colors[i]
         state_snap = states_detailed[idx]
-        time_snap = times_detailed[idx]
-        label = f't = {time_snap:.2f}'
-        
-        # Lapse
-        ax1.plot(r, state_snap[idx_lapse, :], color=color, linewidth=2, label=label)
-        
-        # φ  
-        ax2.plot(r, state_snap[idx_phi, :], color=color, linewidth=2, label=label)
-        
-        # K
-        ax3.plot(r, state_snap[idx_K, :], color=color, linewidth=2, label=label)
-        
-        # h_rr
-        ax4.plot(r, state_snap[idx_hrr, :], color=color, linewidth=2, label=label)
-    
-    # Agregar solución TOV inicial donde sea relevante
+        time_snap = times_detailed_M[idx]
+        label = f't/M = {time_snap:.2f}'
+
+        # Lapse α(r)
+        axes[0,0].plot(r/TOV_Mass, state_snap[idx_lapse, :],
+                      color=colors[i], linewidth=2, label=label)
+
+        # Conformal factor φ(r)
+        axes[0,1].plot(r/TOV_Mass, state_snap[idx_phi, :],
+                      color=colors[i], linewidth=2, label=label)
+
+        # Extrinsic curvature K(r)
+        axes[1,0].plot(r/TOV_Mass, state_snap[idx_K, :],
+                      color=colors[i], linewidth=2, label=label)
+
+        # Metric component h_rr(r)
+        axes[1,1].plot(r/TOV_Mass, state_snap[idx_hrr, :],
+                      color=colors[i], linewidth=2, label=label)
+
+    # Add initial TOV lapse
     if 'r' in tov and 'alpha' in tov:
-        alpha_interp = interp1d(tov['r'], tov['alpha'], kind='linear', 
-                               bounds_error=False, fill_value=(tov['alpha'][0], tov['alpha'][-1]))
-        ax1.plot(r, alpha_interp(r), 'k--', linewidth=2, alpha=0.7, label='TOV initial')
-    
-    ax1.set_xlabel('r'); ax1.set_ylabel('Lapse α'); ax1.set_title('Lapse Evolution'); ax1.legend(); ax1.grid(True, alpha=0.3)
-    ax2.set_xlabel('r'); ax2.set_ylabel('φ'); ax2.set_title('Conformal Factor Evolution'); ax2.legend(); ax2.grid(True, alpha=0.3)
-    ax3.set_xlabel('r'); ax3.set_ylabel('K'); ax3.set_title('Extrinsic Curvature Trace'); ax3.legend(); ax3.grid(True, alpha=0.3)
-    ax4.set_xlabel('r'); ax4.set_ylabel('h_rr'); ax4.set_title('Conformal Metric h_rr'); ax4.legend(); ax4.grid(True, alpha=0.3)
-    
+        alpha_interp = interp1d(tov['r'], tov['alpha'], kind='linear',
+                               bounds_error=False,
+                               fill_value=(tov['alpha'][0], tov['alpha'][-1]))
+        axes[0,0].plot(r/TOV_Mass, alpha_interp(r), 'k--',
+                      linewidth=1.5, alpha=0.7, label='TOV initial')
+
+    # Format axes
+    axes[0,0].set_xlabel('r/M'); axes[0,0].set_ylabel('α'); axes[0,0].set_title('Lapse Function')
+    axes[0,1].set_xlabel('r/M'); axes[0,1].set_ylabel('φ'); axes[0,1].set_title('Conformal Factor')
+    axes[1,0].set_xlabel('r/M'); axes[1,0].set_ylabel('K'); axes[1,0].set_title('Extrinsic Curvature')
+    axes[1,1].set_xlabel('r/M'); axes[1,1].set_ylabel('h_rr'); axes[1,1].set_title('Metric Component h_rr')
+
+    for ax in axes.flat:
+        ax.grid(True, alpha=0.3)
+        ax.legend(loc='best', fontsize=8)
+
     plt.tight_layout()
     if save_plots:
-        plt.savefig(f"{plot_dir}/hwh_evolution_snapshots.png", dpi=300, bbox_inches='tight')
-    plt.show()
-    
-    # ==================== PLOT 3: Error/Drift Analysis ====================
-    fig, ((ax1, ax2), (ax3, ax4)) = plt.subplots(2, 2, figsize=(12, 10))
-    
-    # Drifts
+        plt.savefig(f"{plot_dir}/hwh_spatial_profiles.png", dpi=150, bbox_inches='tight')
+    plt.close()
+
+    # ==================== PLOT 3: Stability Analysis ====================
+    print("Generating stability analysis plots...")
+    fig, axes = plt.subplots(2, 2, figsize=(12, 8))
+
+    # Calculate drifts
     phi_drift = result['phi_center'] - result['phi_center'][0]
-    K_drift = result['K_center'] - result['K_center'][0]  # Debería mantenerse cerca de 0
+    K_drift = result['K_center']  # K should stay near 0
     lapse_drift = result['lapse_center'] - result['lapse_center'][0]
-    
-    ax1.plot(times, phi_drift, 'b-', linewidth=2)
-    ax1.set_xlabel('Time'); ax1.set_ylabel('Δφ'); ax1.set_title('Conformal Factor Drift')
-    ax1.ticklabel_format(style='scientific', axis='y', scilimits=(0,0)); ax1.grid(True, alpha=0.3)
-    
-    ax2.plot(times, K_drift, 'g-', linewidth=2)
-    ax2.set_xlabel('Time'); ax2.set_ylabel('ΔK'); ax2.set_title('Extrinsic Curvature Trace Drift')
-    ax2.ticklabel_format(style='scientific', axis='y', scilimits=(0,0)); ax2.grid(True, alpha=0.3)
-    
-    ax3.plot(times, lapse_drift, 'r-', linewidth=2)
-    ax3.set_xlabel('Time'); ax3.set_ylabel('Δα'); ax3.set_title('Lapse Drift')
-    ax3.ticklabel_format(style='scientific', axis='y', scilimits=(0,0)); ax3.grid(True, alpha=0.3)
-    
-    # Conservación (ejemplo: norma L2 de variables)
-    l2_norms = []
+
+    # φ drift
+    axes[0,0].semilogy(times_M, np.abs(phi_drift) + 1e-16, 'b-', linewidth=2)
+    axes[0,0].set_xlabel('t/M'); axes[0,0].set_ylabel('|Δφ|')
+    axes[0,0].set_title('Conformal Factor Drift')
+    axes[0,0].grid(True, alpha=0.3, which='both')
+
+    # K evolution (should remain near zero)
+    axes[0,1].plot(times_M, K_drift, 'g-', linewidth=2)
+    axes[0,1].axhline(y=0, color='k', linestyle='--', alpha=0.5)
+    axes[0,1].set_xlabel('t/M'); axes[0,1].set_ylabel('K')
+    axes[0,1].set_title('Extrinsic Curvature (should ≈ 0)')
+    axes[0,1].grid(True, alpha=0.3)
+
+    # α drift
+    axes[1,0].semilogy(times_M, np.abs(lapse_drift) + 1e-16, 'r-', linewidth=2)
+    axes[1,0].set_xlabel('t/M'); axes[1,0].set_ylabel('|Δα|')
+    axes[1,0].set_title('Lapse Drift')
+    axes[1,0].grid(True, alpha=0.3, which='both')
+
+    # L∞ norm of φ over time
+    l_inf_norms = []
     for state_snap in states_detailed:
-        # Calcular norma L2 de φ como medida de "conservación"
-        norm = np.sqrt(np.mean(state_snap[idx_phi, :]**2))
-        l2_norms.append(norm)
-    
-    ax4.plot(times_detailed, l2_norms, 'm-', linewidth=2)
-    ax4.set_xlabel('Time'); ax4.set_ylabel('||φ||₂'); ax4.set_title('L2 Norm of φ')
-    ax4.grid(True, alpha=0.3)
-    
+        norm = np.max(np.abs(state_snap[idx_phi, :]))
+        l_inf_norms.append(norm)
+
+    axes[1,1].semilogy(times_detailed_M, np.array(l_inf_norms) + 1e-16, 'm-', linewidth=2)
+    axes[1,1].set_xlabel('t/M'); axes[1,1].set_ylabel('||φ||∞')
+    axes[1,1].set_title('L∞ Norm of Conformal Factor')
+    axes[1,1].grid(True, alpha=0.3, which='both')
+
     plt.tight_layout()
     if save_plots:
-        plt.savefig(f"{plot_dir}/hwh_error_analysis.png", dpi=300, bbox_inches='tight')
-    plt.show()
-    
+        plt.savefig(f"{plot_dir}/hwh_stability_analysis.png", dpi=150, bbox_inches='tight')
+    plt.close()
+
+    # ==================== PLOT 4: 2D Hamiltonian Constraint===================
+    if 'Ham_snapshots' in result:
+        print("Generating 2D Hamiltonian constraint plots...")
+
+        # Create figure with subplots for different times
+        fig, axes = plt.subplots(2, 2, figsize=(12, 10))
+        axes = axes.flatten()
+
+        # Select snapshots to plot
+        n_snapshots = min(4, len(result['Ham_snapshots']))
+        indices = np.linspace(0, len(result['Ham_snapshots'])-1, n_snapshots, dtype=int)
+
+        for i, idx in enumerate(indices):
+            if i >= 4: break  # Only plot first 4
+
+            Ham_profile = result['Ham_snapshots'][idx]
+            time_snap = result['times_detailed'][idx] if idx < len(result['times_detailed']) else 0
+
+            # Create 2D data from 1D spherical profile
+            # Note: the reference notebook uses y/M and z/M, we interpolate from our 1D solution
+            extent_M = 2.0 * result['TOV_Radius'] / result['TOV_Mass']  # Plot extent in units of M
+
+            X, Y, Ham_2D = create_2D_plot_from_1D_spherical(
+                result['r'] / result['TOV_Mass'],  # Convert r to units of M
+                np.log10(np.abs(Ham_profile) + 1e-16),  # log10 of |H|
+                extent=extent_M,
+                resolution=100
+            )
+
+            # Plot
+            im = axes[i].contourf(X, Y, Ham_2D, levels=20, cmap='viridis')
+            axes[i].set_title(f't/M = {time_snap/result["TOV_Mass"]:.2f}')
+            axes[i].set_xlabel('y/M')
+            axes[i].set_ylabel('z/M')
+            axes[i].set_aspect('equal')
+
+            # Add colorbar
+            cbar = plt.colorbar(im, ax=axes[i])
+            cbar.set_label(r'$\log_{10}|H|$', rotation=270, labelpad=15)
+
+            # Add circle showing stellar radius
+            circle = Circle((0, 0), result['TOV_Radius']/result['TOV_Mass'],
+                           color='red', fill=False, linestyle='--', linewidth=1)
+            axes[i].add_patch(circle)
+
+        plt.suptitle('2D Hamiltonian Constraint Violation (log₁₀|H|)', fontsize=14, fontweight='bold')
+        plt.tight_layout()
+
+        if save_plots:
+            plt.savefig(f"{plot_dir}/hwh_hamiltonian_2D.png", dpi=150, bbox_inches='tight')
+        plt.close()
+
+    print(f"\nPlots saved to {plot_dir}/")
     return result
 
-# ==================== Ejemplo de uso completo ====================
-if __name__ == "__main__":
-    # Parámetros conservadores para estabilidad
-    result = run_hwh_test_enhanced(
-        gamma=2.0,           # Polytropic index n=1 → γ=1+1/n=2
-        K=100.0,             # Polytropic constant
-        rho_central=5e-4,    # Central density más baja
-        r_max=8.0,           # Domain size más pequeño
-        dr=0.05,             # Spatial resolution más gruesa
-        t_final=2.0,         # Evolution time más corto
-        cfl=0.05,            # CFL factor muy conservador
-        save_interval=10,    # Save full state every 10 steps
-        progress=True
-    )
-    
-    # Generar plots estilo paper
-    plot_hwh_enhanced(result, save_plots=True)
 
+def run_convergence_test(resolutions=[72, 96], cfl=0.1, plot=True):
+    """
+    Run convergence 
+
+    Tests that Hamiltonian constraint violation converges to zero
+    with increasing resolution at the expected order.
+
+    Parameters:
+    -----------
+    resolutions : list
+        List of radial resolutions to test [Nr1, Nr2]
+    cfl : float
+        CFL factor for evolution
+    plot : bool
+        Whether to generate convergence plot
+
+    Returns:
+    --------
+    dict: Convergence test results
+    """
+    print("\n" + "="*60)
+    print("CONVERGENCE TEST ")
+    print("="*60)
+
+    results = []
+
+    for Nr in resolutions:
+        print(f"\nRunning resolution Nr = {Nr}...")
+
+        # Calculate dr from resolution
+        # Domain size is approximately 2 * R_star
+        R_approx = 1.6  # Approximate for our TOV star
+        dr = R_approx / Nr
+
+        # Run simulation
+        result = run_hwh_test(dr=dr, cfl=cfl, progress=False,
+                             save_interval=1000)  # Less frequent saves for convergence test
+
+        results.append(result)
+
+        print(f"  Completed: t_final/M = {result['time']/result['TOV_Mass']:.3f}")
+        print(f"  Max |K| = {np.max(np.abs(result['K_center'])):.2e}")
+        print(f"  Final φ drift = {result['phi_center'][-1] - result['phi_center'][0]:.2e}")
+
+    if plot and len(results) >= 2:
+        print("\nGenerating convergence plot...")
+
+        fig, ax = plt.subplots(figsize=(10, 6))
+
+        # Plot K evolution for different resolutions
+        for i, (Nr, res) in enumerate(zip(resolutions, results)):
+            times_M = res['times'] / res['TOV_Mass']
+            ax.plot(times_M, res['K_center'], linewidth=2,
+                   label=f'Nr = {Nr}')
+
+        ax.axhline(y=0, color='k', linestyle='--', alpha=0.5)
+        ax.set_xlabel('t/M', fontsize=12)
+        ax.set_ylabel('K (extrinsic curvature)', fontsize=12)
+        ax.set_title('Convergence Test: K should remain ≈ 0', fontsize=14)
+        ax.legend()
+        ax.grid(True, alpha=0.3)
+
+        # Calculate convergence factor
+        if len(results) == 2:
+            # Compare final K values
+            K1_final = results[0]['K_center'][-1]
+            K2_final = results[1]['K_center'][-1]
+            ratio = resolutions[0] / resolutions[1]
+            expected_factor = ratio**4  # 4th order convergence
+
+            print(f"\nConvergence Analysis:")
+            print(f"  K_final(Nr={resolutions[0]}) = {K1_final:.2e}")
+            print(f"  K_final(Nr={resolutions[1]}) = {K2_final:.2e}")
+            print(f"  Expected ratio (4th order): {expected_factor:.2f}")
+            print(f"  Actual ratio: {K1_final/K2_final:.2f}")
+
+        plt.tight_layout()
+        plt.savefig("hwh_convergence_test.png", dpi=150, bbox_inches='tight')
+        plt.close()
+
+        # Also generate Hamiltonian profile convergence at final time
+        try:
+            import numpy as _np
+            import matplotlib.pyplot as _plt
+            # Use final stored profiles
+            r1 = results[0]['r'] / results[0]['TOV_Mass']
+            r2 = results[1]['r'] / results[1]['TOV_Mass']
+            H1 = results[0]['Ham_snapshots'][-1]
+            H2 = results[1]['Ham_snapshots'][-1]
+            eps = 1e-30
+            logH1 = _np.log10(_np.abs(H1) + eps)
+            logH2 = _np.log10(_np.abs(H2) + eps)
+            Nr1, Nr2 = resolutions[0], resolutions[1]
+            if Nr1 > Nr2:
+                r_hi, logH_hi, label_hi = r1, logH1, f"Nr={Nr1}"
+                r_lo, logH_lo, label_lo, ratio = r2, logH2, f"Nr={Nr2}", Nr2 / Nr1
+            else:
+                r_hi, logH_hi, label_hi = r2, logH2, f"Nr={Nr2}"
+                r_lo, logH_lo, label_lo, ratio = r1, logH1, f"Nr={Nr1}", Nr1 / Nr2
+            logH_lo_scaled = logH_lo + 4.0 * _np.log10(max(ratio, 1e-16))
+            fig2, ax2 = _plt.subplots(figsize=(8, 6))
+            ax2.plot(r_hi, logH_hi, 'k-', label=label_hi)
+            ax2.plot(r_lo, logH_lo_scaled, 'k--', label=f"{label_lo}, mult by ({ratio:.2f})^4")
+            ax2.set_title(r"4$^{\mathrm{th}}$-order Convergence, at t/M=1.8")
+            ax2.set_xlabel('y/M')
+            ax2.set_ylabel(r'$\log_{10}$ (Ham. Constraint Violation)')
+            ax2.grid(True, alpha=0.3)
+            lg = ax2.legend(loc='lower right', shadow=True, fontsize='x-large')
+            try:
+                lg.get_frame().set_facecolor('orange')
+            except Exception:
+                pass
+            _plt.tight_layout(); _plt.savefig("hwh_convergence_hamiltonian_profile.png", dpi=150, bbox_inches='tight'); _plt.close(fig2)
+        except Exception as e:
+            print(f"[warn] Could not generate Hamiltonian convergence profile: {e}")
+
+    return results
+
+# ==================== Main Execution  ====================
+if __name__ == "__main__":
+    print("="*60)
+    print("HYDRO-WITHOUT-HYDRO TEST")
+    print("Replicating notebook")
+    print("="*60)
+
+    #
+    print("\nOption 1: Running single simulation...")
+    result = run_hwh_test(
+        gamma=2.0,            # Polytropic index (n=1)
+        K=1.0,                # Polytropic constant
+        rho_central=0.129285, # Central density
+        cfl=0.1,              # CFL factor
+        dr=0.02,              # Spatial resolution
+        progress=True         # Show progress
+    )
+
+    # Generate plots
+    plot_hwh_results(result, save_plots=True)
+
+    # Option 2: Convergence test 
+    print("\nOption 2: Running convergence test...")
+    convergence_results = run_convergence_test(
+        resolutions=[72, 96],  
+        cfl=0.1,
+        plot=True
+    )
+
+    # Print summary
+    print("\n" + "="*60)
+    print("TEST COMPLETED")
+    print("="*60)
+    print("\nKey Results:")
+    print(f"  TOV Mass: M = {result['TOV_Mass']:.6f}")
+    print(f"  TOV Radius: R = {result['TOV_Radius']:.6f}")
+    print(f"  Final time: t/M = {result['time']/result['TOV_Mass']:.3f}")
+    print(f"  Max |K|: {np.max(np.abs(result['K_center'])):.2e}")
+    print(f"  φ drift: {result['phi_center'][-1] - result['phi_center'][0]:.2e}")
+    print(f"  α drift: {result['lapse_center'][-1] - result['lapse_center'][0]:.2e}")
+    if 'Ham_center' in result:
+        print(f"  Max |H|: {np.max(np.abs(result['Ham_center'])):.2e}")
+        print(f"  Initial |H|: {np.abs(result['Ham_center'][0]):.2e}")
+        print(f"  Final |H|: {np.abs(result['Ham_center'][-1]):.2e}")
+    print("\nExpected behavior:")
+    print("  - K should remain ≈ 0 (TOV is static solution)")
+    print("  - φ and α should have minimal drift")
+    print("  - Errors should converge at 4th order with resolution")
+    print("\nSee generated plots in hwh_plots/ directory")

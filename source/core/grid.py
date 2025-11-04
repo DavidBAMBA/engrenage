@@ -118,10 +118,35 @@ class Grid:
         b = (state[idx] - asymp_offset) / self.r[idx] ** asymp_power
 
         outer_state[-NUM_GHOSTS:] = asymp_offset + b * self.r[-NUM_GHOSTS:] ** asymp_power
-        
+
+    def fill_boundaries_primitives(self, rho0, vr, pressure):
+        """Fill boundaries for primitive variables only.
+
+        Uses zero-gradient/outflow conditions for primitives,
+        following IllinoisGRMHD/NRPy+ strategy.
+
+        Args:
+            rho0: (N,) density array
+            vr: (N,) radial velocity array
+            pressure: (N,) pressure array
+        """
+        # Inner boundary: apply parity conditions
+        self.fill_inner_boundary_single_variable(rho0, parity=1)    # Even parity for density
+        self.fill_inner_boundary_single_variable(vr, parity=-1)     # Odd parity for velocity
+        self.fill_inner_boundary_single_variable(pressure, parity=1) # Even parity for pressure
+
+        # Outer boundary: zero-gradient (copy from interior)
+        idx = -NUM_GHOSTS - 1
+        rho0[-NUM_GHOSTS:] = rho0[idx]
+        vr[-NUM_GHOSTS:] = vr[idx]
+        pressure[-NUM_GHOSTS:] = pressure[idx]
+
+        # Apply outflow condition: no inflow at outer boundary
+        vr[-NUM_GHOSTS:] = np.maximum(vr[-NUM_GHOSTS:], 0.0)
+
     def get_first_derivative(self, array: np.ndarray, indices=None):
         """Compute the first derivative of an array for the specified indices."""
-        dr_array = np.zeros_like(array)
+        dr_array = np.zeros_like(array) 
         dr_array[indices] = array[indices] @ self.derivs.drn_matrix[1].T
         return dr_array / self.dr
 

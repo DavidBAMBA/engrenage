@@ -30,14 +30,14 @@ from source.backgrounds.sphericalbackground import FlatSphericalBackground
 
 # BSSN
 from source.bssn.bssnvars import BSSNVars
-from source.bssn.bssnstatevariables import NUM_BSSN_VARS, idx_phi, idx_hrr, idx_htt, idx_hpp, idx_K, idx_arr, idx_att, idx_app, idx_lapse
+from source.bssn.bssnstatevariables import NUM_BSSN_VARS, idx_phi, idx_K, idx_lapse
 
 # Hydro
 from source.matter.hydro.perfect_fluid import PerfectFluid
 from source.matter.hydro.eos import IdealGasEOS
 from source.matter.hydro.reconstruction import create_reconstruction
 from source.matter.hydro.riemann import HLLRiemannSolver
-from source.matter.hydro.cons2prim import cons_to_prim, prim_to_cons
+from source.matter.hydro.cons2prim import prim_to_cons
 from source.matter.hydro.atmosphere import AtmosphereParams
 
 
@@ -45,37 +45,59 @@ from source.matter.hydro.atmosphere import AtmosphereParams
 # GRID AND INFRASTRUCTURE SETUP
 # ============================================================================
 
-class SimpleGrid:
-    """Simple grid wrapper to match original test.py interface."""
-    def __init__(self, dr):
-        self.dr = float(dr)
-
-
-def build_grid(n_interior=256, r_min=1e-3, r_max=1.0, ng=NUM_GHOSTS):
+def build_hydro_and_grid(n_interior=256, r_max=1.0, gamma=1.4, reconstructor="mp5",
+                          spacetime_mode="fixed_minkowski"):
     """
-    Build grid using engrenage infrastructure.
-    Returns (r_array, simple_grid_obj, n_interior) to match original interface.
-    """
-    # Create spacing and grid
-    spacing = LinearSpacing(n_interior + 2 * ng, r_max)
+    Build grid and hydro infrastructure using engrenage architecture.
 
-    # We need a minimal hydro object to create StateVector
-    # Use a temporary one just for grid creation
-    eos_temp = IdealGasEOS(gamma=1.4)
-    hydro_temp = PerfectFluid(
-        eos=eos_temp,
-        spacetime_mode="fixed_minkowski",
-        atmosphere=AtmosphereParams(),
-        reconstructor=create_reconstruction("minmod"),
+    This is the correct way to build the infrastructure, following TOVEvolution.py pattern.
+
+    Args:
+        n_interior: Number of interior points
+        r_max: Maximum radius
+        gamma: Adiabatic index for EOS
+        reconstructor: Reconstruction method ("minmod", "mp5", "wenoz", etc.)
+        spacetime_mode: "fixed_minkowski" or "dynamic"
+
+    Returns:
+        grid: Grid object with full engrenage infrastructure
+        hydro: PerfectFluid object
+        background: Background geometry
+    """
+    # 1. Create spacing
+    spacing = LinearSpacing(n_interior + 2 * NUM_GHOSTS, r_max)
+
+    # 2. Create EOS
+    eos = IdealGasEOS(gamma=gamma)
+
+    # 3. Create atmosphere parameters
+    atmosphere = AtmosphereParams(
+        rho_floor=1e-13,
+        p_floor=1e-15,
+        v_max=0.999999,
+        W_max=1e3
+    )
+
+    # 4. Create hydro object (PerfectFluid)
+    hydro = PerfectFluid(
+        eos=eos,
+        spacetime_mode=spacetime_mode,
+        atmosphere=atmosphere,
+        reconstructor=create_reconstruction(reconstructor),
         riemann_solver=HLLRiemannSolver()
     )
 
-    state_vector = StateVector(hydro_temp)
+    # 5. Create state vector
+    state_vector = StateVector(hydro)
+
+    # 6. Create grid
     grid = Grid(spacing, state_vector)
 
-    # Return r array and simple grid object
-    dr_avg = (grid.r[-1] - grid.r[0]) / (grid.N - 1)
-    return grid.r, SimpleGrid(dr_avg), n_interior
+    # 7. Create background geometry
+    background = FlatSphericalBackground(grid.r)
+    hydro.background = background
+
+    return grid, hydro, background
 
 
 def fill_ghosts_primitives(rho, v, p, ng=NUM_GHOSTS):
@@ -104,170 +126,130 @@ def fill_ghosts_primitives(rho, v, p, ng=NUM_GHOSTS):
     return rho, v, p
 
 
-def to_conserved(rho0, v, p, eos):
-    """Convert primitives to conservatives using prim_to_cons."""
-    D, Sr, tau = prim_to_cons(rho0, v, p, np.ones_like(rho0), eos)
+def primitives_to_conservatives(rho0, vr, p, grid, hydro):
+    """Convert primitives to conservatives using engrenage infrastructure."""
+    gamma_rr = np.ones_like(rho0)  # Minkowski
+    D, Sr, tau = prim_to_cons(rho0, vr, p, gamma_rr, hydro.eos)
     return D, Sr, tau
 
 
-def to_primitives(D, Sr, tau, eos, p_guess=None):
-    """Convert conservatives to primitives using cons_to_prim."""
-    res = cons_to_prim(
-        {'D': D, 'Sr': Sr, 'tau': tau},
-        eos,
-        metric={'gamma_rr': np.ones_like(D), 'alpha': np.ones_like(D), 'beta_r': np.zeros_like(D)},
-        p_guess=p_guess,
-    )
-    return res['rho0'], res['vr'], res['p']
+def conservatives_to_primitives(state_2d, grid, hydro, bssn_vars):
+    """Convert conservatives to primitives using engrenage infrastructure."""
+    hydro.set_matter_vars(state_2d, bssn_vars, grid)
+    return hydro._get_primitives(bssn_vars, grid.r)
 
 
-def max_signal_speed(rho0, v, p, eos, cfl_guard=1e-6):
+def max_signal_speed(primitives, eos, cfl_guard=1e-6):
     """Compute maximum signal speed for CFL condition."""
+    rho0 = primitives['rho0']
+    vr = primitives['vr']
+    p = primitives['p']
     eps = eos.eps_from_rho_p(rho0, p)
     h = 1.0 + eps + p / np.maximum(rho0, 1e-300)
     cs2 = np.clip(eos.gamma * p / np.maximum(rho0 * h, 1e-300), 0.0, 1.0 - 1e-10)
     cs = np.sqrt(cs2)
-    return np.max(np.abs(v) + cs) + cfl_guard
+    return np.max(np.abs(vr) + cs) + cfl_guard
 
 
-def volume_integrals(D, tau, r, grid):
+def volume_integrals(state_2d, grid, hydro):
     """Compute total mass and energy with 4π r^2 weighting."""
     ng = NUM_GHOSTS
-    rin = r[ng:-ng]
-    Din = D[ng:-ng]
-    taun = tau[ng:-ng]
-    mass = 4 * np.pi * np.sum(Din * rin * rin) * grid.dr
-    energ = 4 * np.pi * np.sum((taun + Din) * rin * rin) * grid.dr
-    return mass, energ
+    r_int = grid.r[ng:-ng]
+    D = state_2d[hydro.idx_D, ng:-ng]
+    tau = state_2d[hydro.idx_tau, ng:-ng]
+    dr = grid.min_dr
+    mass = 4 * np.pi * np.sum(D * r_int * r_int) * dr
+    energy = 4 * np.pi * np.sum((tau + D) * r_int * r_int) * dr
+    return mass, energy
 
 
 # ============================================================================
-# RK3 TIME INTEGRATION USING PERFECT FLUID
+# RK3 TIME INTEGRATION USING ENGRENAGE ARCHITECTURE
 # ============================================================================
 
-def rk3_step(valencia_or_hydro, D, Sr, tau, rho0, v, p, r, grid, eos, recon, rsolve, cfl=0.2,
-             spacetime_mode="fixed_minkowski"):
+def get_rhs_minkowski(state_flat, grid, hydro, background, bssn_fixed, bssn_d1_fixed):
     """
-    RK3 Shu-Osher step using PerfectFluid infrastructure.
+    Compute RHS for matter evolution in fixed Minkowski spacetime.
 
-    This function signature matches the original test.py but uses engrenage internally.
+    Following TOVEvolution.py pattern but for Minkowski.
 
     Args:
-        valencia_or_hydro: Can be ValenciaReferenceMetric (ignored) or PerfectFluid instance
-        D, Sr, tau: Conservative variables
-        rho0, v, p: Primitive variables
-        r: Radial coordinate array
-        grid: Grid object (with dr attribute)
-        eos: Equation of state
-        recon: Reconstructor instance
-        rsolve: Riemann solver instance
-        cfl: CFL number
-        spacetime_mode: "fixed_minkowski" or "dynamic"
+        state_flat: Flattened state vector (NUM_BSSN_VARS + 3) * N
+        grid: Grid object
+        hydro: PerfectFluid object
+        background: Background geometry
+        bssn_fixed: Fixed BSSN variables (Minkowski)
+        bssn_d1_fixed: Fixed BSSN derivatives
 
     Returns:
-        dt, D_new, Sr_new, tau_new, rho0_new, v_new, p_new
+        rhs_flat: Flattened RHS vector
     """
-    N = len(r)
+    state_2d = state_flat.reshape((grid.NUM_VARS, grid.N))
+    grid.fill_boundaries(state_2d)
 
-    # Create PerfectFluid instance if needed
-    if not isinstance(valencia_or_hydro, PerfectFluid):
-        hydro = PerfectFluid(
-            eos=eos,
-            spacetime_mode=spacetime_mode,
-            atmosphere=AtmosphereParams(
-                rho_floor=1e-13,
-                p_floor=1e-15,
-                v_max=0.999999,
-                W_max=1e3
-            ),
-            reconstructor=recon,
-            riemann_solver=rsolve
-        )
-    else:
-        hydro = valencia_or_hydro
+    # Build BSSN vars (frozen Minkowski)
+    bssn_vars = BSSNVars(grid.N)
+    bssn_vars.set_bssn_vars(bssn_fixed)
+
+    # Set matter vars and compute hydro RHS
+    hydro.set_matter_vars(state_2d, bssn_vars, grid)
+    hydro_rhs = hydro.get_matter_rhs(grid.r, bssn_vars, bssn_d1_fixed, background)
+
+    # Full RHS (BSSN frozen = 0, only hydro evolves)
+    rhs_2d = np.zeros_like(state_2d)
+    rhs_2d[NUM_BSSN_VARS:, :] = hydro_rhs
+
+    return rhs_2d.flatten()
+
+
+def rk3_step(state_2d, grid, hydro, background, bssn_fixed, bssn_d1_fixed, cfl=0.3):
+    """
+    Single RK3 (Shu-Osher) timestep for fixed Minkowski spacetime.
+
+    Following TOVEvolution.py pattern but using RK3 instead of RK4.
+
+    Args:
+        state_2d: State array (NUM_VARS, N) with BSSN + hydro
+        grid: Grid object
+        hydro: PerfectFluid object
+        background: Background geometry
+        bssn_fixed: Fixed BSSN variables (Minkowski)
+        bssn_d1_fixed: Fixed BSSN derivatives
+        cfl: CFL number
+
+    Returns:
+        state_new: Updated state array (NUM_VARS, N)
+        dt: Timestep used
+    """
+    # Build BSSN vars for primitives computation
+    bssn_vars = BSSNVars(grid.N)
+    bssn_vars.set_bssn_vars(bssn_fixed)
+
+    # Get primitives for timestep calculation
+    hydro.set_matter_vars(state_2d, bssn_vars, grid)
+    primitives = hydro._get_primitives(bssn_vars, grid.r)
 
     # Compute timestep
-    amax = max_signal_speed(rho0, v, p, eos)
-    dt = cfl * grid.dr / amax
-
-    # Create full state vector
-    state_2d = np.zeros((NUM_BSSN_VARS + 3, N))
-
-    # Set flat Minkowski metric (frozen)
-    state_2d[idx_lapse, :] = 1.0
-    state_2d[idx_phi, :] = 0.0
-    state_2d[idx_hrr, :] = 0.0
-    state_2d[idx_htt, :] = 0.0
-    state_2d[idx_hpp, :] = 0.0
-    state_2d[idx_K, :] = 0.0
-    state_2d[idx_arr, :] = 0.0
-    state_2d[idx_att, :] = 0.0
-    state_2d[idx_app, :] = 0.0
-
-    # Set hydro variables
-    state_2d[hydro.idx_D, :] = D
-    state_2d[hydro.idx_Sr, :] = Sr
-    state_2d[hydro.idx_tau, :] = tau
-
-    # Create BSSN vars and background
-    bssn_vars = BSSNVars(N)
-    bssn_vars.set_bssn_vars(state_2d[:NUM_BSSN_VARS, :])
-    background = FlatSphericalBackground(r)
-    hydro.background = background
-
-    # Frozen BSSN for Minkowski
-    bssn_fixed = state_2d[:NUM_BSSN_VARS, :].copy()
-
-    # Create temporary grid for d1 computation
-    spacing_temp = LinearSpacing(N, r[-1])
-    state_vector_temp = StateVector(hydro)
-    grid_temp = Grid(spacing_temp, state_vector_temp)
-    bssn_d1_fixed = grid_temp.get_d1_metric_quantities(state_2d)
-
-    def compute_rhs(state_flat):
-        """Compute RHS for matter evolution."""
-        state = state_flat.reshape((NUM_BSSN_VARS + 3, N))
-
-        # Update matter vars
-        hydro.set_matter_vars(state, bssn_vars, grid_temp)
-
-        # Compute RHS (only matter evolves, BSSN frozen)
-        rhs_D, rhs_Sr, rhs_tau = hydro.get_matter_rhs(r, bssn_vars, bssn_d1_fixed, background)
-
-        # Build full RHS (BSSN = 0)
-        rhs = np.zeros_like(state)
-        rhs[hydro.idx_D, :] = rhs_D
-        rhs[hydro.idx_Sr, :] = rhs_Sr
-        rhs[hydro.idx_tau, :] = rhs_tau
-
-        return rhs.flatten()
+    amax = max_signal_speed(primitives, hydro.eos)
+    dt = cfl * grid.min_dr / amax
 
     state_flat = state_2d.flatten()
 
     # RK3 Stage 1
-    k1 = compute_rhs(state_flat)
+    k1 = get_rhs_minkowski(state_flat, grid, hydro, background, bssn_fixed, bssn_d1_fixed)
     state1 = state_flat + dt * k1
 
     # RK3 Stage 2
-    k2 = compute_rhs(state1)
+    k2 = get_rhs_minkowski(state1, grid, hydro, background, bssn_fixed, bssn_d1_fixed)
     state2 = 0.75 * state_flat + 0.25 * (state1 + dt * k2)
 
     # RK3 Stage 3
-    k3 = compute_rhs(state2)
-    state_new = (1.0/3.0) * state_flat + (2.0/3.0) * (state2 + dt * k3)
+    k3 = get_rhs_minkowski(state2, grid, hydro, background, bssn_fixed, bssn_d1_fixed)
+    state_new_flat = (1.0/3.0) * state_flat + (2.0/3.0) * (state2 + dt * k3)
 
-    # Reshape and extract
-    state_2d_new = state_new.reshape((NUM_BSSN_VARS + 3, N))
+    state_new = state_new_flat.reshape((grid.NUM_VARS, grid.N))
 
-    D_new = state_2d_new[hydro.idx_D, :]
-    Sr_new = state_2d_new[hydro.idx_Sr, :]
-    tau_new = state_2d_new[hydro.idx_tau, :]
-
-    # Convert to primitives
-    rho0_new, v_new, p_new = to_primitives(D_new, Sr_new, tau_new, eos, p_guess=p)
-    rho0_new, v_new, p_new = fill_ghosts_primitives(rho0_new, v_new, p_new)
-
-    return dt, D_new, Sr_new, tau_new, rho0_new, v_new, p_new
+    return state_new, dt
 
 
 # ============================================================================
@@ -279,32 +261,51 @@ def test_uniform_state():
     print("TEST 1: Estado uniforme (Minkowski, engrenage infrastructure)")
     print("="*60)
 
-    r, grid, Nin = build_grid(n_interior=100, r_min=1e-3, r_max=1.0)
-    N = len(r)
-    eos = IdealGasEOS(gamma=1.4)
-    recon = create_reconstruction("minmod")
-    rsolve = HLLRiemannSolver()
-    vr = np.zeros(N)
-    rho0 = np.ones(N) * 1.0
-    p = np.ones(N) * 0.1
-    rho0, vr, p = fill_ghosts_primitives(rho0, vr, p)
-    D, Sr, tau = to_conserved(rho0, vr, p, eos)
+    # Build infrastructure using engrenage architecture
+    grid, hydro, background = build_hydro_and_grid(
+        n_interior=100, r_max=1.0, gamma=1.4, reconstructor="minmod"
+    )
 
-    # Use None as placeholder (PerfectFluid will be created inside rk3_step)
-    val = None
+    # Initial primitives (uniform state)
+    rho0 = np.ones(grid.N) * 1.0
+    vr = np.zeros(grid.N)
+    p = np.ones(grid.N) * 0.1
+    rho0, vr, p = fill_ghosts_primitives(rho0, vr, p)
+
+    # Convert to conservatives
+    D, Sr, tau = primitives_to_conservatives(rho0, vr, p, grid, hydro)
+
+    # Create full state vector with Minkowski metric
+    state_2d = np.zeros((grid.NUM_VARS, grid.N))
+    state_2d[idx_lapse, :] = 1.0  # α = 1
+    state_2d[idx_phi, :] = 0.0    # φ = 0
+    state_2d[idx_K, :] = 0.0      # K = 0
+    state_2d[hydro.idx_D, :] = D
+    state_2d[hydro.idx_Sr, :] = Sr
+    state_2d[hydro.idx_tau, :] = tau
+
+    # Fixed BSSN metric and derivatives
+    bssn_fixed = state_2d[:NUM_BSSN_VARS, :].copy()
+    bssn_d1_fixed = grid.get_d1_metric_quantities(state_2d)
+
+    # Evolution loop
     t, Tfinal = 0.0, 0.1
     steps = 0
     while t < Tfinal and steps < 2000:
-        dt, D, Sr, tau, rho0, vr, p = rk3_step(val, D, Sr, tau, rho0, vr, p, r, grid, eos, recon, rsolve, cfl=0.5)
+        state_2d, dt = rk3_step(state_2d, grid, hydro, background, bssn_fixed, bssn_d1_fixed, cfl=0.5)
         t += dt
         steps += 1
 
-    # Variación relativa (interior)
+    # Check variation (interior)
     ng = NUM_GHOSTS
-    vD = np.max(np.abs(D[ng:-ng] - 1.0))
-    vSr = np.max(np.abs(Sr[ng:-ng] - 0.0))
-    vtau = np.max(np.abs(tau[ng:-ng] - (1.0*0.0 + 0.1*0.0)))  # ~0 en uniforme
-    print(f"max|ΔD|={vD:.3e}, max|Sr|={vSr:.3e}, max|τ|≈{vtau:.3e}")
+    D_final = state_2d[hydro.idx_D, ng:-ng]
+    Sr_final = state_2d[hydro.idx_Sr, ng:-ng]
+    tau_final = state_2d[hydro.idx_tau, ng:-ng]
+
+    vD = np.max(np.abs(D_final - 1.0))
+    vSr = np.max(np.abs(Sr_final - 0.0))
+    vtau = np.max(np.abs(tau_final - 0.15))  # tau ≈ p/(gamma-1) for uniform state
+    print(f"max|ΔD|={vD:.3e}, max|Sr|={vSr:.3e}, max|Δτ|={vtau:.3e}")
     ok = (vD < 5e-8) and (vSr < 5e-8)
     print("✓ PASA" if ok else "✗ FALLA")
     return ok
@@ -314,17 +315,38 @@ def test_cons2prim_roundtrip():
     print("\n" + "="*60)
     print("TEST 2: Conversión Conservadas ↔ Primitivas (roundtrip)")
     print("="*60)
-    N = 128 + 2*NUM_GHOSTS
-    eos = IdealGasEOS(gamma=1.4)
-    rho0 = np.random.uniform(0.3e4, 2.0e-2, N)
-    v = np.random.uniform(-0.8, 0.8, N)
-    p = np.random.uniform(0.05e4, 1.0e-1, N)
-    rho0, v, p = fill_ghosts_primitives(rho0, v, p)
-    D, Sr, tau = to_conserved(rho0, v, p, eos)
-    r2, v2, p2 = to_primitives(D, Sr, tau, eos)
-    e_rho = np.max(np.abs(r2 - rho0))
-    e_v = np.max(np.abs(v2 - v))
-    e_p = np.max(np.abs(p2 - p))
+
+    # Build infrastructure
+    grid, hydro, background = build_hydro_and_grid(
+        n_interior=128, r_max=1.0, gamma=1.4, reconstructor="minmod"
+    )
+
+    # Random primitives
+    rho0 = np.random.uniform(0.3e-4, 2.0e-2, grid.N)
+    vr = np.random.uniform(-0.8, 0.8, grid.N)
+    p = np.random.uniform(0.05e-4, 1.0e-1, grid.N)
+    rho0, vr, p = fill_ghosts_primitives(rho0, vr, p)
+
+    # Convert to conservatives
+    D, Sr, tau = primitives_to_conservatives(rho0, vr, p, grid, hydro)
+
+    # Create state vector
+    state_2d = np.zeros((grid.NUM_VARS, grid.N))
+    state_2d[idx_lapse, :] = 1.0
+    state_2d[idx_phi, :] = 0.0
+    state_2d[hydro.idx_D, :] = D
+    state_2d[hydro.idx_Sr, :] = Sr
+    state_2d[hydro.idx_tau, :] = tau
+
+    # Convert back to primitives
+    bssn_vars = BSSNVars(grid.N)
+    bssn_vars.set_bssn_vars(state_2d[:NUM_BSSN_VARS, :])
+    primitives = conservatives_to_primitives(state_2d, grid, hydro, bssn_vars)
+
+    # Check roundtrip error
+    e_rho = np.max(np.abs(primitives['rho0'] - rho0))
+    e_v = np.max(np.abs(primitives['vr'] - vr))
+    e_p = np.max(np.abs(primitives['p'] - p))
     print(f"max|Δrho|={e_rho:.2e}, max|Δv|={e_v:.2e}, max|Δp|={e_p:.2e}")
     ok = (e_rho < 1e-9) and (e_v < 1e-9) and (e_p < 1e-9)
     print("✓ PASA" if ok else "✗ FALLA")
@@ -336,18 +358,6 @@ def test_riemann_sod():
     print("\n" + "="*60)
     print("TEST 3: Sod radial - Comparación reconstructores (Minkowski, engrenage infrastructure)")
     print("="*60)
-
-    # Configuración base
-    r, grid, Nin = build_grid(n_interior=500, r_min=1e-3, r_max=1.0)
-    N = len(r)
-    eos = IdealGasEOS(gamma=5.0/3.0)
-    rsolve = HLLRiemannSolver()
-
-    # Discontinuidad en el punto medio del dominio interior
-    r_mid = 0.5*(r[NUM_GHOSTS] + r[-NUM_GHOSTS-1])
-    rho0_base = np.where(r < r_mid, 10.0, 1.0)
-    p_base = np.where(r < r_mid, 40000.0/3.0, 1.0e-6)
-    v_base = np.zeros(N)
 
     # Lista de métodos de reconstrucción a probar
     methods = ["mp5"]  # Can add: "wenoz", "mp5_hires"
@@ -363,77 +373,84 @@ def test_riemann_sod():
 
         # Para MP5 alta resolución, usar más puntos
         if method == "mp5_hires":
-            r_hires, grid_hires, Nin_hires = build_grid(n_interior=2000, r_min=1e-3, r_max=1.0)
-            N_hires = len(r_hires)
-
-            r_mid_hires = 0.5*(r_hires[NUM_GHOSTS] + r_hires[-NUM_GHOSTS-1])
-            rho0 = np.where(r_hires < r_mid_hires, 10.0, 1.0)
-            p = np.where(r_hires < r_mid_hires, 40000.0/3.0, 1.0e-6)
-            v = np.zeros(N_hires)
-
-            rho0, v, p = fill_ghosts_primitives(rho0, v, p)
-
-            r_current = r_hires
-            grid_current = grid_hires
-            actual_method = "mp5"
+            grid, hydro, background = build_hydro_and_grid(
+                n_interior=2000, r_max=1.0, gamma=1.4, reconstructor="mp5"
+            )
         else:
-            rho0 = rho0_base.copy()
-            p = p_base.copy()
-            v = v_base.copy()
+            grid, hydro, background = build_hydro_and_grid(
+                n_interior=500, r_max=1.0, gamma=1.4, reconstructor=method
+            )
 
-            rho0, v, p = fill_ghosts_primitives(rho0, v, p)
+        # Discontinuidad en el punto medio del dominio interior
+        r_mid = 0.5 * (grid.r[NUM_GHOSTS] + grid.r[-NUM_GHOSTS-1])
+        rho0 = np.where(grid.r < r_mid, 10.0, 1.0)
+        p = np.where(grid.r < r_mid, 40000.0/3.0, 1.0e-6)
+        vr = np.zeros(grid.N)
 
-            r_current = r
-            grid_current = grid
-            actual_method = method
+        rho0, vr, p = fill_ghosts_primitives(rho0, vr, p)
 
         # Conservadas iniciales
-        D, Sr, tau = to_conserved(rho0, v, p, eos)
+        D, Sr, tau = primitives_to_conservatives(rho0, vr, p, grid, hydro)
 
-        # Crear reconstructor específico
-        recon = create_reconstruction(actual_method)
-        val = None
+        # Create full state vector with Minkowski metric
+        state_2d = np.zeros((grid.NUM_VARS, grid.N))
+        state_2d[idx_lapse, :] = 1.0
+        state_2d[idx_phi, :] = 0.0
+        state_2d[idx_K, :] = 0.0
+        state_2d[hydro.idx_D, :] = D
+        state_2d[hydro.idx_Sr, :] = Sr
+        state_2d[hydro.idx_tau, :] = tau
+
+        # Fixed BSSN metric and derivatives
+        bssn_fixed = state_2d[:NUM_BSSN_VARS, :].copy()
+        bssn_d1_fixed = grid.get_d1_metric_quantities(state_2d)
 
         # Evolución temporal
         t, Tfinal = 0.0, 0.35
         steps = 0
         while t < Tfinal and steps < 5000:
-            dt, D, Sr, tau, rho0, v, p = rk3_step(
-                val, D, Sr, tau, rho0, v, p, r_current, grid_current, eos, recon, rsolve, cfl=0.3
-            )
+            state_2d, dt = rk3_step(state_2d, grid, hydro, background, bssn_fixed, bssn_d1_fixed, cfl=0.3)
             t += dt
             steps += 1
 
+        # Extract primitives from final state
+        bssn_vars = BSSNVars(grid.N)
+        bssn_vars.set_bssn_vars(bssn_fixed)
+        primitives = conservatives_to_primitives(state_2d, grid, hydro, bssn_vars)
+
         # Guardar resultados
         ng = NUM_GHOSTS
-        rin = r_current[ng:-ng]
+        rin = grid.r[ng:-ng]
         results[method] = {
             'r': rin.copy(),
-            'rho': rho0[ng:-ng].copy(),
-            'p': p[ng:-ng].copy(),
-            'v': v[ng:-ng].copy(),
+            'rho': primitives['rho0'][ng:-ng].copy(),
+            'p': primitives['p'][ng:-ng].copy(),
+            'v': primitives['vr'][ng:-ng].copy(),
             't': t,
             'steps': steps
         }
 
         # Métricas de calidad
-        rho_in = rho0[ng:-ng]
+        rho_in = primitives['rho0'][ng:-ng]
         grad = np.gradient(rho_in, rin)
         variation = np.std(rho_in)/np.mean(rho_in)
         contact = np.any(np.abs(grad) > 0.5)
         print(f"  {method}: t≈{t:.3f}, pasos={steps}, variación ρ={variation:.3f}, contacto={contact}")
 
     # PLOTEO (same as original)
-    rho0_init = np.where(r < r_mid, 10.0, 1.0)
-    p_init = np.where(r < r_mid, 40000.0/3.0, 1.0e-6)
-    v_init = np.zeros(N)
+    # Use grid from last method for initial conditions plot
+    r_ref = grid.r
+    r_mid_ref = 0.5 * (r_ref[NUM_GHOSTS] + r_ref[-NUM_GHOSTS-1])
+    rho0_init = np.where(r_ref < r_mid_ref, 10.0, 1.0)
+    p_init = np.where(r_ref < r_mid_ref, 40000.0/3.0, 1.0e-6)
+    v_init = np.zeros(grid.N)
     rho0_init, v_init, p_init = fill_ghosts_primitives(rho0_init, v_init, p_init)
 
     ng = NUM_GHOSTS
     rho0_init_in = rho0_init[ng:-ng]
     p_init_in = p_init[ng:-ng]
     v_init_in = v_init[ng:-ng]
-    rin_ref = r[ng:-ng]
+    rin_ref = r_ref[ng:-ng]
 
     avg_time = np.mean([results[m]['t'] for m in methods])
 
@@ -594,15 +611,7 @@ def test_blast_wave_compare(case='weak'):
     print(f"TEST Blast radial - Comparación reconstructores ({case}, Minkowski, engrenage infrastructure)")
     print("="*60)
 
-    # Configuración base
-    r, grid, Nin = build_grid(n_interior=100, r_min=1e-3, r_max=1.0)
-    N = len(r)
-    eos = IdealGasEOS(gamma=1.4)
-    rsolve = HLLRiemannSolver()
-
-    # Parámetros del blast
-    ng = NUM_GHOSTS
-    r_mid = 0.5*(r[ng] + r[-ng-1])
+    # Blast parameters
     if case.lower() == 'weak':
         p_in, p_out = 1.0, 0.1
         rho_in, rho_out = 1.0, 0.125
@@ -611,10 +620,6 @@ def test_blast_wave_compare(case='weak'):
         rho_in, rho_out = 10.0, 1.0
     else:
         raise ValueError("case debe ser 'weak' o 'strong'")
-
-    rho0_base = np.where(r < r_mid, rho_in, rho_out).astype(float)
-    p_base = np.where(r < r_mid, p_in, p_out).astype(float)
-    v_base = np.zeros(N, dtype=float)
 
     # Métodos a comparar
     methods = ["minmod", "mp5"]
@@ -628,50 +633,63 @@ def test_blast_wave_compare(case='weak'):
     for i, method in enumerate(methods):
         print(f"\nEjecutando {labels[i]}...")
 
-        # Opción de alta resolución (desactivada por defecto)
+        # Build infrastructure
         if method == "mp5_hires":
-            r_hires, grid_hires, Nin_hires = build_grid(n_interior=200, r_min=1e-3, r_max=1.0)
-            r_current = r_hires
-            grid_current = grid_hires
-            rho0 = np.where(r_hires < r_mid, rho_in, rho_out).astype(float)
-            p = np.where(r_hires < r_mid, p_in, p_out).astype(float)
-            v = np.zeros_like(r_hires)
-            actual_method = "mp5"
+            grid, hydro, background = build_hydro_and_grid(
+                n_interior=200, r_max=1.0, gamma=1.4, reconstructor="mp5"
+            )
         else:
-            r_current = r
-            grid_current = grid
-            rho0 = rho0_base.copy()
-            p = p_base.copy()
-            v = v_base.copy()
-            actual_method = method
+            grid, hydro, background = build_hydro_and_grid(
+                n_interior=100, r_max=1.0, gamma=1.4, reconstructor=method
+            )
+
+        # Parámetros del blast
+        ng = NUM_GHOSTS
+        r_mid = 0.5 * (grid.r[ng] + grid.r[-ng-1])
+        rho0 = np.where(grid.r < r_mid, rho_in, rho_out).astype(float)
+        p = np.where(grid.r < r_mid, p_in, p_out).astype(float)
+        vr = np.zeros(grid.N, dtype=float)
 
         # Ghosts
-        rho0, v, p = fill_ghosts_primitives(rho0, v, p)
+        rho0, vr, p = fill_ghosts_primitives(rho0, vr, p)
 
         # Conservadas iniciales
-        D, Sr, tau = to_conserved(rho0, v, p, eos)
+        D, Sr, tau = primitives_to_conservatives(rho0, vr, p, grid, hydro)
 
-        # Recon y evolución
-        recon = create_reconstruction(actual_method)
-        val = None
+        # Create full state vector with Minkowski metric
+        state_2d = np.zeros((grid.NUM_VARS, grid.N))
+        state_2d[idx_lapse, :] = 1.0
+        state_2d[idx_phi, :] = 0.0
+        state_2d[idx_K, :] = 0.0
+        state_2d[hydro.idx_D, :] = D
+        state_2d[hydro.idx_Sr, :] = Sr
+        state_2d[hydro.idx_tau, :] = tau
 
+        # Fixed BSSN metric and derivatives
+        bssn_fixed = state_2d[:NUM_BSSN_VARS, :].copy()
+        bssn_d1_fixed = grid.get_d1_metric_quantities(state_2d)
+
+        # Evolution
         t, Tfinal = 0.0, 0.4
         steps = 0
         while t < Tfinal and steps < 10000:
-            dt, D, Sr, tau, rho0, v, p = rk3_step(
-                val, D, Sr, tau, rho0, v, p, r_current, grid_current, eos, recon, rsolve, cfl=0.3
-            )
+            state_2d, dt = rk3_step(state_2d, grid, hydro, background, bssn_fixed, bssn_d1_fixed, cfl=0.3)
             t += dt
             steps += 1
 
+        # Extract primitives from final state
+        bssn_vars = BSSNVars(grid.N)
+        bssn_vars.set_bssn_vars(bssn_fixed)
+        primitives = conservatives_to_primitives(state_2d, grid, hydro, bssn_vars)
+
         # Guardar
-        rin = r_current[ng:-ng]
+        rin = grid.r[ng:-ng]
         results[method] = {
             'r': rin.copy(),
-            'rho': rho0[ng:-ng].copy(),
-            'p': p[ng:-ng].copy(),
-            'v': v[ng:-ng].copy(),
-            'E': (tau[ng:-ng] + D[ng:-ng]).copy(),
+            'rho': primitives['rho0'][ng:-ng].copy(),
+            'p': primitives['p'][ng:-ng].copy(),
+            'v': primitives['vr'][ng:-ng].copy(),
+            'E': (state_2d[hydro.idx_tau, ng:-ng] + state_2d[hydro.idx_D, ng:-ng]).copy(),
             't': t,
             'steps': steps,
         }
@@ -749,27 +767,47 @@ def test_conservation_short():
     print("\n" + "="*60)
     print("TEST 4: Conservación global (masa/energía)")
     print("="*60)
-    r, grid, Nin = build_grid(n_interior=100, r_min=1e-3, r_max=1.0)
-    N = len(r)
-    eos = IdealGasEOS(gamma=4.0/3.0)
-    recon = create_reconstruction("minmod")
-    rsolve = HLLRiemannSolver()
 
-    rho0 = 1.0 + 0.5*np.exp(-((r-0.6)**2)/0.01)
-    p = 0.1*rho0
-    v = 0.02*np.sin(4*np.pi*(r - r[NUM_GHOSTS]))
-    rho0, v, p = fill_ghosts_primitives(rho0, v, p)
-    D, Sr, tau = to_conserved(rho0, v, p, eos)
+    # Build infrastructure
+    grid, hydro, background = build_hydro_and_grid(
+        n_interior=100, r_max=1.0, gamma=4.0/3.0, reconstructor="minmod"
+    )
 
-    val = None
-    m0, e0 = volume_integrals(D, tau, r, grid)
+    # Initial primitives (smooth perturbation)
+    rho0 = 1.0 + 0.5 * np.exp(-((grid.r - 0.6)**2) / 0.01)
+    p = 0.1 * rho0
+    vr = 0.02 * np.sin(4 * np.pi * (grid.r - grid.r[NUM_GHOSTS]))
+    rho0, vr, p = fill_ghosts_primitives(rho0, vr, p)
+
+    # Convert to conservatives
+    D, Sr, tau = primitives_to_conservatives(rho0, vr, p, grid, hydro)
+
+    # Create full state vector with Minkowski metric
+    state_2d = np.zeros((grid.NUM_VARS, grid.N))
+    state_2d[idx_lapse, :] = 1.0
+    state_2d[idx_phi, :] = 0.0
+    state_2d[idx_K, :] = 0.0
+    state_2d[hydro.idx_D, :] = D
+    state_2d[hydro.idx_Sr, :] = Sr
+    state_2d[hydro.idx_tau, :] = tau
+
+    # Fixed BSSN metric and derivatives
+    bssn_fixed = state_2d[:NUM_BSSN_VARS, :].copy()
+    bssn_d1_fixed = grid.get_d1_metric_quantities(state_2d)
+
+    # Initial mass and energy
+    m0, e0 = volume_integrals(state_2d, grid, hydro)
+
+    # Evolution loop
     steps = 0
     while steps < 200:
-        dt, D, Sr, tau, rho0, v, p = rk3_step(val, D, Sr, tau, rho0, v, p, r, grid, eos, recon, rsolve, cfl=0.25)
+        state_2d, dt = rk3_step(state_2d, grid, hydro, background, bssn_fixed, bssn_d1_fixed, cfl=0.25)
         steps += 1
-    m1, e1 = volume_integrals(D, tau, r, grid)
-    dm = abs(m1-m0)/max(m0, 1e-15)
-    de = abs(e1-e0)/max(e0, 1e-15)
+
+    # Final mass and energy
+    m1, e1 = volume_integrals(state_2d, grid, hydro)
+    dm = abs(m1 - m0) / max(m0, 1e-15)
+    de = abs(e1 - e0) / max(e0, 1e-15)
     print(f"ΔM/M={dm:.3e}, ΔE/E={de:.3e}")
     ok = (dm < 5e-3) and (de < 5e-3)
     print("✓ PASA" if ok else "✗ FALLA")

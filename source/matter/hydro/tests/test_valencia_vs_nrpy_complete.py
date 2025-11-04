@@ -19,6 +19,8 @@ np.random.seed(42)
 
 from source.matter.hydro.tests.grhd_equations_numpy import GRHD_Equations_NumPy
 from source.matter.hydro.valencia_reference_metric import ValenciaReferenceMetric
+from source.matter.hydro.grhd_equations import GRHDEquations
+from source.matter.hydro.stress_energy import StressEnergyTensor, StressEnergyTensor4D
 from source.bssn.bssnvars import BSSNVars
 from source.bssn.tensoralgebra import get_bar_gamma_LL, get_bar_A_LL, SPACEDIM
 from source.backgrounds.sphericalbackground import FlatSphericalBackground, i_r, i_t, i_p
@@ -136,9 +138,12 @@ print_subsection("Initializing Valencia")
 valencia = ValenciaReferenceMetric()
 valencia._extract_geometry(r, bssn_vars, "dynamic", background, None)
 
-# Compute source terms to populate debug variables
-src_S_val, src_tau_val = valencia._compute_source_terms(
-    rho0, v_U, pressure, W, h, bssn_vars, bssn_d1, background, "dynamic", r
+adm_geom = valencia.adm_geometry
+val_geom = valencia.valencia_geometry
+
+grhd_val = GRHDEquations(eos, atmosphere=valencia.atmosphere, boundary_mode=valencia.boundary_mode)
+src_S_val, src_tau_val, debug_val = grhd_val.compute_source_terms(
+    rho0, v_U, pressure, W, h, val_geom, bssn_vars, bssn_d1, background, "dynamic", r, return_debug=True
 )
 
 print(f"  Valencia initialized successfully")
@@ -175,7 +180,7 @@ grhd.u4U_0 = W
 grhd.VU = v_U
 
 # Compute 4-velocity
-u4U_val = valencia._compute_4velocity(rho0, v_U, W)
+u4U_val = adm_geom.compute_4velocity(v_U, W)
 # u4U should be (N, 4) array with [u^0, u^1, u^2, u^3]
 grhd.u4U = u4U_val
 
@@ -187,22 +192,25 @@ print(f"  NRPy initialized successfully")
 print_section("PART 1: STRESS-ENERGY TENSORS")
 
 # Compute T^μν
+stress_val = StressEnergyTensor(adm_geom, rho0, v_U, pressure, W, h)
+T00_val, T0i_val, Tij_val = stress_val.compute_T4UU()
+T4UU_val = StressEnergyTensor4D.from_components(T00_val, T0i_val, Tij_val)
 grhd.compute_T4UU()
-T4UU_val = valencia._debug_T4UU
 
 print_subsection("1.1 Contravariant stress-energy tensor T^μν")
-compare_scalar("T^00", T4UU_val['00'], grhd.T4UU['00'])
-compare_vector("T^0i", T4UU_val['0i'], grhd.T4UU['0i'])
-compare_tensor("T^ij", T4UU_val['ij'], grhd.T4UU['ij'])
+compare_scalar("T^00", T4UU_val.T00, grhd.T4UU.T00)
+compare_vector("T^0i", T4UU_val.T0i, grhd.T4UU.T0i)
+compare_tensor("T^ij", T4UU_val.Tij, grhd.T4UU.Tij)
 
 # Compute T^μ_ν
+T0_0_val, T0_j_val, Ti_j_val = stress_val.compute_T4UD()
+T4UD_val = StressEnergyTensor4D.from_components(T0_0_val, T0_j_val, Ti_j_val)
 grhd.compute_T4UD()
-T4UD_val = valencia._debug_T4UD
 
 print_subsection("1.2 Mixed stress-energy tensor T^μ_ν")
-compare_scalar("T^0_0", T4UD_val['0_0'], grhd.T4UD['0_0'])
-compare_vector("T^0_j", T4UD_val['0_j'], grhd.T4UD['0_j'])
-compare_tensor("T^i_j", T4UD_val['i_j'], grhd.T4UD['i_j'])
+compare_scalar("T^0_0", T4UD_val.T00, grhd.T4UD.T00)
+compare_vector("T^0_j", T4UD_val.T0i, grhd.T4UD.T0i)
+compare_tensor("T^i_j", T4UD_val.Tij, grhd.T4UD.Tij)
 
 # ============================================================================
 # PART 2: PHYSICAL FLUXES
@@ -280,9 +288,9 @@ grhd.alpha_dD = bssn_d1.lapse
 grhd.compute_tau_source_term()
 
 print_subsection("4.1 Energy source term")
-compare_scalar("S_τ: K_ij contraction term", valencia._debug_energy_source_Kij_term, grhd._tau_source_Kij_term, tolerance=1e-10)
-compare_scalar("S_τ: ∂α term", valencia._debug_energy_source_dalpha_term, grhd._tau_source_dalpha_term, tolerance=1e-10)
-compare_scalar("S_τ: Total (α e^6φ × sum)", valencia._debug_energy_source_total, grhd.tau_source_term, tolerance=1e-10)
+compare_scalar("S_τ: K_ij contraction term", debug_val["energy_Kij"], grhd._tau_source_Kij_term, tolerance=1e-10)
+compare_scalar("S_τ: ∂α term", debug_val["energy_dalpha"], grhd._tau_source_dalpha_term, tolerance=1e-10)
+compare_scalar("S_τ: Total (α e^6φ × sum)", debug_val["energy_total"], grhd.tau_source_term, tolerance=1e-10)
 
 # Momentum source
 print_subsection("4.2 Momentum source term")
@@ -325,7 +333,7 @@ print(f"    ∂_r β^θ diff: {np.max(np.abs(val_d1_Shift_test[:, i_t, i_r] - be
 print(f"    ∂_r β^φ diff: {np.max(np.abs(val_d1_Shift_test[:, i_p, i_r] - betaU_dD_val[:, i_p, i_r])):.6e}")
 
 # Compute Valencia's ∇̂_i β^j for comparison
-val_hatD_beta_test = valencia._debug_hatD_beta_U
+val_hatD_beta_test = debug_val["hatD_beta"]
 
 # NRPy computes it implicitly in the loop, let's reconstruct it
 # Careful: NRPy uses GammahatUDD which we set to background.hat_christoffel
@@ -342,22 +350,22 @@ print(f"    ∇̂_r β^φ diff: {np.max(np.abs(val_hatD_beta_test[:, i_r, i_p] -
 print(f"    Overall ∇̂_i β^j diff: {np.max(np.abs(val_hatD_beta_test - nrpy_hatD_beta_test)):.6e}")
 
 compare_vector("S_{S_i}: -T^00 α ∂_i α term",
-               valencia._debug_momentum_source_T00_alpha_term,
+               debug_val["momentum_T00_alpha"],
                grhd._momentum_source_T00_alpha_term,
                tolerance=1e-10)
 
 compare_vector("S_{S_i}: T^0_j ∇̂_i β^j term",
-               valencia._debug_momentum_source_T0j_beta_term,
+               debug_val["momentum_T0j_beta"],
                grhd._momentum_source_T0j_beta_term,
                tolerance=1e-10)
 
 compare_vector("S_{S_i}: Metric derivative term",
-               valencia._debug_momentum_source_metric_term,
+               debug_val["momentum_metric"],
                grhd._momentum_source_metric_term,
                tolerance=1e-10)
 
 compare_vector("S_{S_i}: Total (α e^6φ × sum)",
-               valencia._debug_momentum_source_total,
+               debug_val["momentum_total"],
                grhd.S_tilde_source_termD,
                tolerance=1e-10)
 

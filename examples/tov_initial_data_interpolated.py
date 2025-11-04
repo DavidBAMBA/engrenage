@@ -396,26 +396,38 @@ def create_initial_data_interpolated(tov_solution, grid, background, eos,
     N = grid.N
 
     # Interpolate hydro quantities with surface protection
-    rho_arr = np.zeros(N)
+    # AthenaK-style EOS consistency: interpolate P, then compute rho=(P/K)^(1/Gamma)
     P_arr = np.zeros(N)
+    rho_arr = np.zeros(N)
 
     for i in range(N):
         r_abs = abs(grid.r[i])
         is_interior = r_abs < R_star
 
         if is_interior:
-            rho_arr[i] = interpolate_tov_avoiding_surface(
-                r_abs, tov_solution, 'rho_baryon', interp_order, atmosphere_rho)
-            P_arr[i] = interpolate_tov_avoiding_surface(
+            # Interpolate pressure from TOV fine solution (stencil not crossing R)
+            P_loc = interpolate_tov_avoiding_surface(
                 r_abs, tov_solution, 'P', interp_order, p_atm)
+            P_loc = max(P_loc, p_atm)
 
-            # Enforce floors
-            rho_arr[i] = max(rho_arr[i], atmosphere_rho)
-            P_arr[i] = max(P_arr[i], p_atm)
+            # Compute rho from EOS to enforce P = K rho^Gamma pointwise
+            if polytrope_K is not None and polytrope_Gamma is not None:
+                rho_loc = (P_loc / max(polytrope_K, 1e-300)) ** (1.0 / polytrope_Gamma)
+            else:
+                # Fallback: if no polytrope params provided, keep previous interpolation of rho
+                rho_loc = interpolate_tov_avoiding_surface(
+                    r_abs, tov_solution, 'rho_baryon', interp_order, atmosphere_rho)
+
+            rho_loc = max(rho_loc, atmosphere_rho)
+
+            P_arr[i] = P_loc
+            rho_arr[i] = rho_loc
         else:
             # Exterior: EXACT atmosphere values (no interpolation)
-            rho_arr[i] = atmosphere_rho
             P_arr[i] = p_atm
+            rho_arr[i] = atmosphere_rho
+
+
 
     # Convert primitives → conservatives following NRPy approach
     # For TOV star with v=0: T^00 = ρ_total = ρ₀(1 + ε)
@@ -429,7 +441,7 @@ def create_initial_data_interpolated(tov_solution, grid, background, eos,
         # Use EOS to compute epsilon from pressure and density
         eps_arr = np.zeros(N)
         for i in range(N):
-            eps_arr[i] = eos.epsilon_from_P_rho(P_arr[i], rho_arr[i])
+            eps_arr[i] = eos.eps_from_rho_p(rho_arr[i], P_arr[i])
 
     # For static TOV (v=0), the conservative variables simplify:
     # D = ρ₀ (conserved baryon density)
@@ -453,6 +465,17 @@ def create_initial_data_interpolated(tov_solution, grid, background, eos,
         bssn_state[NUM_BSSN_VARS + 1, exterior_mask] = 0.0
         bssn_state[NUM_BSSN_VARS + 2, exterior_mask] = atmosphere.tau_atm
         print(f"  Set {n_exterior} exterior points (r > {R_star:.6f}) to atmosphere")
+
+    # Optional: quick EOS consistency report inside star
+    try:
+        if polytrope_K is not None and polytrope_Gamma is not None:
+            interior_mask = (np.abs(grid.r) < R_star) & (rho_arr > 50.0 * atmosphere_rho)
+            if np.any(interior_mask):
+                P_eos = polytrope_K * np.power(np.maximum(rho_arr, 1e-300), polytrope_Gamma)
+                rel = np.abs(P_arr - P_eos) / np.maximum(P_arr, 1e-30)
+                print(f"  EOS consistency (interior): max |P-Kρ^Γ|/P = {np.max(rel[interior_mask]):.3e}")
+    except Exception:
+        pass
 
     # Fill ghost zones
     grid.fill_boundaries(bssn_state)

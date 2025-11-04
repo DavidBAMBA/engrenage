@@ -18,6 +18,7 @@ Author: Terrence Pierre Jacques
 
 import numpy as np
 from typing import Dict
+from source.matter.hydro.valencia_reference_metric import StressEnergyTensor4D
 
 SPACEDIM = 3
 
@@ -113,21 +114,19 @@ class GRHD_Equations_NumPy:
 
         # compute T^{mu nu}
         # GRHD_equations.py line 156-161
-        self.T4UU = {}
+        self.T4UU = StressEnergyTensor4D(self.N)
 
         # T^{00}
-        self.T4UU['00'] = (rho_b * h) * u4U[:, 0] * u4U[:, 0] + P * g4UU_00
+        self.T4UU.T00[:] = (rho_b * h) * u4U[:, 0] * u4U[:, 0] + P * g4UU_00
 
         # T^{0i}
-        self.T4UU['0i'] = np.zeros((self.N, 3))
         for i in range(3):
-            self.T4UU['0i'][:, i] = (rho_b * h) * u4U[:, 0] * u4U[:, i + 1] + P * g4UU_0i[:, i]
+            self.T4UU.T0i[:, i] = (rho_b * h) * u4U[:, 0] * u4U[:, i + 1] + P * g4UU_0i[:, i]
 
         # T^{ij}
-        self.T4UU['ij'] = np.zeros((self.N, 3, 3))
         for i in range(3):
             for j in range(3):
-                self.T4UU['ij'][:, i, j] = (rho_b * h) * u4U[:, i + 1] * u4U[:, j + 1] + P * g4UU_spatial[:, i, j]
+                self.T4UU.Tij[:, i, j] = (rho_b * h) * u4U[:, i + 1] * u4U[:, j + 1] + P * g4UU_spatial[:, i, j]
 
     def compute_T4UD(self) -> None:
         """
@@ -163,27 +162,25 @@ class GRHD_Equations_NumPy:
         g4DD_spatial = gammaDD
 
         # GRHD_equations.py line 192-198
-        self.T4UD = {}
+        self.T4UD = StressEnergyTensor4D(self.N)
 
         # T^0_0 = T^{00} g_{00} + T^{0i} g_{i0}
-        self.T4UD['0_0'] = self.T4UU['00'] * g4DD_00
+        self.T4UD.T00[:] = self.T4UU.T00 * g4DD_00
         for i in range(3):
-            self.T4UD['0_0'] += self.T4UU['0i'][:, i] * g4DD_0i[:, i]
+            self.T4UD.T00 += self.T4UU.T0i[:, i] * g4DD_0i[:, i]
 
         # T^0_j = T^{00} g_{0j} + T^{0i} g_{ij}
-        self.T4UD['0_j'] = np.zeros((self.N, 3))
         for j in range(3):
-            self.T4UD['0_j'][:, j] = self.T4UU['00'] * g4DD_0i[:, j]
+            self.T4UD.T0i[:, j] = self.T4UU.T00 * g4DD_0i[:, j]
             for i in range(3):
-                self.T4UD['0_j'][:, j] += self.T4UU['0i'][:, i] * g4DD_spatial[:, i, j]
+                self.T4UD.T0i[:, j] += self.T4UU.T0i[:, i] * g4DD_spatial[:, i, j]
 
         # T^i_j = T^{i0} g_{0j} + T^{ik} g_{kj}
-        self.T4UD['i_j'] = np.zeros((self.N, 3, 3))
         for i in range(3):
             for j in range(3):
-                self.T4UD['i_j'][:, i, j] = self.T4UU['0i'][:, i] * g4DD_0i[:, j]
+                self.T4UD.Tij[:, i, j] = self.T4UU.T0i[:, i] * g4DD_0i[:, j]
                 for k in range(3):
-                    self.T4UD['i_j'][:, i, j] += self.T4UU['ij'][:, i, k] * g4DD_spatial[:, k, j]
+                    self.T4UD.Tij[:, i, j] += self.T4UU.Tij[:, i, k] * g4DD_spatial[:, k, j]
 
     def compute_rho_star(self) -> None:
         """
@@ -214,7 +211,7 @@ class GRHD_Equations_NumPy:
         rho_star = self.rho_star
 
         # GRHD_equations.py line 243
-        self.tau_tilde = alpha**2 * e6phi * T4UU['00'] - rho_star
+        self.tau_tilde = alpha**2 * e6phi * T4UU.T00 - rho_star
 
     def compute_S_tildeD(self) -> None:
         """
@@ -230,7 +227,7 @@ class GRHD_Equations_NumPy:
         # GRHD_equations.py line 249-250
         self.S_tildeD = np.zeros((self.N, 3))
         for i in range(3):
-            self.S_tildeD[:, i] = alpha * e6phi * T4UD['0_j'][:, i]
+            self.S_tildeD[:, i] = alpha * e6phi * T4UD.T0i[:, i]
 
     def compute_rho_star_fluxU(self) -> None:
         """
@@ -264,7 +261,7 @@ class GRHD_Equations_NumPy:
         self.tau_tilde_fluxU = np.zeros((self.N, 3))
         for j in range(3):
             self.tau_tilde_fluxU[:, j] = (
-                alpha**2 * e6phi * T4UU['0i'][:, j] - rho_star * VU[:, j]
+                alpha**2 * e6phi * T4UU.T0i[:, j] - rho_star * VU[:, j]
             )
 
     def compute_S_tilde_fluxUD(self) -> None:
@@ -282,7 +279,7 @@ class GRHD_Equations_NumPy:
         self.S_tilde_fluxUD = np.zeros((self.N, 3, 3))
         for j in range(3):
             for i in range(3):
-                self.S_tilde_fluxUD[:, j, i] = alpha * e6phi * T4UD['i_j'][:, j, i]
+                self.S_tilde_fluxUD[:, j, i] = alpha * e6phi * T4UD.Tij[:, j, i]
 
     def compute_tau_source_term(self) -> None:
         """
@@ -308,16 +305,16 @@ class GRHD_Equations_NumPy:
         for i in range(3):
             for j in range(3):
                 term1 += (
-                    T4UU['00'] * betaU[:, i] * betaU[:, j]
-                    + 2 * T4UU['0i'][:, i] * betaU[:, j]
-                    + T4UU['ij'][:, i, j]
+                    T4UU.T00 * betaU[:, i] * betaU[:, j]
+                    + 2 * T4UU.T0i[:, i] * betaU[:, j]
+                    + T4UU.Tij[:, i, j]
                 ) * KDD[:, i, j]
 
         # Term 2:
         # GRHD_equations.py line 324-327
         for i in range(3):
             term2 += (
-                -(T4UU['00'] * betaU[:, i] + T4UU['0i'][:, i]) * alpha_dD[:, i]
+                -(T4UU.T00 * betaU[:, i] + T4UU.T0i[:, i]) * alpha_dD[:, i]
             )
 
         # --- TEMPORARY DEBUG: Store sub-terms before scaling ---
@@ -418,23 +415,23 @@ class GRHD_Equations_NumPy:
         # GRHD_equations.py line 392-406
         for i in range(3):
             # First term
-            first_termD[:, i] -= T4UU['00'] * alpha * alpha_dD[:, i]
+            first_termD[:, i] -= T4UU.T00 * alpha * alpha_dD[:, i]
 
             for j in range(3):
                 # Second term
-                second_termD[:, i] += T4UD['0_j'][:, j] * betaU_dD[:, j, i]
+                second_termD[:, i] += T4UD.T0i[:, j] * betaU_dD[:, j, i]
 
                 for k in range(3):
                     second_termD[:, i] += (
-                        T4UD['0_j'][:, j] * self.GammahatUDD[:, j, i, k] * betaU[:, k]
+                        T4UD.T0i[:, j] * self.GammahatUDD[:, j, i, k] * betaU[:, k]
                     )
 
                     # Third term
                     third_termD[:, i] += (
                         0.5 * covhatdD_gammaDD[:, i, j, k] * (
-                            T4UU['00'] * betaU[:, j] * betaU[:, k]
-                            + 2.0 * T4UU['0i'][:, j] * betaU[:, k]
-                            + T4UU['ij'][:, j, k]
+                            T4UU.T00 * betaU[:, j] * betaU[:, k]
+                            + 2.0 * T4UU.T0i[:, j] * betaU[:, k]
+                            + T4UU.Tij[:, j, k]
                         )
                     )
 

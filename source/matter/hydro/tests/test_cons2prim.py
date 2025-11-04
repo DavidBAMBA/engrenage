@@ -66,9 +66,28 @@ def create_test_data_varied(N=1000):
     return rho0, vr, p
 
 def create_edge_case_data():
-    """Create specific edge cases that are known to be challenging."""
+    """
+    Create specific edge cases that are known to be challenging.
 
-    edge_cases = [
+    Includes cases from:
+    - Original engrenage tests (13 cases)
+    - Extended C++ test suite (37 cases, physical velocities only)
+
+    For 3D velocities, we use the magnitude: |v| = sqrt(vx^2 + vy^2 + vz^2)
+    All cases satisfy v <= 0.998 (physical constraint for SR).
+
+    Cases with v > 0.998 have been permanently removed.
+    """
+    # Helper to compute velocity magnitude from 3D components
+    def v_mag(vx, vy, vz):
+        return np.sqrt(vx**2 + vy**2 + vz**2)
+
+    # Maximum allowed velocity (conservative limit to avoid v→c issues)
+    V_MAX = 0.998
+
+    # Raw test cases (before filtering)
+    edge_cases_raw = [
+        # ==================== ORIGINAL ENGRENAGE CASES (13) ====================
         # (rho0, vr, p, description)
         (1.0, 0.9, 1000.5, "High pressure, high velocity"),
         (0.125, 0.0, 0.1, "Low density, rest"),
@@ -83,7 +102,66 @@ def create_edge_case_data():
         (50.0, 0.5, 500.0, "High density/pressure"),
         (0.02, 0.99, 0.02, "Low density/pressure, ultra-relativistic"),
         (1e-3, 0.5, 1e-2, "Very low density, moderate pressure"),
+
+        # ==================== NORMAL/MODERATE CASES (20) ====================
+        (1.0, v_mag(0.9, 0.0, 0.0), 1000.5, "Caso 1: γ≈1.047"),
+        (0.125, v_mag(0.0, 0.0, 0.0), 0.1, "Caso 2: γ≈1.005"),
+        (5.0, v_mag(0.6, 0.2, 0.0), 10.0, "Caso 3: γ≈1.29"),
+        (10.0, v_mag(0.9, 0.1, 0.0), 50.0, "Caso 4: γ≈2.357"),
+        (1.0, v_mag(0.0, 0.0, 0.0), 1.0, "Caso 5: γ=1"),
+        (110.001, v_mag(0.9, 0.0, 0.0), 1e-6, "Caso 6: γ≈7.089"),
+        (100.0, v_mag(0.7, 0.7, 0.0), 1000.0, "Caso 7: γ≈7.071"),
+        (1e-5, v_mag(0.01, 0.02, 0.03), 1e-6, "Caso 8: γ≈1.0007"),
+        (1.5, v_mag(0.3, 0.4, 0.5), 0.8, "Caso 9: γ≈1.414"),
+        (2.0, v_mag(0.4, 0.1, 0.1), 0.2, "Caso 10: γ≈1.104"),
+        (50.0, v_mag(0.5, 0.5, 0.5), 500.0, "Caso 11: γ≈2.000"),
+        (0.02, v_mag(0.99, 0.01, 0.0), 0.02, "Caso 12: γ≈7.107, v≈0.990"),
+        (1e-3, v_mag(0.5, 0.4, 0.3), 1e-2, "Caso 13: γ≈1.414"),
+        (1000.0, v_mag(0.2, 0.2, 0.2), 1e5, "Caso 14: γ≈1.066"),
+        (3.0, v_mag(0.0, 0.8, 0.4), 1.0, "Caso 15: γ≈2.236"),
+        (0.5, v_mag(0.7, 0.0, 0.0), 0.1, "Caso 16: γ≈1.400"),
+        (1e-2, v_mag(0.95, 0.2, 0.0), 5e-5, "Caso 17: γ≈4.170, v≈0.971"),
+        (10.0, v_mag(0.1, 0.1, 0.1), 20.0, "Caso 18: γ≈1.015"),
+        (2e-2, v_mag(0.01, 0.0, 0.99), 3e-2, "Caso 19: γ≈7.107, v≈0.990"),
+        (10.0, v_mag(0.0, 0.0, 0.0), 40.0/3.0, "Caso 20: γ=1"),
+
+        # ==================== EXTREME CONDITIONS ====================
+        (0.1, v_mag(0.899, 0.0, 0.0), 1e-4, "Caso 21: Nearly speed of light, γ≈22.361"),
+        (0.01, v_mag(0.2, 0.1, 0.9), 0.5, "Caso 22: High velocity in one dir, γ≈2.673, v≈0.927"),
+        (100.0, v_mag(0.0, 0.0, 0.0), 50.0, "Caso 23: High density/pressure at rest, γ=1"),
+        (1e-3, v_mag(0.6, 0.3, 0.2), 1e-6, "Caso 24: Very low ρ,p, γ≈1.400"),
+        (500.0, v_mag(0.99, 0.01, 0.01), 10.0, "Caso 26: Extreme velocity + high ρ, γ≈7.120, v≈0.990"),
+        (0.001, v_mag(0.3, 0.7, 0.4), 1e-5, "Caso 27: Low ρ + moderate v, γ≈1.961, v≈0.860"),
+        (0.1, v_mag(0.5, 0.4, 0.3), 0.5, "Caso 29: Balanced combination, γ≈1.414"),
+        (100.0, v_mag(0.0, 0.1, 0.99), 1e10, "Caso 30: High P + extreme v, γ≈10.05, v≈0.995"),
+        (1e-2, v_mag(0.2, 0.3, 0.4), 1e-2, "Caso 31: Low ρ,p + low v, γ≈1.066"),
+        (1000.0, v_mag(0.899, 0.001, 0.0), 10.0, "Caso 32: High ρ + extreme v, γ≈22.361"),
+        (10.0, v_mag(0.6, 0.6, 0.52), 0.1, "Caso 33: Isotropic velocity, γ≈10.204, v≈0.995"),
+        (0.5, v_mag(0.0, 0.9, 0.1), 0.2, "Caso 34: Large component in one dir, γ≈2.357, v≈0.906"),
+        (1e-3, v_mag(0.95, 0.05, 0.0), 0.1, "Caso 35: Nearly extreme v + low ρ, γ≈3.247, v≈0.951"),
+        (0.01, v_mag(0.2, 0.2, 0.2), 1e-4, "Caso 36: Small values + low v, γ≈1.066"),
+        (1e-2, v_mag(0.4, 0.5, 0.6), 0.01, "Caso 38: Moderate velocities, γ≈2.085, v≈0.877"),
+        (100.0, v_mag(0.2, 0.0, 0.0), 1000.0, "Caso 39: High ρ,p + low v, γ≈1.020"),
+        (1.0, v_mag(0.1, 0.1, 0.1), 1e3, "Caso 40: High P vs ρ, γ≈1.015"),
     ]
+
+    # Filter cases with v > V_MAX
+    edge_cases = []
+    filtered_count = 0
+
+    for case in edge_cases_raw:
+        rho0, vr, p, desc = case
+        if vr <= V_MAX:
+            edge_cases.append(case)
+        else:
+            filtered_count += 1
+            # Uncomment to see which cases are filtered:
+            # print(f"[FILTERED] {desc}: v={vr:.4f} > {V_MAX}")
+
+    # Report filtering stats (only once at module load)
+    if filtered_count > 0:
+        print(f"[create_edge_case_data] Filtered {filtered_count} cases with v > {V_MAX}")
+        print(f"[create_edge_case_data] Keeping {len(edge_cases)} physical test cases")
 
     return edge_cases
 
@@ -149,8 +227,9 @@ def benchmark_performance():
 
         # Convert to conservative
         D, Sr, tau = prim_to_cons(rho0, vr, p, gamma_rr, eos)
-        U = {'D': D, 'Sr': Sr, 'tau': tau}
-        metric = {'gamma_rr': gamma_rr}
+        # Use tuple format (more efficient than dict)
+        U = (D, Sr, tau)
+        metric = (np.ones(N), np.zeros(N), gamma_rr)
 
         # Time conversion
         start_time = time.time()

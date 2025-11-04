@@ -8,7 +8,7 @@ that supports current ideal gas EOS and is ready for future EOS implementations.
 Floor application follows IllinoisGRMHD strategy (see atmosphere.py).
 
 OPTIMIZATIONS:
-- Numba JIT compilation for critical scalar functions (10-100x speedup)
+- Numba JIT compilation for critical scalar functions 
 - Improved vectorization with reduced nested masks
 - Cached repeated calculations
 - Vectorized bisection fallback
@@ -126,12 +126,12 @@ def _solve_newton_raphson_jit(D, Sr, tau, gamma_rr, p_floor, W_max,
             p = max(p_floor, p * 1.5 + 1e-12)
             continue
 
-        # Newton update with damping
-        p_new = p - f / df
+        # Newton update with damping (0.1 like C++ implementation for robustness)
+        p_new = p - 0.1 * f / df
         if not np.isfinite(p_new) or p_new <= 0:
             p_new = max(p_floor, 0.5 * p)
 
-        p = 0.5 * p + 0.5 * p_new
+        p = p_new
 
     return False, 0.0, 0.0, 0.0, 0.0, 1.0, 1.0
 
@@ -612,110 +612,6 @@ class Cons2PrimSolver:
     # CORE SOLVING METHODS
     # ------------------------------------------------------------------------
 
-    def _solve_single_point(self, D, Sr, tau, gamma_rr, p_guess=None):
-        """
-        Solve for primitive variables at a single grid point.
-
-        Strategy:
-        1. Try pressure guess if provided
-        2. Newton-Raphson method (primary) - uses JIT if available
-        3. Bisection fallback if Newton fails - uses JIT if available
-
-        Returns:
-            (success, (rho0, vr, p, eps, W, h)) or (False, None)
-        """
-        # Use JIT-optimized path for ideal gas
-        if self.use_jit:
-            # Try Newton-Raphson first (JIT compiled)
-            success, rho0, vr, p, eps, W, h = _solve_newton_raphson_jit(
-                D, Sr, tau, gamma_rr,
-                self.params["p_floor"], self.params["W_max"],
-                self.eos_gamma, self.params["tol"], self.params["max_iter"]
-            )
-            if success:
-                self.stats["newton_successes"] += 1
-                return True, (rho0, vr, p, eps, W, h)
-
-            # Bisection fallback (JIT compiled)
-            success, rho0, vr, p, eps, W, h = _solve_bisection_jit(
-                D, Sr, tau, gamma_rr,
-                self.params["p_floor"], self.params["W_max"],
-                self.eos_gamma, self.params["tol"], self.params["max_iter"]
-            )
-            if success:
-                self.stats["bisection_fallbacks"] += 1
-                return True, (rho0, vr, p, eps, W, h)
-
-            return False, None
-
-        # Fallback to original path for non-ideal gas EOS
-        # Try pressure guess first
-        if p_guess is not None and p_guess > self.params["p_floor"]:
-            ok, primitives = self._evaluate_pressure(D, Sr, tau, p_guess, gamma_rr)
-            if ok and abs(primitives[5]) <= self.params["tol"] * max(1.0, abs(p_guess)):
-                return True, (primitives[0], primitives[1], p_guess, primitives[2], primitives[3], primitives[4])
-
-        # Newton-Raphson method (primary solver)
-        success, result = self._solve_newton_raphson(D, Sr, tau, gamma_rr)
-        if success:
-            self.stats["newton_successes"] += 1
-            return True, result
-
-        # Bisection fallback
-        success, result = self._solve_bisection_fallback(D, Sr, tau, gamma_rr)
-        if success:
-            self.stats["bisection_fallbacks"] += 1
-            return True, result
-
-        return False, None
-
-    def _solve_newton_raphson(self, D, Sr, tau, gamma_rr):
-        """Newton-Raphson solver with numerical derivatives (analytic for IdealGas)."""
-        p = max(self.params["p_floor"], 0.1 * (tau + D))
-
-        _is_ideal = getattr(self.eos, "name", "").startswith("ideal_gas")
-
-        for _ in range(self.params["max_iter"]):
-            ok, state = self._evaluate_pressure(D, Sr, tau, p, gamma_rr)
-
-            if not ok:
-                p = max(self.params["p_floor"], p * 1.5 + 1e-12)
-                continue
-
-            rho0, vr, eps, W, h, f = state
-
-            if abs(f) <= self.params["tol"] * max(1.0, abs(p)):
-                return True, (rho0, vr, p, eps, W, h)
-
-            if _is_ideal:
-                # === Analytic df/dp for Ideal Gas EOS (2 líneas clave) ===
-                E = tau + D
-                Q = E + p
-                g = max(gamma_rr, 1e-30)
-                Wprime = - (Sr * Sr) * (W ** 3) / max(Q ** 3 * g, 1e-30)
-                c = float(self.eos.gamma) / (float(self.eos.gamma) - 1.0)
-                df = c * (W ** 2) + (D + 2.0 * c * p * W) * Wprime - 1.0
-            else:
-                # Numerical derivative
-                dp = max(1e-3 * max(abs(p), 1.0), 1e-12)
-                ok2, state2 = self._evaluate_pressure(D, Sr, tau, p + dp, gamma_rr)
-                if not ok2:
-                    p = max(self.params["p_floor"], p * 1.5 + 1e-12)
-                    continue
-                df = (state2[5] - f) / dp
-
-            if not np.isfinite(df) or abs(df) < 1e-15:
-                p = max(self.params["p_floor"], p * 1.5 + 1e-12)
-                continue
-
-            p_new = p - f / df
-            if not np.isfinite(p_new) or p_new <= 0:
-                p_new = max(self.params["p_floor"], 0.5 * p)
-
-            p = 0.5 * p + 0.5 * p_new  # Damped Newton
-
-        return False, None
-
     def _solve_bisection_fallback(self, D, Sr, tau, gamma_rr):
         """Simple bisection solver as fallback."""
         E = tau + D
@@ -842,8 +738,8 @@ class Cons2PrimSolver:
             "p_floor": 1e-15,
             "v_max": 0.999999,
             "W_max": 1.0e3,
-            "tol": 1e-12,
-            "max_iter": 500,
+            "tol": 1e-16,
+            "max_iter": 1000,
         }
 
     def _parse_conservative_variables(self, U):
@@ -853,7 +749,7 @@ class Cons2PrimSolver:
             Sr = np.atleast_1d(np.asarray(U["Sr"], dtype=float))
             tau = np.atleast_1d(np.asarray(U["tau"], dtype=float))
         elif isinstance(U, (tuple, list)) and len(U) == 3:
-            D = np.atleast_1d(np.asarray(U[0], dtype=float))
+            D = np.atleast_1d(np.asarray(U[0], dtype=float)) 
             Sr = np.atleast_1d(np.asarray(U[1], dtype=float))
             tau = np.atleast_1d(np.asarray(U[2], dtype=float))
         else:
@@ -904,11 +800,6 @@ class Cons2PrimSolver:
 
         return p_guess
 
-    def _is_valid_input(self, D, Sr, tau):
-        """Check if conservative variables are physically valid."""
-        return (np.isfinite(D) and np.isfinite(Sr) and np.isfinite(tau)
-                and D >= self.params["rho_floor"] and tau >= -D)
-
     def _atmosphere_fallback(self):
         """Return atmosphere values when conversion fails."""
         rho0 = self.atmosphere.rho_floor
@@ -932,12 +823,6 @@ class Cons2PrimSolver:
                 h = 1.0 + eps + p / np.maximum(rho0, 1e-30)
 
         return rho0, vr, p, eps, W, h
-
-    def _enforce_velocity_limit(self, vr, i, gamma_rr):
-        """Enforce maximum velocity constraint."""
-        v2 = gamma_rr * (vr[i] ** 2)
-        if v2 >= self.params["v_max"] ** 2:
-            vr[i] = np.sign(vr[i]) * self.params["v_max"] / np.sqrt(max(gamma_rr, 1e-30))
 
 
 # ============================================================================
@@ -1000,8 +885,8 @@ def prim_to_cons(rho0, vr, pressure, gamma_rr, eos):
 def _solve_pressure(D, Sr, tau, gamma_rr, eos, p_guess=None):
     """Legacy function for backward compatibility."""
     solver = Cons2PrimSolver(eos)
-    U = {'D': np.array([D]), 'Sr': np.array([Sr]), 'tau': np.array([tau])}
-    metric = {'gamma_rr': np.array([gamma_rr])}
+    U = (np.array([D]), np.array([Sr]), np.array([tau]))
+    metric = (np.ones(1), np.zeros(1), np.array([gamma_rr]))
     p_guess_array = np.array([p_guess]) if p_guess is not None else None
 
     result = solver.convert(U, metric=metric, p_guess=p_guess_array)

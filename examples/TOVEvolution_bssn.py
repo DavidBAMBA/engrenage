@@ -21,6 +21,8 @@ from source.bssn.bssnstatevariables import (NUM_BSSN_VARS, idx_phi, idx_hrr, idx
                                              idx_K, idx_arr, idx_att, idx_app, idx_lapse)
 from source.bssn.tensoralgebra import get_bar_gamma_LL
 from source.bssn.bssnrhs import get_bssn_rhs
+from source.core.rhsevolution import get_rhs
+from tqdm import tqdm
 
 # Hydro
 from source.matter.hydro.perfect_fluid import PerfectFluid
@@ -573,41 +575,7 @@ def plot_surface_zoom(tov_solution, state_t0, state_t1, grid, hydro, window=0.5)
     plt.close(fig)
 
 
-def get_rhs_full(t, y, grid, background, hydro):
-    """RHS for full BSSN + hydro evolution (no Cowling approximation)."""
-    state = y.reshape((grid.NUM_VARS, grid.N))
-    grid.fill_boundaries(state)
-
-    # Build BSSN containers from current state
-    bssn_vars = BSSNVars(grid.N)
-    bssn_vars.set_bssn_vars(state[:NUM_BSSN_VARS, :])
-
-    # Compute derivatives for BSSN RHS
-    bssn_d1 = grid.get_d1_metric_quantities(state)
-    bssn_d2 = grid.get_d2_metric_quantities(state)
-
-    # Set matter variables
-    hydro.set_matter_vars(state, bssn_vars, grid)
-
-    # Get matter RHS
-    hydro_rhs = hydro.get_matter_rhs(grid.r, bssn_vars, bssn_d1, background)
-
-    # Get energy-momentum tensor for BSSN evolution
-    emtensor = hydro.get_emtensor(grid.r, bssn_vars, background)
-
-    # Get BSSN RHS
-    bssn_rhs = BSSNVars(grid.N)
-    get_bssn_rhs(bssn_rhs, grid.r, bssn_vars, bssn_d1, bssn_d2, background, emtensor)
-
-    # Combine into full RHS
-    rhs = np.zeros_like(state)
-    rhs[:NUM_BSSN_VARS, :] = bssn_rhs.set_bssn_state_vars()
-    rhs[NUM_BSSN_VARS:, :] = hydro_rhs
-
-    return rhs.flatten()
-
-
-def _apply_atmosphere_reset(state_2d, grid, hydro, atmosphere, rho_threshold=None):
+def _apply_atmosphere_reset(state_2d, grid, hydro, atmosphere, R_star=None):
     """
     Apply atmosphere floors using IllinoisGRMHD strategy.
 
@@ -625,15 +593,19 @@ def _apply_atmosphere_reset(state_2d, grid, hydro, atmosphere, rho_threshold=Non
         grid: Grid object
         hydro: Hydrodynamics object
         atmosphere: AtmosphereParams object
-        rho_threshold: Threshold below which to apply atmosphere (default: 10 * rho_floor)
+        R_star: Stellar radius - atmosphere reset applied ONLY for r > R_star (optional)
 
     Returns:
         state_2d with floors applied
     """
     from source.matter.hydro.atmosphere import FloorApplicator
 
-    if rho_threshold is None:
-        rho_threshold = 10.0 * atmosphere.rho_floor
+    # DIAGNOSTIC: Print R_star once at the beginning
+    import sys
+    if not hasattr(_apply_atmosphere_reset, '_printed_R_star'):
+        print(f"\n=== ATMOSPHERE RESET DIAGNOSTICS ===", file=sys.stderr)
+        print(f"R_star = {R_star} km" if R_star is not None else "R_star = None (PROBLEM!)", file=sys.stderr)
+        _apply_atmosphere_reset._printed_R_star = True
 
     # Extract conservatives
     D = state_2d[NUM_BSSN_VARS + 0, :]
@@ -665,12 +637,33 @@ def _apply_atmosphere_reset(state_2d, grid, hydro, atmosphere, rho_threshold=Non
     rho0_floor, vr_floor, p_floor = floor_app.apply_primitive_floors(rho0, vr, p, gamma_rr)
 
     # STEP 2: Identify atmosphere regions (where there is NO real fluid)
-    # In atmosphere: density is at floor and there should be NO motion
-    atm_mask = D < rho_threshold
+    # SPATIAL CRITERION: Apply atmosphere reset ONLY outside stellar radius (r > R_star)
+    # Inside star (r < R_star): primitives can fluctuate but stay physical
+    # Outside star (r > R_star): force exact atmosphere values (vacuum)
+    if R_star is not None:
+        atm_mask = grid.r > R_star
 
-    # CRITICAL: In atmosphere, velocity MUST be zero (no fluid to move!)
+        # DIAGNOSTIC: Check if reset is being applied
+        n_atm = np.sum(atm_mask)
+        max_vr_before = np.max(np.abs(vr_floor[atm_mask])) if n_atm > 0 else 0.0
+    else:
+        # Fallback to density-based criterion if R_star not provided
+        atm_mask = np.zeros(grid.N, dtype=bool)
+        n_atm = 0
+        max_vr_before = 0.0
+
+    # CRITICAL: In atmosphere, RESET (not floor) primitives to exact atmosphere values
+    # This is NOT the same as applying floors (max operation) - we force exact values
+    # where there is no real fluid, ensuring clean separation between interior and vacuum
     if np.any(atm_mask):
-        vr_floor[atm_mask] = 0.0  # Force v=0 in atmosphere
+        rho0_floor[atm_mask] = atmosphere.rho_floor  # RESET to exact floor (not max)
+        p_floor[atm_mask] = atmosphere.p_floor        # RESET to exact floor (not max)
+        vr_floor[atm_mask] = 0.0                      # RESET velocity to zero
+
+        # DIAGNOSTIC: Verify reset worked
+        max_vr_after = np.max(np.abs(vr_floor[atm_mask]))
+        if max_vr_after > 1e-14:
+            print(f"WARNING: vr reset failed! max_vr_after = {max_vr_after:.3e}")
 
     # STEP 3: Apply conservative consistency floors (tau, S_i constraints)
     D_floor, Sr_floor, tau_floor, cons_floor_applied = floor_app.apply_conservative_floors(
@@ -703,6 +696,13 @@ def _apply_atmosphere_reset(state_2d, grid, hydro, atmosphere, rho_threshold=Non
         state_2d[NUM_BSSN_VARS + 1, needs_floor] = Sr_new[needs_floor]
         state_2d[NUM_BSSN_VARS + 2, needs_floor] = tau_new[needs_floor]
 
+        # DIAGNOSTIC: Verify Sr is zero in atmosphere after update
+        if R_star is not None and np.any(atm_mask):
+            Sr_final = state_2d[NUM_BSSN_VARS + 1, :]
+            max_Sr_atm = np.max(np.abs(Sr_final[atm_mask]))
+            if max_Sr_atm > 1e-14:
+                print(f"WARNING: Sr in atmosphere is not zero! max_Sr_atm = {max_Sr_atm:.3e}", file=sys.stderr)
+
     return state_2d
 
 
@@ -720,59 +720,67 @@ def enforce_origin_symmetry(state_2d):
         Modified state_2d with S^r = 0 at first interior cell
     """
     NUM_GHOSTS = 3
-    # S^r_tilde is at index 7 (after 6 BSSN variables + D)
-    # Index ordering: [phi, h_rr, h_tt, h_pp, K, a_rr, D, Sr, tau]
-    #                  0    1     2     3     4   5     6  7   8
-    state_2d[7, NUM_GHOSTS] = 0.0
+    # S^r_tilde is at index NUM_BSSN_VARS + 1 = 13
+    # Complete index ordering:
+    #   BSSN (0-11): [phi, h_rr, h_tt, h_pp, K, a_rr, a_tt, a_pp, lambda^r, shift^r, b^r, lapse]
+    #   Hydro (12-14): [D, S^r, tau]
+    # We enforce S^r = 0 at first interior cell (index 13 = NUM_BSSN_VARS + 1)
+    state_2d[NUM_BSSN_VARS + 1, NUM_GHOSTS] = 0.0  # S^r = 0 at r ≈ 0
     return state_2d
 
 
-def rk4_step(state_flat, dt, grid, background, hydro, atmosphere):
+def rk4_step(state_flat, dt, grid, background, hydro, atmosphere, R_star=None):
     """
-    Single RK4 (classical 4th order Runge-Kutta) timestep with atmosphere reset.
-    Full BSSN + hydro evolution (no Cowling approximation).
+    Single RK4 (classical 4th order Runge-Kutta) timestep using canonical get_rhs.
+    Full BSSN + hydro evolution following rhsevolution.py pattern.
 
     Args:
         atmosphere: AtmosphereParams object
+        R_star: Stellar radius for atmosphere reset (optional)
+
+    Note: Uses rhsevolution.get_rhs() which includes:
+        - BSSN RHS (geometric evolution)
+        - Hydro RHS (Valencia formulation)
+        - Gauge evolution (1+log lapse, Gamma-driver shift)
+        - Advection terms (Lie derivatives)
+        - Kreiss-Oliger dissipation (BSSN only)
+        - Constraint enforcement (det(γ̄) = det(γ̂))
+        - Boundary conditions (inner/outer)
     """
+    # Create dummy progress bar for get_rhs (required by signature)
+    dummy_progress = tqdm(total=1, disable=True)
+    time_state = [0, dt]
+
     # Stage 1
-    k1 = get_rhs_full(0, state_flat, grid, background, hydro)
+    k1 = get_rhs(0, state_flat, grid, background, hydro, dummy_progress, time_state)
 
     # Stage 2
     state_2 = state_flat + 0.5 * dt * k1
-    s2 = state_2.reshape((grid.NUM_VARS, grid.N))
-    enforce_origin_symmetry(s2)
-    state_2 = s2.flatten()
-    k2 = get_rhs_full(0, state_2, grid, background, hydro)
+    k2 = get_rhs(0, state_2, grid, background, hydro, dummy_progress, time_state)
 
     # Stage 3
     state_3 = state_flat + 0.5 * dt * k2
-    s3 = state_3.reshape((grid.NUM_VARS, grid.N))
-    enforce_origin_symmetry(s3)
-    state_3 = s3.flatten()
-    k3 = get_rhs_full(0, state_3, grid, background, hydro)
+    k3 = get_rhs(0, state_3, grid, background, hydro, dummy_progress, time_state)
 
     # Stage 4
     state_4 = state_flat + dt * k3
-    s4 = state_4.reshape((grid.NUM_VARS, grid.N))
-    enforce_origin_symmetry(s4)
-    state_4 = s4.flatten()
-    k4 = get_rhs_full(0, state_4, grid, background, hydro)
+    k4 = get_rhs(0, state_4, grid, background, hydro, dummy_progress, time_state)
 
     # Combine
     state_new = state_flat + (dt / 6.0) * (k1 + 2*k2 + 2*k3 + k4)
     snew = state_new.reshape((grid.NUM_VARS, grid.N))
 
-    # Apply atmosphere reset after full step
-    snew_reset = _apply_atmosphere_reset(snew, grid, hydro, atmosphere)
+    # Apply atmosphere reset after full step (ONLY outside stellar radius r > R_star)
+    snew_reset = _apply_atmosphere_reset(snew, grid, hydro, atmosphere, R_star=R_star)
 
+    dummy_progress.close()
     return snew_reset.flatten()
 
 
 def evolve_fixed_timestep(state_initial, dt, num_steps, grid, background, hydro,
                           atmosphere, method='rk4', t_start=0.0,
                           reference_state=None, step_offset=0, data_manager=None,
-                          snapshot_interval=None, evolution_interval=None):
+                          snapshot_interval=None, evolution_interval=None, R_star=None):
     """Evolve with fixed timestep using RK4 (full BSSN + hydro).
 
     Args:
@@ -784,6 +792,7 @@ def evolve_fixed_timestep(state_initial, dt, num_steps, grid, background, hydro,
         data_manager: SimulationDataManager object for data saving (optional)
         snapshot_interval: Save full domain snapshot every N steps (optional)
         evolution_interval: Save evolution data every N steps (optional)
+        R_star: Stellar radius for atmosphere reset (optional)
     """
     state_flat = state_initial.flatten()
 
@@ -808,12 +817,12 @@ def evolve_fixed_timestep(state_initial, dt, num_steps, grid, background, hydro,
         data_manager.add_evolution_point(step_offset, t_start, state_initial, prim_initial, prim_initial)
 
     print("\n===== Evolution diagnostics (per step) =====")
-    print("Columns: step | t | ρ_central | max_Δρ/ρ | max_vʳ | max_D | max_Sʳ | max_τ | c2p_fails")
+    print("Columns: step | t | ρ_central | max_Δρ/ρ | max_vʳ (location) | max_D | max_Sʳ | max_τ | c2p_fails")
     print("-" * 100)
 
     for step in range(num_steps):
         # Advance one RK4 step
-        state_flat_next = rk4_step(state_flat, dt, grid, background, hydro, atmosphere)
+        state_flat_next = rk4_step(state_flat, dt, grid, background, hydro, atmosphere, R_star=R_star)
 
         # Compute primitives BEFORE and AFTER to measure change
         prim_next, s_next = primitives_from_state(state_flat_next)
@@ -845,6 +854,14 @@ def evolve_fixed_timestep(state_initial, dt, num_steps, grid, background, hydro,
 
         # Maximum velocity
         max_abs_v = float(np.max(np.abs(v_next)))
+        idx_max_v = int(np.argmax(np.abs(v_next)))
+        r_max_v = float(grid.r[idx_max_v])
+
+        # Check if max velocity is in atmosphere or interior
+        if R_star is not None:
+            in_atmosphere = "ATM" if r_max_v > R_star else "INT"
+        else:
+            in_atmosphere = "?"
 
         # Maximum conserved variables (more useful than minimum)
         max_D = float(np.max(D_next))
@@ -858,7 +875,7 @@ def evolve_fixed_timestep(state_initial, dt, num_steps, grid, background, hydro,
         step_num = step_offset + step + 1
         if step_num % 100 == 0:
             print(f"step {step_num:4d}  t={t_curr:.6e}:  ρ_c={rho_central:.6e}  max_Δρ/ρ={max_rel_rho_err:.3e}  "
-              f"max_vʳ={max_abs_v:.3e}  max_D={max_D:.3e}  max_Sʳ={max_Sr:.3e}  "
+              f"max_vʳ={max_abs_v:.3e} (r={r_max_v:.2f} {in_atmosphere})  max_D={max_D:.3e}  max_Sʳ={max_Sr:.3e}  "
               f"max_τ={max_tau:.3e}  c2p_fail={c2p_fail_count}")
 
         # Save data if data manager provided
@@ -948,32 +965,48 @@ def evolve_fixed_timestep(state_initial, dt, num_steps, grid, background, hydro,
     return state_flat.reshape((grid.NUM_VARS, grid.N)), num_steps, actual_time
 
 
-def evolve_adaptive(state_initial, t_final, grid, background, hydro,
-                   method='RK45', rtol=1e-6, atol=1e-8):
-    """Evolve with adaptive timestep using scipy.integrate.solve_ivp (full BSSN + hydro)."""
-    from scipy.integrate import solve_ivp
+def evolve_adaptive(state_initial, t_final, grid, background, hydro, atmosphere,
+                   method='RK45', rtol=1e-6, atol=1e-8, R_star=None):
+    """
+    Evolve with adaptive timestep using scipy.integrate.solve_ivp.
+    Uses canonical get_rhs from rhsevolution.py (full BSSN + hydro).
 
-    # Wrapper for RHS compatible with solve_ivp
-    def rhs_wrapper(t, y):
-        return get_rhs_full(t, y, grid, background, hydro)
+    Args:
+        atmosphere: AtmosphereParams object
+        R_star: Stellar radius for atmosphere reset (optional)
+    """
+    from scipy.integrate import solve_ivp
 
     state_flat = state_initial.flatten()
 
     print(f"  Using solve_ivp with method={method}, rtol={rtol}, atol={atol}")
+    print(f"  Evolving from t=0 to t={t_final}")
 
-    solution = solve_ivp(
-        rhs_wrapper,
-        t_span=(0, t_final),
-        y0=state_flat,
-        method=method,  # 'RK45', 'RK23', 'DOP853', 'Radau', 'BDF', 'LSODA'
-        rtol=rtol,
-        atol=atol,
-        dense_output=False
-    )
+    # Use get_rhs with progress tracking
+    with tqdm(total=1000, unit="‰", desc=f"  Adaptive to t={t_final}") as progress_bar:
+        # Wrapper for RHS compatible with solve_ivp
+        def rhs_wrapper(t, y):
+            time_state = [0, t_final/1000]
+            return get_rhs(t, y, grid, background, hydro, progress_bar, time_state)
 
-    print(f"  solve_ivp: {solution.nfev} function evaluations, status={solution.status}")
+        solution = solve_ivp(
+            rhs_wrapper,
+            t_span=(0, t_final),
+            y0=state_flat,
+            method=method,  # 'RK45', 'RK23', 'DOP853', 'Radau', 'BDF', 'LSODA'
+            max_step=0.4 * grid.min_dr,  # For stability with KO dissipation σ=1.0
+            rtol=rtol,
+            atol=atol,
+            dense_output=False
+        )
 
-    return solution.y[:, -1].reshape((grid.NUM_VARS, grid.N))
+    print(f"  ✓ solve_ivp: {solution.nfev} function evaluations, status={solution.status}")
+
+    # Apply atmosphere reset to final state
+    state_final = solution.y[:, -1].reshape((grid.NUM_VARS, grid.N))
+    state_final_reset = _apply_atmosphere_reset(state_final, grid, hydro, atmosphere, R_star=R_star)
+
+    return state_final_reset
 
 
 def plot_tov_diagnostics(tov_solution, r_max):
@@ -1334,7 +1367,7 @@ def main():
     K = 100.0
     Gamma = 2.0
     rho_central = 1.28e-3
-    num_steps_total = 10000
+    num_steps_total = 1000  # Temporarily reduced for faster testing
 
 
     # ==================================================================
@@ -1414,7 +1447,10 @@ def main():
     # Solve TOV with adaptive step; interpolation to evolution grid will be applied below
     tov_solution = tov_solver.solve(rho_central, r_max=r_max)
 
-    print(f"TOV Solution: M={tov_solution['M_star']:.6f}, R={tov_solution['R']:.3f}, C={tov_solution['C']:.4f}\n")
+    # Extract stellar radius for atmosphere reset (r > R_star criterion)
+    R_star = tov_solution['R']
+
+    print(f"TOV Solution: M={tov_solution['M_star']:.6f}, R={R_star:.3f}, C={tov_solution['C']:.4f}\n")
 
     plot_tov_diagnostics(tov_solution, r_max)
 
@@ -1434,10 +1470,10 @@ def main():
     )
 
     # Diagnostics: check discrete hydrostatic balance at t=0
-    diagnose_t0_residuals(initial_state_2d, grid, background, hydro)
+    # diagnose_t0_residuals(initial_state_2d, grid, background, hydro)  # TEMPORARILY DISABLED FOR FASTER TESTING
 
     # Initial-data diagnostics
-    tov_id.plot_initial_comparison(tov_solution, initial_state_2d, grid, hydro)
+    # tov_id.plot_initial_comparison(tov_solution, initial_state_2d, grid, hydro)  # TEMPORARILY DISABLED FOR FASTER TESTING
 
     # ==================================================================
     # DATA MANAGER INITIALIZATION
@@ -1462,12 +1498,12 @@ def main():
 
         # Single step for comparison
         state_t1 = rk4_step(initial_state_2d.flatten(), dt, grid, background, hydro,
-                           ATMOSPHERE).reshape((grid.NUM_VARS, grid.N))
+                           ATMOSPHERE, R_star=R_star).reshape((grid.NUM_VARS, grid.N))
         t_1 = dt
 
         # Plot only the first step changes
-        plot_first_step(initial_state_2d, state_t1, grid, hydro, tov_solution)
-        plot_surface_zoom(tov_solution, initial_state_2d, state_t1, grid, hydro, window=0.1)
+        # plot_first_step(initial_state_2d, state_t1, grid, hydro, tov_solution)  # TEMPORARILY DISABLED FOR FASTER TESTING
+        # plot_surface_zoom(tov_solution, initial_state_2d, state_t1, grid, hydro, window=0.1)  # TEMPORARILY DISABLED FOR FASTER TESTING
 
         # Define intermediate checkpoint (around 10% of total, or 100 if total is large)
         if num_steps_total <= 100:
@@ -1483,7 +1519,8 @@ def main():
             reference_state=initial_state_2d,
             data_manager=data_manager,
             snapshot_interval=SNAPSHOT_INTERVAL,
-            evolution_interval=EVOLUTION_INTERVAL)
+            evolution_interval=EVOLUTION_INTERVAL,
+            R_star=R_star)
         print(f"  -> Reached step {steps_100}, t={t_100:.6e}")
 
         # Continue evolution to num_steps_total (or until it breaks)
@@ -1497,7 +1534,8 @@ def main():
                 step_offset=checkpoint_mid,
                 data_manager=data_manager,
                 snapshot_interval=SNAPSHOT_INTERVAL,
-                evolution_interval=EVOLUTION_INTERVAL)
+                evolution_interval=EVOLUTION_INTERVAL,
+                R_star=R_star)
             # t_final already includes t_start from evolve_fixed_timestep
             steps_final = checkpoint_mid + steps_more
             print(f"  -> Reached step {steps_final}, t={t_final:.6e}")
@@ -1526,15 +1564,15 @@ def main():
         # so code paths that expect 'num_steps' still work.
         num_steps = max(1, int(round(t_10000 / dt)))
         state_t1 = rk4_step(initial_state_2d.flatten(), dt, grid, background, hydro,
-                           ATMOSPHERE).reshape((grid.NUM_VARS, grid.N))
+                           ATMOSPHERE, R_star=R_star).reshape((grid.NUM_VARS, grid.N))
 
         # Adaptive evolution to t=1.0
-        state_t100 = evolve_adaptive(initial_state_2d, t_100, grid, background, hydro,
-                                    method='RK45', rtol=1e-5, atol=1e-7)
+        state_t100 = evolve_adaptive(initial_state_2d, t_100, grid, background, hydro, ATMOSPHERE,
+                                    method='RK45', rtol=1e-5, atol=1e-7, R_star=R_star)
 
         # Adaptive evolution to t=10.0
-        state_t10000 = evolve_adaptive(initial_state_2d, t_10000, grid, background, hydro,
-                                      method='RK45', rtol=1e-5, atol=1e-7)
+        state_t10000 = evolve_adaptive(initial_state_2d, t_10000, grid, background, hydro, ATMOSPHERE,
+                                      method='RK45', rtol=1e-5, atol=1e-7, R_star=R_star)
 
     # ==================================================================
     # DIAGNOSTICS
@@ -1553,6 +1591,13 @@ def main():
         # For adaptive timestep: use time labels
         label_100 = 't_mid'
         label_10000 = 't_final'
+
+    # CRITICAL: Apply atmosphere reset to final states before plotting
+    # This ensures primitives calculated for plots have vr=0 in atmosphere
+    # (during evolution, this happens in rk4_step, but plots call _get_primitives separately)
+    state_t1 = _apply_atmosphere_reset(state_t1, grid, hydro, ATMOSPHERE, R_star=R_star)
+    state_t100 = _apply_atmosphere_reset(state_t100, grid, hydro, ATMOSPHERE, R_star=R_star)
+    state_t10000 = _apply_atmosphere_reset(state_t10000, grid, hydro, ATMOSPHERE, R_star=R_star)
 
     plot_evolution(initial_state_2d, state_t1, state_t100, state_t10000, grid, hydro,
                    t_1, t_100, t_10000, label_100=label_100, label_10000=label_10000)
