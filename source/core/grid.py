@@ -123,7 +123,7 @@ class Grid:
         """Fill boundaries for primitive variables only.
 
         Uses zero-gradient/outflow conditions for primitives,
-        following IllinoisGRMHD/NRPy+ strategy.
+        following   / + strategy.
 
         Args:
             rho0: (N,) density array

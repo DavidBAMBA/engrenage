@@ -1,5 +1,5 @@
 """
-TOV Initial Data in isotropic coordinates (NRPy-style) + rigorous ADM→BSSN conversion.
+TOV Initial Data in isotropic coordinates ( -style) + rigorous ADM→BSSN conversion.
 
 This module expects the output from TOVSolverISO (isotropic radii + profiles)
 and builds consistent ADM variables in the isotropic radial coordinate r.
@@ -19,7 +19,7 @@ from source.bssn.bssnstatevariables import (
 from source.backgrounds.sphericalbackground import i_r, i_t, i_p
 
 # Reuse robust ADM→BSSN converter from the existing module
-from examples.tov_initial_data_interpolated import convert_adm_to_bssn
+from examples.TOV.tov_initial_data_interpolated import convert_adm_to_bssn
 
 
 def _interp_surface_protected(r_query, r_int, f_int, r_ext, f_ext):

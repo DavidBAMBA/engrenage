@@ -1,11 +1,11 @@
 # matter/hydro/riemann_hll.py
 """
 HLL Riemann solver for GRHD using quadratic-eigenvalue characteristic speeds,
-aligned with NRPy cmin/cmax HLL form.
+aligned with   cmin/cmax HLL form.
 
 Key fixes & alignment:
 - Transport velocity uses Valencia form: vtil = v^r - beta^r/alpha (scalar & batch).
-- HLL uses cmin/cmax (positive) as in NRPy, equivalent to lambda_± with:
+- HLL uses cmin/cmax (positive) as in  , equivalent to lambda_± with:
     cmax = max(0, max(cp_L, cp_R)), cmin = -min(0, min(cm_L, cm_R))
 - Entropy-fix batch swap corrected.
 - estimate_dt now accepts beta_r (default 0) and uses it in g^{μν}.
@@ -80,12 +80,12 @@ class HLLRiemannSolver:
         u4U_R = self._compute_4velocity(vrR, gamma_rr)
         g4UU = self._ADM_to_g4UU(gamma_rr, beta_r, alpha)
 
-        # Characteristic speeds via NRPy-style quadratic
+        # Characteristic speeds via  -style quadratic
         flux_dirn = 0
         cmL, cpL = self._find_cp_cm(flux_dirn, g4UU, u4U_L, cs2L)
         cmR, cpR = self._find_cp_cm(flux_dirn, g4UU, u4U_R, cs2R)
 
-        # NRPy mapping: positive cmin,cmax
+        #   mapping: positive cmin,cmax
         cmax = max(0.0, max(cpL, cpR))
         cmin = -min(0.0, min(cmL, cmR))
 
@@ -144,7 +144,7 @@ class HLLRiemannSolver:
         u4U_R = self._compute_4velocity_batch(vrR, gamma_rr_batch)
         g4UU = self._ADM_to_g4UU_batch(gamma_rr_batch, beta_r_batch, alpha_batch)
 
-        # Características vectorizadas (NRPy)
+        # Características vectorizadas ( )
         cmL, cpL = self._find_cp_cm_batch(0, g4UU, u4U_L, cs2L)
         cmR, cpR = self._find_cp_cm_batch(0, g4UU, u4U_R, cs2R)
         cmax = np.maximum(0.0, np.maximum(cpL, cpR))
@@ -256,7 +256,7 @@ class HLLRiemannSolver:
         self.negative_pressure_fixes = 0
 
     # ----------------------------------------------------------------------
-    # Internals (NRPy-style characteristic speeds)
+    # Internals ( -style characteristic speeds)
     # Now using ADMGeometry for cleaner implementation
     # ----------------------------------------------------------------------
     def _compute_4velocity(self, vr, gamma_rr):

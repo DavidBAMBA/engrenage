@@ -29,7 +29,7 @@ from source.core.grid import Grid
 from source.core.statevector import StateVector
 from source.core.rhsevolution import get_rhs
 from source.backgrounds.sphericalbackground import FlatSphericalBackground, i_r, i_t, i_p
-from source.matter.hydro.perfect_fluid import PerfectFluid
+from source.matter.perfect_fluid import PerfectFluid
 from source.matter.hydro.eos import PolytropicEOS, IdealGasEOS
 from source.matter.hydro.reconstruction import create_reconstruction
 from source.matter.hydro.riemann import HLLRiemannSolver
@@ -47,8 +47,8 @@ from source.bssn.constraintsdiagnostic import get_constraints_diagnostic
 from source.bssn.bssnvars import BSSNVars
 
 # High-fidelity TOV initial data
-from examples.tov_initial_data_interpolated import create_initial_data_interpolated
-from examples.tov_solver import TOVSolver
+from examples.TOV.tov_initial_data_interpolated import create_initial_data_interpolated
+from examples.TOV.tov_solver import TOVSolver
 
 # -------------------- Progress monitor (dummy) --------------------
 class DummyProgress:
@@ -126,17 +126,17 @@ def rk4_step_hwh(state, grid: Grid, background, matter, cfl=0.5):
 
 # -------------------- Main Evolution Function --------------------
 def run_hwh_test(
-    # Reference default parameters
+    # Reference default parameters (Baumgarte paper)
     gamma=2.0,                # Polytropic index (n=1 → γ=2)
     K=1.0,                    # Polytropic constant
-    rho_central=0.129285,     # Central density
+    rho_central=0.2,          # Central density (Baumgarte paper value)
     cfl=0.1,                  # CFL factor
     # Grid parameters
     r_max=None,              # Will be set to 2*R_iso automatically
     dr=0.01,                 # Spatial resolution
-    atmosphere=1e-12,        # Atmosphere threshold
+    atmosphere=1e-10,        # Atmosphere threshold
     # Evolution parameters
-    t_final_factor=1.8,      # t_final = t_final_factor * TOV_Mass
+    t_final_factor=100.8,      # t_final = t_final_factor * TOV_Mass
     progress=True,           # Print progress
     save_interval=10         # Save frequency for detailed data
 ):
@@ -211,8 +211,6 @@ def run_hwh_test(
         background,
         hydro.eos,
         atmosphere=hydro.atmosphere,
-        polytrope_K=K,
-        polytrope_Gamma=gamma,
         interp_order=11
     )
 
@@ -591,6 +589,202 @@ def plot_hwh_results(result, save_plots=True, plot_dir="hwh_plots"):
     return result
 
 
+def plot_baumgarte_paper_figures(result, save_plots=True, plot_dir="hwh_plots"):
+    """
+    Replicate figures from Baumgarte, Hughes & Shapiro (1999) paper.
+
+    Figure 1: φ and K at center vs t/M
+    Shows long-term evolution settling into numerical equilibrium.
+    """
+    import os
+    if save_plots:
+        os.makedirs(plot_dir, exist_ok=True)
+
+    times = result['times']
+    TOV_Mass = result['TOV_Mass']
+    times_M = times / TOV_Mass
+
+    # ==================== FIGURE 1: φ and K Evolution (Paper Figure 1) ====================
+    print("\nGenerating Baumgarte paper Figure 1: φ and K at center...")
+
+    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(8, 10))
+
+    # Top panel: φ at center
+    ax1.plot(times_M, result['phi_center'], 'k-', linewidth=1.5)
+    ax1.set_ylabel(r'$\phi$', fontsize=14)
+    ax1.set_title('Evolution of conformal exponent and trace of extrinsic curvature',
+                  fontsize=12, fontweight='bold')
+    ax1.grid(True, alpha=0.3)
+    ax1.set_xlim(0, times_M[-1])
+
+    # Inset showing early evolution (first 100 time units)
+    if times_M[-1] > 100:
+        left, bottom, width, height = [0.55, 0.62, 0.35, 0.25]
+        ax1_inset = fig.add_axes([left, bottom, width, height])
+        mask_early = times_M <= 100
+        ax1_inset.plot(times_M[mask_early], result['phi_center'][mask_early], 'k-', linewidth=1)
+        ax1_inset.set_xlim(0, 100)
+        ax1_inset.set_xlabel('t/M', fontsize=10)
+        ax1_inset.grid(True, alpha=0.3)
+        ax1_inset.tick_params(labelsize=9)
+
+    # Bottom panel: K at center
+    ax2.plot(times_M, result['K_center'], 'k-', linewidth=1.5)
+    ax2.set_ylabel('K', fontsize=14)
+    ax2.set_xlabel('t/M', fontsize=14)
+    ax2.grid(True, alpha=0.3)
+    ax2.set_xlim(0, times_M[-1])
+    ax2.axhline(y=0, color='gray', linestyle='--', alpha=0.5)
+
+    # Inset showing early evolution
+    if times_M[-1] > 100:
+        left, bottom, width, height = [0.55, 0.18, 0.35, 0.25]
+        ax2_inset = fig.add_axes([left, bottom, width, height])
+        ax2_inset.plot(times_M[mask_early], result['K_center'][mask_early], 'k-', linewidth=1)
+        ax2_inset.set_xlim(0, 100)
+        ax2_inset.set_xlabel('t/M', fontsize=10)
+        ax2_inset.axhline(y=0, color='gray', linestyle='--', alpha=0.5)
+        ax2_inset.grid(True, alpha=0.3)
+        ax2_inset.tick_params(labelsize=9)
+
+    plt.tight_layout()
+    if save_plots:
+        plt.savefig(f"{plot_dir}/baumgarte_fig1_phi_K_evolution.png", dpi=150, bbox_inches='tight')
+        print(f"  Saved: {plot_dir}/baumgarte_fig1_phi_K_evolution.png")
+    plt.close()
+
+
+def plot_baumgarte_fig2_convergence(results_list, resolutions, save_plots=True, plot_dir="hwh_plots"):
+    """
+    Replicate Baumgarte paper Figure 2: Convergence test for K at center.
+
+    Shows that the code converges to second order until surface effects
+    spoil convergence at later times (t > 1).
+
+    Args:
+        results_list: List of results dicts from different resolutions
+        resolutions: List of grid resolutions used (e.g., [16, 32, 64])
+    """
+    import os
+    if save_plots:
+        os.makedirs(plot_dir, exist_ok=True)
+
+    print("\nGenerating Baumgarte paper Figure 2: Convergence test...")
+
+    fig, ax = plt.subplots(figsize=(8, 6))
+
+    # Note: Analytic solution is K = 0
+    # We plot scaled errors to show second-order convergence
+
+    # Plot each resolution with appropriate scaling
+    # For second-order convergence, error should scale as h^2
+    # So when we multiply coarse grid by 4, 16, etc., scaled errors should overlap
+
+    n_res = len(resolutions)
+    colors = ['k-', 'k--', 'k:']
+    labels = []
+
+    for i, (res, Nr) in enumerate(zip(results_list, resolutions)):
+        times = res['times'] / res['TOV_Mass']
+        K_center = res['K_center']
+
+        # Calculate scaling factor relative to finest grid
+        if i == n_res - 1:
+            # Finest grid - no scaling
+            scaling = 1.0
+            label = f"16×({Nr})³"
+        elif i == n_res - 2:
+            # Middle resolution
+            scaling = 4.0
+            label = f"4×({Nr})³"
+        else:
+            # Coarsest resolution
+            scaling = 1.0
+            label = f"({Nr})³"
+
+        ax.plot(times, K_center * scaling, colors[i], linewidth=1.5, label=label)
+
+    ax.axhline(y=0, color='gray', linestyle='--', alpha=0.5)
+    ax.set_xlabel('t', fontsize=14)
+    ax.set_ylabel('K', fontsize=14)
+    ax.set_title('Convergence test for K at the center', fontsize=12)
+    ax.legend(loc='upper right', fontsize=11)
+    ax.grid(True, alpha=0.3)
+    ax.set_xlim(0, 3)
+
+    # Add annotation
+    ax.text(0.5, 0.05, 'Note that the analytic solution is K = 0',
+            transform=ax.transAxes, ha='left', fontsize=10, style='italic')
+
+    plt.tight_layout()
+    if save_plots:
+        plt.savefig(f"{plot_dir}/baumgarte_fig2_convergence.png", dpi=150, bbox_inches='tight')
+        print(f"  Saved: {plot_dir}/baumgarte_fig2_convergence.png")
+    plt.close()
+
+
+def plot_baumgarte_fig3_outer_boundary(results_list, ob_locations, save_plots=True, plot_dir="hwh_plots"):
+    """
+    Replicate Baumgarte paper Figure 3: K at center for different outer boundary locations.
+
+    Shows how outer boundary errors propagate inward and identifies
+    three sources of error:
+    1. Local finite-difference error (t ~ 0.4)
+    2. Surface effects (t ~ 2)
+    3. Outer boundary (t ~ 4 for OB=2)
+
+    Args:
+        results_list: List of results dicts with different outer boundaries
+        ob_locations: List of outer boundary locations (e.g., [1, 2, 4])
+    """
+    import os
+    if save_plots:
+        os.makedirs(plot_dir, exist_ok=True)
+
+    print("\nGenerating Baumgarte paper Figure 3: Outer boundary analysis...")
+
+    fig, ax = plt.subplots(figsize=(10, 6))
+
+    linestyles = ['k--', 'k-.', 'k-']
+    max_errors = []
+
+    for i, (res, ob) in enumerate(zip(results_list, ob_locations)):
+        times = res['times'] / res['TOV_Mass']
+        K_center = res['K_center']
+
+        label = f"OB at {ob}"
+        ax.plot(times, K_center, linestyles[i], linewidth=1.5, label=label)
+
+        # Find maximum error (where each OB starts affecting the solution)
+        # This happens when the domain of dependence reaches the center
+        if i < len(results_list) - 1:
+            # Find where this curve starts to deviate significantly from the next one
+            next_K = results_list[i + 1]['K_center']
+            min_len = min(len(K_center), len(next_K))
+            diff = np.abs(K_center[:min_len] - next_K[:min_len])
+            if len(diff) > 0:
+                max_idx = np.argmax(diff)
+                max_errors.append((times[max_idx], K_center[max_idx]))
+
+    # Plot dots marking maximum errors
+    for t, K in max_errors:
+        ax.plot(t, K, 'ko', markersize=6)
+
+    ax.axhline(y=0, color='gray', linestyle=':', alpha=0.5)
+    ax.set_xlabel('t', fontsize=14)
+    ax.set_ylabel('K', fontsize=14)
+    ax.set_title('Evolution of K at center for different outer boundary locations', fontsize=12)
+    ax.legend(loc='best', fontsize=11)
+    ax.grid(True, alpha=0.3)
+    ax.set_xlim(0, 8)
+
+    plt.tight_layout()
+    if save_plots:
+        plt.savefig(f"{plot_dir}/baumgarte_fig3_outer_boundary.png", dpi=150, bbox_inches='tight')
+        print(f"  Saved: {plot_dir}/baumgarte_fig3_outer_boundary.png")
+    plt.close()
+
+
 def run_convergence_test(resolutions=[72, 96], cfl=0.1, plot=True):
     """
     Run convergence 
@@ -721,7 +915,7 @@ if __name__ == "__main__":
     result = run_hwh_test(
         gamma=2.0,            # Polytropic index (n=1)
         K=1.0,                # Polytropic constant
-        rho_central=0.129285, # Central density
+        rho_central=0.2,      # Central density (Baumgarte paper)
         cfl=0.1,              # CFL factor
         dr=0.02,              # Spatial resolution
         progress=True         # Show progress
@@ -730,10 +924,13 @@ if __name__ == "__main__":
     # Generate plots
     plot_hwh_results(result, save_plots=True)
 
-    # Option 2: Convergence test 
+    # Generate Baumgarte paper Figure 1
+    plot_baumgarte_paper_figures(result, save_plots=True)
+
+    # Option 2: Convergence test
     print("\nOption 2: Running convergence test...")
     convergence_results = run_convergence_test(
-        resolutions=[72, 96],  
+        resolutions=[72, 96],
         cfl=0.1,
         plot=True
     )

@@ -11,12 +11,7 @@ Classes:
 import numpy as np
 from typing import Tuple, Optional
 
-from source.bssn.tensoralgebra import (
-    SPACEDIM,
-    get_bar_gamma_LL,
-    get_bar_A_LL,
-    get_hat_D_bar_gamma_LL,
-)
+from source.bssn.tensoralgebra import SPACEDIM, get_bar_gamma_LL, get_bar_A_LL, get_hat_D_bar_gamma_LL
 from source.core.spacing import NUM_GHOSTS
 from source.matter.hydro.geometry import ADMGeometry, ValenciaGeometry
 from source.matter.hydro.stress_energy import StressEnergyTensor
@@ -95,14 +90,32 @@ class GRHDEquations:
         rhs_D, rhs_S, rhs_tau : np.ndarray
             Right-hand sides for conservative evolution
         """
+        # CRITICAL: Enforce v^r = 0 at origin for spherical symmetry
+        # Even tiny numerical drift (v^r ~ 1e-6) gets amplified by large
+        # Christoffel symbols (Γ ~ 200/M) near origin, creating spurious
+        # connection terms that act as mass sources and cause density to drift.
+        if self.boundary_mode == "parity" and spacetime_mode != "fixed_minkowski":
+            v_U[NUM_GHOSTS, 0] = 0.0  # Force v^r = 0 at r ≈ 0 (first interior cell)
+
+            # CRITICAL: Recalculate W and h with the corrected v_U
+            # The W passed from perfect_fluid was computed BEFORE this fix, so it's inconsistent.
+            # Using inconsistent W in connection terms creates spurious mass sources.
+            v_squared = np.einsum('xij,xi,xj->x', geometry.gamma_LL, v_U, v_U)
+            W[NUM_GHOSTS] = 1.0 / np.sqrt(np.maximum(1.0 - v_squared[NUM_GHOSTS], 1e-16))
+
+            # Recalculate h at origin (W changed, so h = 1 + eps + P/rho needs W for consistency)
+            if self.eos is not None:
+                eps_center = self.eos.eps_from_rho_p(rho0[NUM_GHOSTS], pressure[NUM_GHOSTS])
+                h[NUM_GHOSTS] = 1.0 + eps_center + pressure[NUM_GHOSTS] / np.maximum(rho0[NUM_GHOSTS], 1e-30)
+
         # Step 1: Reconstruct primitives and convert to conservatives
         UL, UR, primL, primR = self.reconstruct_and_convert(
-            rho0, v_U[:, 0], pressure, r, reconstructor, geometry
+            rho0, v_U[:, 0], pressure, r, reconstructor, geometry, spacetime_mode
         )
 
         # Step 2: Solve Riemann problem and get fluxes
         F_D, F_S, F_tau = self.solve_riemann_and_densitize(
-            UL, UR, primL, primR, geometry, riemann_solver, spacetime_mode
+            UL, UR, primL, primR, geometry, riemann_solver, spacetime_mode, bssn_vars
         )
 
         # Step 3: Compute divergence of fluxes
@@ -111,13 +124,17 @@ class GRHDEquations:
         rhs_D, rhs_S, rhs_tau = self.compute_divergence(F_D, F_S, F_tau, geometry.dr)
 
         # Step 3.2: Add connection term contributions from divergence
-        if spacetime_mode != 'fixed_minkowski':
-            conn_D, conn_S, conn_tau = self.compute_connection_terms(
-                rho0, v_U, pressure, W, h, geometry, background.hat_christoffel
-            )
-            rhs_D += conn_D
-            rhs_S += conn_S
-            rhs_tau += conn_tau
+        # CRITICAL: Always compute connection terms, even in Minkowski spacetime.
+        # In spherical coordinates (or any curvilinear system), the reference metric
+        # Christoffel symbols Γ̂^i_{jk} are non-zero and provide essential geometric terms.
+        # For example, the "hoop stress" term 2p/r in spherical blast waves comes from
+        # connection terms, NOT from explicit source terms.
+        conn_D, conn_S, conn_tau = self.compute_connection_terms(
+            rho0, v_U, pressure, W, h, geometry, background.hat_christoffel
+        )
+        rhs_D += conn_D
+        rhs_S += conn_S
+        rhs_tau += conn_tau
 
         # Step 4: Add geometric source terms
         if spacetime_mode == 'dynamic':
@@ -176,7 +193,8 @@ class GRHDEquations:
 
     def reconstruct_and_convert(self, rho0: np.ndarray, v_primary: np.ndarray,
                                 pressure: np.ndarray, r: np.ndarray,
-                                reconstructor, geometry: ValenciaGeometry) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+                                reconstructor, geometry: ValenciaGeometry,
+                                spacetime_mode: str) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
         """
         Reconstruct primitive variables and convert to conservatives at cell faces.
 
@@ -194,6 +212,8 @@ class GRHDEquations:
             Reconstruction method object
         geometry : ValenciaGeometry
             Geometry with metric at faces
+        spacetime_mode : str
+            'fixed_minkowski', 'fixed', or 'dynamic'
 
         Returns
         -------
@@ -203,7 +223,12 @@ class GRHDEquations:
             Left/right primitive states at faces (N_faces, 3)
         """
         # Determine boundary condition type for reconstruction
-        recon_boundary = "reflecting" if self.boundary_mode == "parity" else "open"
+        # Determine boundary type for reconstruction
+        # CRITICAL: Use reflecting ONLY for parity boundaries in non-Minkowski spacetime
+        # In Minkowski (spacetime_mode=="fixed_minkowski"), always use outflow to avoid
+        # spurious reflections that contaminate the Sod shock test
+        use_reflecting = (self.boundary_mode == "parity" and spacetime_mode != "fixed_minkowski")
+        recon_boundary = "reflecting" if use_reflecting else "outflow"
 
         # Reconstruct primitives to cell interfaces
         (rhoL, vL, pL), (rhoR, vR, pR) = reconstructor.reconstruct_primitive_variables(
@@ -228,18 +253,18 @@ class GRHDEquations:
                 pL[0] = p_ref
                 pR[0] = p_ref
 
+        # Interpolate metric to cell faces (arithmetic average)
+        # geometry.gamma_LL has shape (N, 3, 3), we need (N-1, 3, 3) at faces
+        gamma_LL_f = 0.5 * (geometry.gamma_LL[:-1] + geometry.gamma_LL[1:])  # (N-1, 3, 3)
+        gamma_primary_primary_f = gamma_LL_f[:, 0, 0]  # γ_rr at faces (N-1,)
+
         # Apply physical limiters if available
         if hasattr(reconstructor, "apply_physical_limiters"):
-            # Get metric at faces (primary direction)
-            gamma_rr_f = geometry.gamma_LL[:, 0, 0] if hasattr(geometry.gamma_LL, 'shape') else np.ones(len(rhoL))
             (rhoL, vL, pL), (rhoR, vR, pR) = reconstructor.apply_physical_limiters(
                 (rhoL, vL, pL), (rhoR, vR, pR),
                 atmosphere=self.atmosphere,
-                gamma_rr=gamma_rr_f
+                gamma_rr=gamma_primary_primary_f  # Now has correct shape (N-1,)
             )
-
-        # Get metric component at faces for cons conversion
-        gamma_primary_primary_f = geometry.gamma_LL[:, 0, 0] if hasattr(geometry.gamma_LL, 'shape') else np.ones(len(rhoL))
 
         # Convert primitives to conservatives at interfaces
         UL_D, UL_S_primary, UL_tau = prim_to_cons(
@@ -260,7 +285,7 @@ class GRHDEquations:
     def solve_riemann_and_densitize(self, UL_batch: np.ndarray, UR_batch: np.ndarray,
                                     primL_batch: np.ndarray, primR_batch: np.ndarray,
                                     geometry: ValenciaGeometry, riemann_solver,
-                                    spacetime_mode: str) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+                                    spacetime_mode: str, bssn_vars) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
         """
         Solve Riemann problem and apply densitization.
 
@@ -282,11 +307,20 @@ class GRHDEquations:
         F_D_face, F_S_tildeD_face, F_tau_face : np.ndarray
             Densitized fluxes at cell faces
         """
-        # Extract face geometry (for now use cell-center values)
-        alpha_f = geometry.alpha
-        beta_primary_f = geometry.beta_U[:, 0]
-        gamma_primary_primary_f = geometry.gamma_LL[:, 0, 0]
-        e6phi_f = geometry.e6phi
+        # Interpolate geometry to cell faces (arithmetic average)
+        # All geometry arrays have shape (N,), we need (N-1,) at faces
+        alpha_f = 0.5 * (geometry.alpha[:-1] + geometry.alpha[1:])
+        beta_U_f = 0.5 * (geometry.beta_U[:-1] + geometry.beta_U[1:])
+        beta_primary_f = beta_U_f[:, 0]  # Extract primary component
+        gamma_LL_f = 0.5 * (geometry.gamma_LL[:-1] + geometry.gamma_LL[1:])
+        gamma_primary_primary_f = gamma_LL_f[:, 0, 0]
+
+        # CRITICAL FIX: Interpolate φ to faces FIRST, then compute exp(6φ)
+        # This ensures exact cancellation with connection terms
+        # Original: exp(6·φ_face), NOT 0.5*(e6φ_i + e6φ_{i+1})
+        phi_arr = np.asarray(bssn_vars.phi, dtype=float)
+        phi_face = 0.5 * (phi_arr[:-1] + phi_arr[1:])
+        e6phi_f = np.exp(6.0 * phi_face)
 
         # Solve Riemann problem to get physical fluxes
         F_phys_batch = riemann_solver.solve_batch(
@@ -299,6 +333,7 @@ class GRHDEquations:
         F_batch = dens_factor[:, None] * F_phys_batch
 
         # Enforce zero momentum flux at the r≈0 interface (spherical boundary)
+        # This is the last guard against numerical drift creating spurious fluxes at origin
         if self.boundary_mode == "parity" and spacetime_mode != "fixed_minkowski":
             if len(F_batch) > 0:
                 F_batch[0, 1] = 0.0  # F_Sr = 0 at the r≈0 interface
@@ -330,7 +365,7 @@ class GRHDEquations:
         """
         Compute Christoffel connection contributions to RHS.
 
-        Connection form (NRPy+):
+        Connection form ( +):
             D, τ:   -Γ̂^k_{ki} F̃^i
             S_i:    -Γ̂^k_{kj} F̃^j_i + Γ̂^l_{ji} F̃^j_l
 
@@ -354,14 +389,17 @@ class GRHDEquations:
         gamma_LL = geometry.gamma_LL
         gamma_UU = geometry.gamma_UU
 
-        # Compute 4-velocity components
+        # Compute 4-velocity components (Valencia formulation)
+        # In Valencia form: u^i = W v^i (NOT coordinate form u^i = W v^i - β^i u^0)
         u4U = np.zeros((N, 4))
         u4U[:, 0] = W / alpha  # u^0
         for i in range(SPACEDIM):
-            u4U[:, i+1] = W * v_U[:, i] - geometry.beta_U[:, i] * u4U[:, 0]  # u^i
+            u4U[:, i+1] = W * v_U[:, i]  # u^i = W v^i (Valencia form)
 
         # Compute stress-energy tensor components needed for fluxes
-        factor = rho0 * h * W**2
+        # CRITICAL: factor = ρ₀ h (NOT ρ₀ h W²) because u^μ already contains W factors
+        # u^0 = W/α, u^i = W v^i, so T^{μν} = (ρ₀ h) u^μ u^ν already has W² when expanded
+        factor = rho0 * h
 
         # Conservative density flux
         rho_star = alpha * e6phi * rho0 * u4U[:, 0]
@@ -372,22 +410,27 @@ class GRHDEquations:
             fD_U[:, j] = rho_star * v_U[:, j]
 
         # Energy (tau) partial flux vector
-        # Compute T^0j first
+        # Compute T^0j = ρ₀ h u^0 u^j + P g^{0j}, where g^{0j} = β^j / α²
         T0j = np.zeros((N, SPACEDIM))
+        g4UU_0j = geometry.beta_U / (alpha[:, None] ** 2)  # g^{0j} = β^j / α²
         for j in range(SPACEDIM):
-            T0j[:, j] = factor * u4U[:, 0] * u4U[:, j+1]
+            T0j[:, j] = (factor * u4U[:, 0] * u4U[:, j+1] +
+                         pressure * g4UU_0j[:, j])  # CRITICAL: pressure term
 
         fTau_U = np.zeros((N, SPACEDIM))
         for j in range(SPACEDIM):
             fTau_U[:, j] = alpha ** 2 * e6phi * T0j[:, j] - rho_star * v_U[:, j]
 
         # Momentum partial flux tensor F̃^j_i = α e^{6φ} T^j_i
-        # First compute T^ij
+        # First compute T^ij = ρ₀ h u^i u^j + P g^{ij}, where g^{ij} = γ^{ij} - β^i β^j / α²
+        g4UU_spatial = (gamma_UU -
+                        np.einsum('xi,xj->xij', geometry.beta_U, geometry.beta_U) / (alpha[:, None, None] ** 2))
+
         Tij_UU = np.zeros((N, SPACEDIM, SPACEDIM))
         for i in range(SPACEDIM):
             for j in range(SPACEDIM):
                 Tij_UU[:, i, j] = (factor * u4U[:, i+1] * u4U[:, j+1] +
-                                   pressure * gamma_UU[:, i, j])
+                                   pressure * g4UU_spatial[:, i, j])  # Use 4D spatial metric
 
         # Convert to mixed T^j_i
         Tij_UD = np.zeros((N, SPACEDIM, SPACEDIM))
@@ -564,13 +607,51 @@ class GRHDEquations:
 
         # Term 2: T^0_j ∇̂_i β^j (shift covariant derivative)
         # ∇̂_i β^j = ∂_i β^j + Γ̂^j_{ik} β^k
-        d_beta = np.asarray(bssn_d1.shift_U, dtype=float)
+        # CRITICAL: Apply product rule for β^j = shift_rescaled^j × inverse_scaling^j
+        # ∂_i β^j = inverse_scaling^j × ∂_i(shift_rescaled^j) + shift_rescaled^j × ∂_i(inverse_scaling^j)
+
+        # Get shift derivatives from BSSN
+        if hasattr(bssn_d1, 'shift_U') and bssn_d1.shift_U is not None:
+            shift_d1 = np.asarray(bssn_d1.shift_U, dtype=float)  # ∂_j(shift_rescaled^i)
+        else:
+            # No shift derivatives available - assume zero
+            shift_d1 = np.zeros((N, SPACEDIM, SPACEDIM))
+
+        # Get rescaled shift from BSSN (to apply product rule)
+        if hasattr(bssn_vars, 'shift_U') and bssn_vars.shift_U is not None:
+            shift_rescaled = np.asarray(bssn_vars.shift_U, dtype=float)
+            # Handle 1D case (only radial component)
+            if shift_rescaled.ndim == 1:
+                shift_rescaled_2d = np.zeros((N, SPACEDIM))
+                shift_rescaled_2d[:, 0] = shift_rescaled
+                shift_rescaled = shift_rescaled_2d
+        else:
+            # Compute from physical shift (reverse scaling)
+            if hasattr(background, 'inverse_scaling_vector') and np.any(background.inverse_scaling_vector != 0):
+                shift_rescaled = beta_U / background.inverse_scaling_vector
+            else:
+                shift_rescaled = beta_U
+
+        dbeta_dx = np.zeros((N, SPACEDIM, SPACEDIM))
+
+        # Apply product rule if background has d1_inverse_scaling_vector
+        if hasattr(background, 'd1_inverse_scaling_vector') and hasattr(background, 'inverse_scaling_vector'):
+            for i in range(SPACEDIM):
+                for j in range(SPACEDIM):
+                    dbeta_dx[:, i, j] = (
+                        background.inverse_scaling_vector[:, i] * shift_d1[:, i, j] +
+                        shift_rescaled[:, i] * background.d1_inverse_scaling_vector[:, i, j]
+                    )
+        else:
+            # Fallback: no scaling correction (flat spacetime)
+            dbeta_dx = shift_d1
+
         hat_chris = background.hat_christoffel
         hatD_beta = np.zeros((N, SPACEDIM, SPACEDIM))
 
         for i in range(SPACEDIM):
             for j in range(SPACEDIM):
-                cov_deriv_beta = d_beta[:, j, i]
+                cov_deriv_beta = dbeta_dx[:, i, j]
                 for k in range(SPACEDIM):
                     cov_deriv_beta += hat_chris[:, j, i, k] * beta_U[:, k]
                 hatD_beta[:, i, j] = cov_deriv_beta
@@ -581,16 +662,25 @@ class GRHDEquations:
         # where ∂_i γ̄_{jk} = Γ̂_{jik} + Γ̂_{kij} from reference metric
         d_phi = np.asarray(bssn_d1.phi, dtype=float)
 
+        # CRITICAL FIX: Compute bar_gamma_LL (conformal metric), not just h_LL (deviation)
+        # The formula requires γ̄_{jk}, which is the FULL conformal metric, not just the deviation
+        bar_gamma_LL = get_bar_gamma_LL(r, h_LL, background)
+
         if hasattr(background, 'hat_D_gamma'):
             hat_D_gamma = background.hat_D_gamma
         else:
-            hat_D_gamma = get_hat_D_bar_gamma_LL(h_LL, hat_chris)
+            d1_h = getattr(bssn_d1, 'hDD', getattr(bssn_d1, 'h_LL', None))
+            hat_D_gamma = get_hat_D_bar_gamma_LL(r, h_LL, d1_h, background)
 
         for i in range(SPACEDIM):
             for j in range(SPACEDIM):
                 for k in range(SPACEDIM):
-                    cov_deriv_gamma = e4phi * (hat_D_gamma[:, i, j, k] +
-                                               4.0 * h_LL[:, j, k] * d_phi[:, i])
+                    # CRITICAL FIX: Correct index order for ∇̂_i γ̄_{jk}
+                    # hat_D_gamma has shape (N, 3, 3, 3) with indices [x, m, n, p] = ∇̂_p γ̄_{mn}
+                    # To get ∇̂_i γ̄_{jk}, we need hat_D_gamma[:, j, k, i]
+                    # CRITICAL FIX: Use bar_gamma_LL (full conformal metric), not h_LL (deviation)
+                    cov_deriv_gamma = e4phi * (hat_D_gamma[:, j, k, i] +
+                                               4.0 * bar_gamma_LL[:, j, k] * d_phi[:, i])
                     third_term[:, i] += 0.5 * stress_block[:, j, k] * cov_deriv_gamma
 
         total_momentum_term = first_term + second_term + third_term

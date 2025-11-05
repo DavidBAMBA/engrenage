@@ -1,5 +1,5 @@
 """
-TOV solver in isotropic coordinates (NRPy-inspired).
+TOV solver in isotropic coordinates ( -inspired).
 
 This module integrates the TOV equations in Schwarzschild radius R,
 while simultaneously evolving the isotropic radius r_bar via
@@ -151,7 +151,7 @@ class TOVSolverISO:
         M_star = M_arr[-1]
 
         # Fix integration constant so that rbar is continuous across surface
-        # Following NRPy: multiply by factor so that rbar matches exterior mapping at R_surf
+        # Following  : multiply by factor so that rbar matches exterior mapping at R_surf
         # Exterior mapping: rbar(R) = 0.5 * (sqrt(R(R-2M)) + R - M)
         rbar_surf_target = 0.5 * (np.sqrt(max(R_surf * (R_surf - 2.0 * M_star), 0.0)) + R_surf - M_star)
         if rbar_arr[-1] > 0:

@@ -15,7 +15,7 @@ def test_valencia_rhs_decomposition_matches_full_rhs():
     from source.core.grid import Grid
     from source.core.statevector import StateVector
     from source.backgrounds.sphericalbackground import FlatSphericalBackground
-    from source.matter.hydro.perfect_fluid import PerfectFluid
+    from source.matter.perfect_fluid import PerfectFluid
     from source.matter.hydro.eos import IdealGasEOS
     from source.matter.hydro.riemann import HLLRiemannSolver
     from source.matter.hydro.reconstruction import create_reconstruction
@@ -25,8 +25,8 @@ def test_valencia_rhs_decomposition_matches_full_rhs():
     from source.bssn.tensoralgebra import get_bar_gamma_LL
     from source.matter.hydro.grhd_equations import GRHDEquations
     from source.matter.hydro.stress_energy import StressEnergyTensor, StressEnergyTensor4D
-    from examples.tov_solver import TOVSolver
-    import examples.tov_initial_data_interpolated as tov_id
+    from examples.TOV.tov_solver import TOVSolver
+    import examples.TOV.tov_initial_data_interpolated as tov_id
 
     # Configuration (moderate size for runtime)
     r_max = 16.0
@@ -135,7 +135,7 @@ def test_valencia_rhs_decomposition_matches_full_rhs():
         rho0, v_U, p, W, h, val_geom, bssn, bssn_d1, background, hydro.spacetime_mode, r, return_debug=True
     )
 
-    # Connection terms (NRPy form)
+    # Connection terms (  form)
     # u^μ and T^{μν}
     u4U = adm_geom.compute_4velocity(v_U, W)
     stress = StressEnergyTensor(adm_geom, rho0, v_U, p, W, h)

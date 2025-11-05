@@ -38,7 +38,7 @@ from source.bssn.bssnvars import BSSNVars
 from source.bssn.bssnstatevariables import NUM_BSSN_VARS, idx_phi, idx_K, idx_lapse
 
 # Hidro (tus módulos)
-from source.matter.hydro.perfect_fluid import PerfectFluid           # ← usa Valencia ref-metric :contentReference[oaicite:6]{index=6}
+from source.matter.perfect_fluid import PerfectFluid           # ← usa Valencia ref-metric :contentReference[oaicite:6]{index=6}
 from source.matter.hydro.eos import PolytropicEOS                    # ← EOS politrópica                :contentReference[oaicite:7]{index=7}
 from source.matter.hydro.reconstruction import create_reconstruction # ← reconstructores (MP5/WENOZ)    :contentReference[oaicite:8]{index=8}
 from source.matter.hydro.riemann import HLLRiemannSolver             # ← Riemann HLL                    :contentReference[oaicite:9]{index=9}

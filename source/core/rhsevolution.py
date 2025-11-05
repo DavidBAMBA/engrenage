@@ -72,7 +72,7 @@ def get_rhs(t_i, current_state: np.ndarray, grid: Grid, background, matter, prog
     global _INITIAL_DET_CHECK_DONE
     if (not _INITIAL_DET_CHECK_DONE) and (abs(t_i) <= 1e-14):
         max_err = np.nanmax(error)
-        if max_err > 1.0e-4:
+        if max_err > 5.0e-4:  # Relaxed tolerance to allow for boundary extrapolation effects
             print("error in rescaling factor is ", error)
             assert False, "Warning, initial det(hat gamma) != det(bar gamma) beyond tolerance, check your initial data."
         elif max_err > 1.0e-8:

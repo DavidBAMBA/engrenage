@@ -9,13 +9,13 @@ def _build_initial_data(N=300, r_max=16.0, K=100.0, Gamma=2.0, rho_c=1.28e-3,
     from source.core.grid import Grid
     from source.core.statevector import StateVector
     from source.backgrounds.sphericalbackground import FlatSphericalBackground
-    from source.matter.hydro.perfect_fluid import PerfectFluid
+    from source.matter.perfect_fluid import PerfectFluid
     from source.matter.hydro.eos import IdealGasEOS
     from source.matter.hydro.atmosphere import AtmosphereParams
     from source.bssn.bssnvars import BSSNVars
     from source.bssn.bssnstatevariables import NUM_BSSN_VARS
-    from examples.tov_solver import TOVSolver
-    import examples.tov_initial_data_interpolated as tov_id
+    from examples.TOV.tov_solver import TOVSolver
+    import examples.TOV.tov_initial_data_interpolated as tov_id
 
     spacing = LinearSpacing(N, r_max)
     eos = IdealGasEOS(gamma=Gamma)
@@ -30,7 +30,6 @@ def _build_initial_data(N=300, r_max=16.0, K=100.0, Gamma=2.0, rho_c=1.28e-3,
     state = tov_id.create_initial_data_interpolated(
         tov, grid, background, eos,
         atmosphere=atmosphere,
-        polytrope_K=K, polytrope_Gamma=Gamma,
         interp_order=11
     )
 

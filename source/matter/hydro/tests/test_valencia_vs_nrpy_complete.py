@@ -1,5 +1,5 @@
 """
-Complete comparison: Valencia vs NRPy GRHD_equations.py
+Complete comparison: Valencia vs   GRHD_equations.py
 
 Compares ALL intermediate quantities:
 1. Stress-energy tensors T^μν and T^μ_ν
@@ -7,7 +7,7 @@ Compares ALL intermediate quantities:
 3. Connection terms (density, energy, momentum)
 4. Source terms (energy and momentum, with sub-terms)
 
-Reference: nrpy/nrpy/equations/grhd/GRHD_equations.py
+Reference:  / /equations/grhd/GRHD_equations.py
 """
 
 import numpy as np
@@ -67,7 +67,7 @@ def compare_tensor(name, val1, val2, tolerance=1e-12):
                 print(f"  Component ({i},{j}): {diff_ij:.3e}")
     return diff < tolerance
 
-print_section("COMPLETE VALENCIA VS NRPY COMPARISON")
+print_section("COMPLETE VALENCIA VS   COMPARISON")
 
 # ============================================================================
 # SETUP
@@ -149,9 +149,9 @@ src_S_val, src_tau_val, debug_val = grhd_val.compute_source_terms(
 print(f"  Valencia initialized successfully")
 
 # ============================================================================
-# INITIALIZE NRPY
+# INITIALIZE  
 # ============================================================================
-print_subsection("Initializing NRPy equations")
+print_subsection("Initializing   equations")
 
 grhd = GRHD_Equations_NumPy(N)
 
@@ -184,7 +184,7 @@ u4U_val = adm_geom.compute_4velocity(v_U, W)
 # u4U should be (N, 4) array with [u^0, u^1, u^2, u^3]
 grhd.u4U = u4U_val
 
-print(f"  NRPy initialized successfully")
+print(f"    initialized successfully")
 
 # ============================================================================
 # PART 1: STRESS-ENERGY TENSORS
@@ -234,7 +234,7 @@ valencia.compute_rhs(
     eos, None, reconstructor, riemann_solver
 )
 
-# Compute NRPy fluxes
+# Compute   fluxes
 grhd.compute_rho_star()
 grhd.compute_rho_star_fluxU()
 grhd.compute_tau_tilde_fluxU()
@@ -260,12 +260,12 @@ grhd.compute_rho_star__Ye_star__and_tau_connection_terms()
 grhd.compute_S_tilde_connection_termsD()
 
 print_subsection("3.1 Density connection term")
-print("  Note: Valencia uses -Γ̂^k_{kj} F^j convention, NRPy uses +Γ̂^k_{kj} F^j")
+print("  Note: Valencia uses -Γ̂^k_{kj} F^j convention,   uses +Γ̂^k_{kj} F^j")
 print("        Comparing with sign flip...")
 compare_scalar("Γ̂^k_{kj} F^j_ρ", -valencia._debug_connection_density, grhd.rho_star_connection_term)
 
 print_subsection("3.2 Energy connection term")
-print("  Note: Valencia uses -Γ̂^k_{kj} F^j convention, NRPy uses +Γ̂^k_{kj} F^j")
+print("  Note: Valencia uses -Γ̂^k_{kj} F^j convention,   uses +Γ̂^k_{kj} F^j")
 print("        Comparing with sign flip...")
 compare_scalar("Γ̂^k_{kj} F^j_τ", -valencia._debug_connection_energy, grhd.tau_connection_term)
 
@@ -295,11 +295,11 @@ compare_scalar("S_τ: Total (α e^6φ × sum)", debug_val["energy_total"], grhd.
 # Momentum source
 print_subsection("4.2 Momentum source term")
 
-# Need to set up betaU_dD and gamma derivatives for NRPy
+# Need to set up betaU_dD and gamma derivatives for  
 betaU_dD_val = (background.d1_inverse_scaling_vector * bssn_vars.shift_U[:, :, np.newaxis]
                 + bssn_d1.shift_U * background.inverse_scaling_vector[:, :, np.newaxis])
-betaU_dD_nrpy = betaU_dD_val.transpose(0, 2, 1)  # NRPy convention
-grhd.betaU_dD = betaU_dD_nrpy
+betaU_dD_  = betaU_dD_val.transpose(0, 2, 1)  #   convention
+grhd.betaU_dD = betaU_dD_ 
 
 # Compute gammabarDD and derivatives
 gammabarDD = bar_gamma_LL  # This is already the conformal metric γ̄_{ij}
@@ -335,19 +335,19 @@ print(f"    ∂_r β^φ diff: {np.max(np.abs(val_d1_Shift_test[:, i_p, i_r] - be
 # Compute Valencia's ∇̂_i β^j for comparison
 val_hatD_beta_test = debug_val["hatD_beta"]
 
-# NRPy computes it implicitly in the loop, let's reconstruct it
-# Careful: NRPy uses GammahatUDD which we set to background.hat_christoffel
-nrpy_hatD_beta_test = np.zeros((N, SPACEDIM, SPACEDIM))
+#   computes it implicitly in the loop, let's reconstruct it
+# Careful:   uses GammahatUDD which we set to background.hat_christoffel
+ _hatD_beta_test = np.zeros((N, SPACEDIM, SPACEDIM))
 for i in range(SPACEDIM):
     for j in range(SPACEDIM):
-        nrpy_hatD_beta_test[:, i, j] = betaU_dD_nrpy[:, j, i]  # ∂_i β^j
+         _hatD_beta_test[:, i, j] = betaU_dD_ [:, j, i]  # ∂_i β^j
         for k in range(SPACEDIM):
-            nrpy_hatD_beta_test[:, i, j] += grhd.GammahatUDD[:, j, i, k] * grhd.betaU[:, k]
+             _hatD_beta_test[:, i, j] += grhd.GammahatUDD[:, j, i, k] * grhd.betaU[:, k]
 
-print(f"    ∇̂_r β^r diff: {np.max(np.abs(val_hatD_beta_test[:, i_r, i_r] - nrpy_hatD_beta_test[:, i_r, i_r])):.6e}")
-print(f"    ∇̂_r β^θ diff: {np.max(np.abs(val_hatD_beta_test[:, i_r, i_t] - nrpy_hatD_beta_test[:, i_r, i_t])):.6e}")
-print(f"    ∇̂_r β^φ diff: {np.max(np.abs(val_hatD_beta_test[:, i_r, i_p] - nrpy_hatD_beta_test[:, i_r, i_p])):.6e}")
-print(f"    Overall ∇̂_i β^j diff: {np.max(np.abs(val_hatD_beta_test - nrpy_hatD_beta_test)):.6e}")
+print(f"    ∇̂_r β^r diff: {np.max(np.abs(val_hatD_beta_test[:, i_r, i_r] -  _hatD_beta_test[:, i_r, i_r])):.6e}")
+print(f"    ∇̂_r β^θ diff: {np.max(np.abs(val_hatD_beta_test[:, i_r, i_t] -  _hatD_beta_test[:, i_r, i_t])):.6e}")
+print(f"    ∇̂_r β^φ diff: {np.max(np.abs(val_hatD_beta_test[:, i_r, i_p] -  _hatD_beta_test[:, i_r, i_p])):.6e}")
+print(f"    Overall ∇̂_i β^j diff: {np.max(np.abs(val_hatD_beta_test -  _hatD_beta_test)):.6e}")
 
 compare_vector("S_{S_i}: -T^00 α ∂_i α term",
                debug_val["momentum_T00_alpha"],

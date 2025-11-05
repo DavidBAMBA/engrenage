@@ -87,7 +87,7 @@ def get_constraints_diagnostic(states_over_time, t, grid: Grid, background, matt
                          - 2.0 * eight_pi_G * my_emtensor.rho)
 
 
-        # Get the Mom constraint eqn (47) of NRPy+ https://arxiv.org/abs/1712.07658
+        # Get the Mom constraint eqn (47) of  + https://arxiv.org/abs/1712.07658
         Mom[i,:,:] = em4phi[:,np.newaxis] * (
                               np.einsum('xil,xjm,xlmj->xi', bar_gamma_UU, bar_gamma_UU, s_times_d1_a)
                             + np.einsum('xil,xjm,xlmj->xi', bar_gamma_UU, bar_gamma_UU, a_times_d1_s)

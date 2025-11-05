@@ -1,9 +1,9 @@
 """
-NumPy implementation of NRPy's GRHD_equations.py
+NumPy implementation of  's GRHD_equations.py
 
 This module provides numerical (NumPy-based) implementations of the GRHD equations
 that exactly match the symbolic expressions in:
-    nrpy/nrpy/equations/grhd/GRHD_equations.py
+     / /equations/grhd/GRHD_equations.py
 
 Each function is a direct translation from SymPy to NumPy, preserving:
 - The exact same function names
@@ -11,7 +11,7 @@ Each function is a direct translation from SymPy to NumPy, preserving:
 - The exact same loop structure
 - The exact same computation order
 
-Reference: Terrence Pierre Jacques, NRPy+ GRHD implementation
+Reference: Terrence Pierre Jacques,  + GRHD implementation
 Author: Terrence Pierre Jacques
         terrencepierrej **at** gmail **dot* com
 """
@@ -25,12 +25,12 @@ SPACEDIM = 3
 
 class GRHD_Equations_NumPy:
     """
-    Numerical implementation of GRHD equations matching NRPy's GRHD_Equations class.
+    Numerical implementation of GRHD equations matching  's GRHD_Equations class.
 
     This class computes all hydrodynamical quantities using NumPy arrays instead of
     SymPy expressions, but follows the exact same computational structure.
 
-    Corresponds to: nrpy/nrpy/equations/grhd/GRHD_equations.py lines 35-409
+    Corresponds to:  / /equations/grhd/GRHD_equations.py lines 35-409
     """
 
     def __init__(self, N: int):

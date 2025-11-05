@@ -31,7 +31,7 @@ from source.bssn.bssnvars import BSSNVars
 from source.bssn.bssnstatevariables import NUM_BSSN_VARS, idx_phi, idx_K, idx_lapse
 
 # Hydro
-from source.matter.hydro.perfect_fluid import PerfectFluid
+from source.matter.perfect_fluid import PerfectFluid
 from source.matter.hydro.eos import IdealGasEOS
 from source.matter.hydro.reconstruction import create_reconstruction
 from source.matter.hydro.riemann import HLLRiemannSolver

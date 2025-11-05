@@ -2,10 +2,10 @@
 Centralized atmosphere and floor management for relativistic hydrodynamics.
 
 This module provides a unified interface for atmospheric parameters and floor
-application strategies, following the IllinoisGRMHD/NRPy+ approach.
+application strategies, following the   / + approach.
 
 References:
-    - IllinoisGRMHD: apply_tau_floor__enforce_limits_on_primitives_and_recompute_conservs.C
+    -   : apply_tau_floor__enforce_limits_on_primitives_and_recompute_conservs.C
     - Etienne et al. (2012): https://arxiv.org/pdf/1112.0568.pdf (Appendix A)
 """
 
@@ -20,7 +20,7 @@ class AtmosphereParams:
     Centralized atmospheric parameters for hydrodynamics.
 
     These parameters control floors, ceilings, and fallback values throughout
-    the hydrodynamics evolution pipeline, following IllinoisGRMHD/NRPy.
+    the hydrodynamics evolution pipeline, following   / .
 
     Attributes
     ----------
@@ -35,7 +35,7 @@ class AtmosphereParams:
     tau_atm_factor : float
         Safety factor for tau atmosphere: tau_atm = factor * p_floor. Default: 1.0
     conservative_floor_safety : float
-        Safety factor for conservative variable floors (0.999999 in IllinoisGRMHD)
+        Safety factor for conservative variable floors (0.999999 in   )
     mb : float
         Baryon mass for ideal gas EOS (in geometric units). Default: 1.0
 
@@ -53,7 +53,7 @@ class AtmosphereParams:
     # Primary floors
     rho_floor: float = 1e-10
     p_floor: float = 1e-11
-    # No explicit temperature or threshold here; NRPy floors rely on
+    # No explicit temperature or threshold here;   floors rely on
     # p_floor and rho_floor directly.
 
     # Velocity and Lorentz factor limits
@@ -73,7 +73,7 @@ class AtmosphereParams:
             raise ValueError(f"rho_floor must be positive, got {self.rho_floor}")
         if self.p_floor <= 0:
             raise ValueError(f"p_floor must be positive, got {self.p_floor}")
-        # No temperature or rho_threshold checks in NRPy-style params
+        # No temperature or rho_threshold checks in  -style params
         if not 0 < self.v_max < 1:
             raise ValueError(f"v_max must be in (0, 1), got {self.v_max}")
         if self.W_max <= 1:
@@ -100,7 +100,7 @@ class FloorApplicator:
     """
     Applies intelligent floors to conservative and primitive variables.
 
-    Implements the IllinoisGRMHD strategy:
+    Implements the    strategy:
     1. Apply primitive variable floors (rho, P, v)
     2. Apply conservative variable consistency floors (tau, S_i)
     3. Recompute conservatives from floored primitives if needed
@@ -122,7 +122,7 @@ class FloorApplicator:
 
     def apply_primitive_floors(self, rho0, vr, p, gamma_rr):
         """
-        Apply floors to primitive variables (NRPy/IllinoisGRMHD-style).
+        Apply floors to primitive variables ( /  -style).
 
         Parameters
         ----------
@@ -171,7 +171,7 @@ class FloorApplicator:
 
     def apply_conservative_floors(self, D, Sr, tau, gamma_rr, metric_psi6=None):
         """
-        Apply conservative variable consistency floors following IllinoisGRMHD.
+        Apply conservative variable consistency floors following   .
 
         This implements the inequalities from Etienne et al. (2012) Appendix A:
         - tau >= tau_atm
@@ -221,7 +221,8 @@ class FloorApplicator:
         S_violated = S2 > RHS
         if np.any(S_violated):
             # Rescale Sr to satisfy constraint
-            rescale_factor = np.sqrt(RHS[S_violated] / np.maximum(S2[S_violated], 1e-30))
+            ratio = RHS[S_violated] / np.maximum(S2[S_violated], 1e-30)
+            rescale_factor = np.sqrt(np.maximum(ratio, 0.0))
             Sr_floor[S_violated] *= rescale_factor
             floor_applied[S_violated] = True
 
@@ -253,20 +254,15 @@ class FloorApplicator:
 
         W[mask] = 1.0
 
-        # Enthalpy (EOS-dependent)
-        if hasattr(self.eos, 'K') and hasattr(self.eos, 'gamma'):
-            # Polytropic: h = 1 + ε
-            h[mask] = 1.0 + eps[mask]
-        else:
-            # Ideal gas: h = 1 + ε + P/ρ
-            h[mask] = 1.0 + eps[mask] + self.atm.p_floor / self.atm.rho_floor
+        # Enthalpy (always ideal gas EOS: h = 1 + ε + P/ρ)
+        h[mask] = 1.0 + eps[mask] + self.atm.p_floor / self.atm.rho_floor
 
 
 def apply_atmosphere_to_state(state, atmosphere, NUM_BSSN_VARS=12, gamma=2.0):
     """
     Apply atmosphere floors to the complete state array after RK substeps.
 
-    Following AthenaK approach: apply floors to conserved variables directly
+    Following   approach: apply floors to conserved variables directly
     when density falls below threshold.
 
     Parameters
@@ -295,16 +291,16 @@ def apply_atmosphere_to_state(state, atmosphere, NUM_BSSN_VARS=12, gamma=2.0):
     atmosphere_mask = D < atmosphere.rho_floor
 
     if np.any(atmosphere_mask):
-        # Set atmosphere values following AthenaK
+        # Set atmosphere values following  
         D[atmosphere_mask] = atmosphere.rho_floor  # Conservative density
         Sr[atmosphere_mask] = 0.0  # Zero momentum
 
         # For tau (energy), compute for fluid at rest (v=0, W=1)
         # tau = rho * h * W^2 - P - rho * W = rho * h - P - rho
-        # For polytropic EOS: h = 1 + eps + P/rho
-        # where eps = P/(rho*(gamma-1)) for polytrope
+        # For ideal gas EOS: h = 1 + eps + P/rho
+        # where eps = P/(rho*(gamma-1)) for ideal gas
         # So: tau = rho*(1 + eps + P/rho) - P - rho = rho*eps
-        # For our polytrope: eps = P/(rho*(gamma-1))
+        # For ideal gas: eps = P/(rho*(gamma-1))
         # Use the atmosphere pressure for consistency
         # gamma now comes from parameter, ensuring consistency with EOS
         eps_atm = atmosphere.p_floor / (atmosphere.rho_floor * (gamma - 1.0))
@@ -322,14 +318,18 @@ def apply_atmosphere_to_state(state, atmosphere, NUM_BSSN_VARS=12, gamma=2.0):
 
 def apply_floors_to_state(state_2d, grid, hydro, rho_threshold=None):
     """
-    IllinoisGRMHD/NRPy-style floor application to both primitives and conservatives.
+      / -style floor application to both primitives and conservatives.
 
-    This function centralizes atmosphere handling following the IllinoisGRMHD
+    This function centralizes atmosphere handling following the
     strategy (Etienne+ 2012, Appendix A):
       1) Recover primitives (cons2prim)
       2) Apply floors/limits to primitives (ρ, v, P)
       3) Apply conservative consistency floors (τ floor, S^2 ≤ safety·τ(τ+2D))
       4) Recompute conservatives from floored primitives where needed
+
+    IMPORTANT: This function only operates on PHYSICAL cells [NUM_GHOSTS:-NUM_GHOSTS].
+    Ghost cells are handled by grid.fill_boundaries() with parity conditions and should
+    NOT be modified by atmosphere/floor logic.
 
     Notes on definitions (no densitization here):
       - D is the non-densitized conserved rest-mass density (D = ρ0 W)
@@ -357,15 +357,18 @@ def apply_floors_to_state(state_2d, grid, hydro, rho_threshold=None):
     from source.bssn.bssnstatevariables import NUM_BSSN_VARS
     from source.core.spacing import NUM_GHOSTS
     from source.bssn.tensoralgebra import get_bar_gamma_LL
-    
+
     atm = hydro.atmosphere
     if rho_threshold is None:
         rho_threshold = 10.0 * atm.rho_floor
 
-    # Extract conservatives
-    D = state_2d[NUM_BSSN_VARS + 0, :]
-    Sr = state_2d[NUM_BSSN_VARS + 1, :]
-    tau = state_2d[NUM_BSSN_VARS + 2, :]
+    # Define physical cells slice (exclude ghost cells on both ends)
+    phys = slice(NUM_GHOSTS, -NUM_GHOSTS)
+
+    # Extract conservatives (ONLY physical cells)
+    D = state_2d[NUM_BSSN_VARS + 0, phys]
+    Sr = state_2d[NUM_BSSN_VARS + 1, phys]
+    tau = state_2d[NUM_BSSN_VARS + 2, phys]
 
     # Build BSSN geometry to compute γ_rr (physical)
     bssn_vars = BSSNVars(grid.N)
@@ -373,14 +376,15 @@ def apply_floors_to_state(state_2d, grid, hydro, rho_threshold=None):
     bar_gamma_LL = get_bar_gamma_LL(grid.r, bssn_vars.h_LL, hydro.background)
     phi = np.asarray(bssn_vars.phi, dtype=float)
     e4phi = np.exp(4.0 * phi)
-    gamma_rr = e4phi * bar_gamma_LL[:, 0, 0]
+    gamma_rr_full = e4phi * bar_gamma_LL[:, 0, 0]
+    gamma_rr = gamma_rr_full[phys]  # Extract only physical cells
 
     # Recover primitives (cons2prim has its own floors for invalid points)
     hydro.set_matter_vars(state_2d, bssn_vars, grid)
     prim = hydro._get_primitives(bssn_vars, grid.r)
-    rho0 = prim['rho0']
-    vr = prim['vr']
-    p = prim['p']
+    rho0 = prim['rho0'][phys]  # Only physical cells
+    vr = prim['vr'][phys]
+    p = prim['p'][phys]
 
     # Create floor applicator
     floor_app = FloorApplicator(atmosphere=atm, eos=hydro.eos)
@@ -411,15 +415,17 @@ def apply_floors_to_state(state_2d, grid, hydro, rho_threshold=None):
         # Apply cons floors again to ensure final consistency
         D_new, Sr_new, tau_new, _ = floor_app.apply_conservative_floors(D_new, Sr_new, tau_new, gamma_rr)
 
-        state_2d[NUM_BSSN_VARS + 0, needs] = D_new[needs]
-        state_2d[NUM_BSSN_VARS + 1, needs] = Sr_new[needs]
-        state_2d[NUM_BSSN_VARS + 2, needs] = tau_new[needs]
+        D_f[needs] = D_new[needs]
+        Sr_f[needs] = Sr_new[needs]
+        tau_f[needs] = tau_new[needs]
 
-    # STEP 5: Force zero momentum in outer ghost cells when in atmosphere
-    outer = slice(-NUM_GHOSTS, None)
-    outer_mask = state_2d[NUM_BSSN_VARS + 0, outer] < rho_threshold
-    if np.any(outer_mask):
-        state_2d[NUM_BSSN_VARS + 1, outer][outer_mask] = 0.0
+    # Update state_2d with floored values (ONLY in physical cells)
+    state_2d[NUM_BSSN_VARS + 0, phys] = D_f
+    state_2d[NUM_BSSN_VARS + 1, phys] = Sr_f
+    state_2d[NUM_BSSN_VARS + 2, phys] = tau_f
+
+    # NOTE: Ghost cells are NOT touched here. They will be filled by grid.fill_boundaries()
+    # with proper parity conditions after this function returns.
 
     return state_2d
 

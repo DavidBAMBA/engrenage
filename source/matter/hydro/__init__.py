@@ -1,17 +1,18 @@
 # matter/hydro/__init__.py
 
 """
-Relativistic hydrodynamics module for engrenage.
+Relativistic hydrodynamics implementation details for engrenage.
 
-Valencia formulation with reference metric (spherical). This __init__ is kept
-LIGHTWEIGHT on purpose: we avoid heavy imports at package import time so that
-tools like `python -m source.matter.hydro.test` don't fail on transitive deps.
+This module contains the internal implementation of the Valencia formulation
+for GRHD equations. The public interface (PerfectFluid) is in source.matter.perfect_fluid.
+
+This __init__ is kept LIGHTWEIGHT on purpose: we avoid heavy imports at package
+import time so that tools don't fail on transitive dependencies.
 """
 
 from importlib import import_module
 
 __all__ = [
-    'PerfectFluid',
     'ValenciaReferenceMetric',
     'IdealGasEOS',
     'PolytropicEOS',
@@ -22,14 +23,12 @@ __all__ = [
     'EOS_TYPES',
     'RECONSTRUCTION_TYPES',
     'RIEMANN_SOLVERS',
-    'AtmosphereParams',  # New: centralized floor management
+    'AtmosphereParams',
     'create_default_atmosphere',
 ]
 
 # -------- Lazy attribute loading (PEP 562) --------
 def __getattr__(name):
-    if name == 'PerfectFluid':
-        return import_module('.perfect_fluid', __name__).PerfectFluid
     if name == 'ValenciaReferenceMetric':
         return import_module('.valencia_reference_metric', __name__).ValenciaReferenceMetric
     if name == 'IdealGasEOS':
@@ -76,7 +75,8 @@ def __getattr__(name):
             eos_mod  = import_module('.eos', __name__)
             rec_mod  = import_module('.reconstruction', __name__)
             rie_mod  = import_module('.riemann', __name__)
-            pf_mod   = import_module('.perfect_fluid', __name__)
+            # PerfectFluid is now in source.matter (parent module)
+            pf_mod   = import_module('source.matter.perfect_fluid')
 
             # EOS
             if reconstruction != "minmod":

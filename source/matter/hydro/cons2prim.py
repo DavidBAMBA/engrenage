@@ -5,7 +5,7 @@ Conservative to primitive variable conversion for relativistic hydrodynamics.
 This module provides a clean, extensible architecture for cons2prim conversion
 that supports current ideal gas EOS and is ready for future EOS implementations.
 
-Floor application follows IllinoisGRMHD strategy (see atmosphere.py).
+Floor application follows    strategy (see atmosphere.py).
 
 OPTIMIZATIONS:
 - Numba JIT compilation for critical scalar functions 
@@ -261,7 +261,7 @@ class Cons2PrimSolver:
         _, _, gamma_rr = self._ensure_metric_arrays(metric, N)
         p_guess = self._validate_pressure_guess(p_guess, N)
 
-        # Apply conservative variable floors (IllinoisGRMHD strategy)
+        # Apply conservative variable floors (   strategy)
         # This prevents many cons2prim failures by ensuring physical consistency
         if apply_conservative_floors:
             D, Sr, tau, floor_mask = self.floor_applicator.apply_conservative_floors(
