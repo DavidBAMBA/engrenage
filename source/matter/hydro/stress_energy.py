@@ -98,7 +98,6 @@ class StressEnergyTensor:
         Tij : np.ndarray
             T^{ij} components (N, 3, 3)
         """
-        N = len(self.rho0)
         u4U = self.u4U
         g4UU = self.g4UU
 
@@ -111,17 +110,12 @@ class StressEnergyTensor:
         T00 = rho_h * u4U[:, 0] * u4U[:, 0] + self.pressure * g4UU[:, 0, 0]
 
         # T^{0i} = ρ₀ h u^0 u^i + P g^{0i}
-        T0i = np.zeros((N, SPACEDIM))
-        for i in range(SPACEDIM):
-            T0i[:, i] = (rho_h * u4U[:, 0] * u4U[:, i+1] +
-                         self.pressure * g4UU[:, 0, i+1])
+        T0i = rho_h[:, np.newaxis] * u4U[:, 0:1] * u4U[:, 1:4] + self.pressure[:, np.newaxis] * g4UU[:, 0, 1:4]
 
         # T^{ij} = ρ₀ h u^i u^j + P g^{ij}
-        Tij = np.zeros((N, SPACEDIM, SPACEDIM))
-        for i in range(SPACEDIM):
-            for j in range(SPACEDIM):
-                Tij[:, i, j] = (rho_h * u4U[:, i+1] * u4U[:, j+1] +
-                                self.pressure * g4UU[:, i+1, j+1])
+        u_spatial = u4U[:, 1:4]  # u^i components (N, 3)
+        Tij = (rho_h[:, np.newaxis, np.newaxis] * u_spatial[:, :, np.newaxis] * u_spatial[:, np.newaxis, :] +
+               self.pressure[:, np.newaxis, np.newaxis] * g4UU[:, 1:4, 1:4])
 
         return T00, T0i, Tij
 
@@ -146,30 +140,16 @@ class StressEnergyTensor:
         # Get covariant metric
         g4DD = self.g4DD
 
-        N = len(self.rho0)
-
         # Lower the second index using g_{μν}
         # T^0_0 = T^{0μ} g_{μ0}
-        T0_0 = T00 * g4DD[:, 0, 0]
-        for i in range(SPACEDIM):
-            T0_0 += T0i[:, i] * g4DD[:, i+1, 0]
+        T0_0 = T00 * g4DD[:, 0, 0] + np.sum(T0i * g4DD[:, 1:4, 0], axis=1)
 
         # T^0_j = T^{0μ} g_{μj}
-        T0_j = np.zeros((N, SPACEDIM))
-        for j in range(SPACEDIM):
-            T0_j[:, j] = T00 * g4DD[:, 0, j+1]
-            for i in range(SPACEDIM):
-                T0_j[:, j] += T0i[:, i] * g4DD[:, i+1, j+1]
+        T0_j = T00[:, np.newaxis] * g4DD[:, 0, 1:4] + np.einsum('ni,nij->nj', T0i, g4DD[:, 1:4, 1:4])
 
         # T^i_j = T^{iμ} g_{μj}
-        Ti_j = np.zeros((N, SPACEDIM, SPACEDIM))
-        for i in range(SPACEDIM):
-            for j in range(SPACEDIM):
-                # T^i_0 g_{0j} contribution
-                Ti_j[:, i, j] = T0i[:, i] * g4DD[:, 0, j+1]
-                # T^{ik} g_{kj} contributions
-                for k in range(SPACEDIM):
-                    Ti_j[:, i, j] += Tij[:, i, k] * g4DD[:, k+1, j+1]
+        # T^i_0 g_{0j} + T^{ik} g_{kj}
+        Ti_j = T0i[:, :, np.newaxis] * g4DD[:, 0:1, 1:4] + np.einsum('nik,nkj->nij', Tij, g4DD[:, 1:4, 1:4])
 
         return T0_0, T0_j, Ti_j
 
@@ -194,37 +174,23 @@ class StressEnergyTensor:
         # Get covariant metric
         g4DD = self.g4DD
 
-        N = len(self.rho0)
-
         # Lower both indices using g_{μν}
         # T_{00} = g_{0μ} T^{μν} g_{ν0}
-        T_00 = np.zeros(N)
-        T_00 += g4DD[:, 0, 0] * T00 * g4DD[:, 0, 0]
-        for i in range(SPACEDIM):
-            T_00 += 2.0 * g4DD[:, 0, i+1] * T0i[:, i] * g4DD[:, 0, 0]
-            for j in range(SPACEDIM):
-                T_00 += g4DD[:, 0, i+1] * Tij[:, i, j] * g4DD[:, j+1, 0]
+        T_00 = (g4DD[:, 0, 0]**2 * T00 +
+                2.0 * g4DD[:, 0, 0] * np.sum(g4DD[:, 0, 1:4] * T0i, axis=1) +
+                np.einsum('ni,nij,nj->n', g4DD[:, 0, 1:4], Tij, g4DD[:, 1:4, 0]))
 
         # T_{0i} = g_{0μ} T^{μν} g_{νi}
-        T_0i = np.zeros((N, SPACEDIM))
-        for i in range(SPACEDIM):
-            T_0i[:, i] += g4DD[:, 0, 0] * T00 * g4DD[:, 0, i+1]
-            for j in range(SPACEDIM):
-                T_0i[:, i] += g4DD[:, 0, 0] * T0i[:, j] * g4DD[:, j+1, i+1]
-                T_0i[:, i] += g4DD[:, 0, j+1] * T0i[:, j] * g4DD[:, 0, i+1]
-                for k in range(SPACEDIM):
-                    T_0i[:, i] += g4DD[:, 0, j+1] * Tij[:, j, k] * g4DD[:, k+1, i+1]
+        T_0i = (g4DD[:, 0:1, 0] * T00[:, np.newaxis] * g4DD[:, 0, 1:4] +
+                g4DD[:, 0:1, 0] * np.einsum('nj,nji->ni', T0i, g4DD[:, 1:4, 1:4]) +
+                np.einsum('nj,ni,nj->ni', g4DD[:, 0, 1:4], g4DD[:, 0, 1:4], T0i) +
+                np.einsum('nj,njk,nki->ni', g4DD[:, 0, 1:4], Tij, g4DD[:, 1:4, 1:4]))
 
         # T_{ij} = g_{iμ} T^{μν} g_{νj}
-        T_ij = np.zeros((N, SPACEDIM, SPACEDIM))
-        for i in range(SPACEDIM):
-            for j in range(SPACEDIM):
-                T_ij[:, i, j] += g4DD[:, i+1, 0] * T00 * g4DD[:, 0, j+1]
-                for k in range(SPACEDIM):
-                    T_ij[:, i, j] += g4DD[:, i+1, 0] * T0i[:, k] * g4DD[:, k+1, j+1]
-                    T_ij[:, i, j] += g4DD[:, i+1, k+1] * T0i[:, k] * g4DD[:, 0, j+1]
-                    for l in range(SPACEDIM):
-                        T_ij[:, i, j] += g4DD[:, i+1, k+1] * Tij[:, k, l] * g4DD[:, l+1, j+1]
+        T_ij = (g4DD[:, 1:4, 0:1] * T00[:, np.newaxis, np.newaxis] * g4DD[:, 0:1, 1:4] +
+                np.einsum('ni,nk,nkj->nij', g4DD[:, 1:4, 0], T0i, g4DD[:, 1:4, 1:4]) +
+                np.einsum('nik,nk,nj->nij', g4DD[:, 1:4, 1:4], T0i, g4DD[:, 0:1, 1:4]) +
+                np.einsum('nik,nkl,nlj->nij', g4DD[:, 1:4, 1:4], Tij, g4DD[:, 1:4, 1:4]))
 
         return T_00, T_0i, T_ij
 
@@ -250,8 +216,6 @@ class StressEnergyTensor:
         # S_{ij} = ρ₀ h W² v_i v_j + P γ_{ij}
         # S = γ^{ij} S_{ij} = ρ₀ h W² v² + 3P
 
-        N = len(self.rho0)
-
         # Compute ρ₀ h W²
         rho_h_W2 = self.rho0 * self.h * self.W**2
 
@@ -264,11 +228,8 @@ class StressEnergyTensor:
         S_D = rho_h_W2[:, np.newaxis] * v_D
 
         # Stress tensor
-        S_DD = np.zeros((N, SPACEDIM, SPACEDIM))
-        for i in range(SPACEDIM):
-            for j in range(SPACEDIM):
-                S_DD[:, i, j] = (rho_h_W2 * v_D[:, i] * v_D[:, j] +
-                                 self.pressure * self.geometry.gamma_LL[:, i, j])
+        S_DD = (rho_h_W2[:, np.newaxis, np.newaxis] * v_D[:, :, np.newaxis] * v_D[:, np.newaxis, :] +
+                self.pressure[:, np.newaxis, np.newaxis] * self.geometry.gamma_LL)
 
         # Trace S = γ^{ij} S_{ij}
         S_trace = np.einsum('nij,nij->n', self.geometry.gamma_UU, S_DD)

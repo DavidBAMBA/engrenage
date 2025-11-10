@@ -228,93 +228,6 @@ class FloorApplicator:
 
         return D_floor, Sr_floor, tau_floor, floor_applied
 
-    def apply_atmosphere_fallback(self, rho0, vr, p, eps, W, h, mask):
-        """
-        Set atmosphere values for failed points.
-
-        Parameters
-        ----------
-        rho0, vr, p, eps, W, h : arrays
-            Primitive variables to modify in-place
-        mask : bool array
-            Points to set to atmosphere
-        """
-        if not np.any(mask):
-            return
-
-        rho0[mask] = self.atm.rho_floor
-        vr[mask] = 0.0
-        p[mask] = self.atm.p_floor
-
-        # EOS-consistent epsilon
-        try:
-            eps[mask] = self.eos.eps_from_rho_p(self.atm.rho_floor, self.atm.p_floor)
-        except:
-            eps[mask] = 1e-10
-
-        W[mask] = 1.0
-
-        # Enthalpy (always ideal gas EOS: h = 1 + ε + P/ρ)
-        h[mask] = 1.0 + eps[mask] + self.atm.p_floor / self.atm.rho_floor
-
-
-def apply_atmosphere_to_state(state, atmosphere, NUM_BSSN_VARS=12, gamma=2.0):
-    """
-    Apply atmosphere floors to the complete state array after RK substeps.
-
-    Following   approach: apply floors to conserved variables directly
-    when density falls below threshold.
-
-    Parameters
-    ----------
-    state : array
-        State array with shape (NUM_VARS, N) containing conservative variables
-    atmosphere : AtmosphereParams
-        Atmosphere parameters
-    NUM_BSSN_VARS : int
-        Number of BSSN variables (default 12)
-    gamma : float
-        Adiabatic index for EOS (default 2.0)
-
-    Returns
-    -------
-    None (modifies state in-place)
-    """
-    # Extract conservative variables
-    # Hydro variables start after BSSN variables: D, Sr, tau
-    D = state[NUM_BSSN_VARS + 0, :]
-    Sr = state[NUM_BSSN_VARS + 1, :]
-    tau = state[NUM_BSSN_VARS + 2, :]
-
-    # Check where atmosphere should be applied based on density floor
-    # D ≈ rho for our purpose here
-    atmosphere_mask = D < atmosphere.rho_floor
-
-    if np.any(atmosphere_mask):
-        # Set atmosphere values following  
-        D[atmosphere_mask] = atmosphere.rho_floor  # Conservative density
-        Sr[atmosphere_mask] = 0.0  # Zero momentum
-
-        # For tau (energy), compute for fluid at rest (v=0, W=1)
-        # tau = rho * h * W^2 - P - rho * W = rho * h - P - rho
-        # For ideal gas EOS: h = 1 + eps + P/rho
-        # where eps = P/(rho*(gamma-1)) for ideal gas
-        # So: tau = rho*(1 + eps + P/rho) - P - rho = rho*eps
-        # For ideal gas: eps = P/(rho*(gamma-1))
-        # Use the atmosphere pressure for consistency
-        # gamma now comes from parameter, ensuring consistency with EOS
-        eps_atm = atmosphere.p_floor / (atmosphere.rho_floor * (gamma - 1.0))
-        tau[atmosphere_mask] = atmosphere.rho_floor * eps_atm
-
-        # Update state array
-        state[NUM_BSSN_VARS + 0, :] = D
-        state[NUM_BSSN_VARS + 1, :] = Sr
-        state[NUM_BSSN_VARS + 2, :] = tau
-
-    # Also apply minimum floors to ensure no negative values
-    state[NUM_BSSN_VARS + 0, :] = np.maximum(state[NUM_BSSN_VARS + 0, :], atmosphere.rho_floor)
-    state[NUM_BSSN_VARS + 2, :] = np.maximum(state[NUM_BSSN_VARS + 2, :], atmosphere.tau_atm)
-
 
 def apply_floors_to_state(state_2d, grid, hydro, rho_threshold=None):
     """
@@ -331,10 +244,8 @@ def apply_floors_to_state(state_2d, grid, hydro, rho_threshold=None):
     Ghost cells are handled by grid.fill_boundaries() with parity conditions and should
     NOT be modified by atmosphere/floor logic.
 
-    Notes on definitions (no densitization here):
-      - D is the non-densitized conserved rest-mass density (D = ρ0 W)
-      - S_r is the conserved momentum density (non-densitized)
-      - τ is the conserved energy density (non-densitized), with τ ≥ τ_atm
+    Notes on definitions:
+      - D, S_r, τ are DENSITIZED conservatives (D̃ = e^{6φ} D, etc.) as stored in state_2d
       - γ_rr is the physical metric component used for v^2 and S^2
 
     Parameters
@@ -411,7 +322,9 @@ def apply_floors_to_state(state_2d, grid, hydro, rho_threshold=None):
     needs = prim_mask | cons_mask
     if np.any(needs):
         from source.matter.hydro.cons2prim import prim_to_cons
-        D_new, Sr_new, tau_new = prim_to_cons(rho0_f, vr_f, p_f, gamma_rr, hydro.eos)
+        # Compute densitization factor at physical cells
+        e6phi = np.exp(6.0 * phi[phys])
+        D_new, Sr_new, tau_new = prim_to_cons(rho0_f, vr_f, p_f, gamma_rr, hydro.eos, e6phi=e6phi)
         # Apply cons floors again to ensure final consistency
         D_new, Sr_new, tau_new, _ = floor_app.apply_conservative_floors(D_new, Sr_new, tau_new, gamma_rr)
 

@@ -73,23 +73,30 @@ class FlatSphericalBackground:
         return ds_dx
     
     def get_d1_inverse_scaling_vector(self) :
-    
+
+        # Use abs(r) to handle ghost cells with r<0 correctly
+        # Spherical symmetry: physics at r and -r is the same
+        r_safe = np.abs(self.r)
+
         ds_dx = np.zeros([self.N, SPACEDIM, SPACEDIM])
-        ds_dx[:,i_t, i_r] += - 1.0 / self.r / self.r
-        ds_dx[:,i_p, i_r] += - 1.0 / self.r / self.r / sintheta
-        ds_dx[:,i_p, i_t] += - 1.0 / self.r * costheta / sintheta / sintheta
-        
+        ds_dx[:,i_t, i_r] += - 1.0 / r_safe / r_safe
+        ds_dx[:,i_p, i_r] += - 1.0 / r_safe / r_safe / sintheta
+        ds_dx[:,i_p, i_t] += - 1.0 / r_safe * costheta / sintheta / sintheta
+
         return ds_dx
     
     def get_d2_inverse_scaling_vector(self) :
-    
+
+        # Use abs(r) to handle ghost cells with r<0 correctly
+        r_safe = np.abs(self.r)
+
         d2s_dxdy = np.zeros([self.N, SPACEDIM, SPACEDIM, SPACEDIM])
-        d2s_dxdy[:,i_t, i_r, i_r] += 2.0 / (self.r ** 3.0) 
-        d2s_dxdy[:,i_p, i_r, i_r] += 2.0 / (self.r ** 3.0) / sintheta
-        d2s_dxdy[:,i_p, i_r, i_t] += 1.0 / (self.r ** 2.0 * sintheta ** 2.0) * costheta
-        d2s_dxdy[:,i_p, i_t, i_r] += 1.0 / (self.r ** 2.0 * sintheta ** 2.0) * costheta
-        d2s_dxdy[:,i_p, i_t, i_t] += 1.0 / (self.r * sintheta ** 3.0) * (costheta ** 2.0 + 1.0)
-        
+        d2s_dxdy[:,i_t, i_r, i_r] += 2.0 / (r_safe ** 3.0)
+        d2s_dxdy[:,i_p, i_r, i_r] += 2.0 / (r_safe ** 3.0) / sintheta
+        d2s_dxdy[:,i_p, i_r, i_t] += 1.0 / (r_safe ** 2.0 * sintheta ** 2.0) * costheta
+        d2s_dxdy[:,i_p, i_t, i_r] += 1.0 / (r_safe ** 2.0 * sintheta ** 2.0) * costheta
+        d2s_dxdy[:,i_p, i_t, i_t] += 1.0 / (r_safe * sintheta ** 3.0) * (costheta ** 2.0 + 1.0)
+
         return d2s_dxdy
 
     # This is d2 (scaling_i) / dx^j dx^k
@@ -168,12 +175,15 @@ class FlatSphericalBackground:
     # christoffel symbols for the hat metric
     # See eqn (18) in Baumgarte https://arxiv.org/abs/1211.6632
     def get_hat_christoffel(self) :
-        
-        hat_chris = np.zeros([self.N, SPACEDIM, SPACEDIM, SPACEDIM])
-        #one_over_r = 1.0 / self.r
-        one_over_r = 1.0 / np.maximum(self.r, 1e-30)  # En vez de 1.0 / self.r
 
-        
+        # Use abs(r) to handle ghost cells with r<0 correctly
+        # np.maximum(self.r, 1e-30) FAILS for r<0 because max(-0.1, 1e-30) = 1e-30
+        r_safe = np.maximum(np.abs(self.r), 1e-30)
+
+        hat_chris = np.zeros([self.N, SPACEDIM, SPACEDIM, SPACEDIM])
+        one_over_r = 1.0 / r_safe
+
+
         # non zero r comps \Gamma^r_ab
         hat_chris[:,i_r,i_t,i_t] = - self.r
         hat_chris[:,i_r,i_p,i_p] = - self.r * sin2theta
@@ -193,11 +203,12 @@ class FlatSphericalBackground:
     
     # d \hat Gamma^i_jk / dx^l
     def get_d1_hat_christoffel(self) :
-    
-        ones = np.ones_like(self.r)
-        #one_over_r = 1.0 / self.r
-        one_over_r = 1.0 / np.maximum(self.r, 1e-30)  # En vez de 1.0 / self.r
 
+        # Use abs(r) to handle ghost cells with r<0 correctly
+        r_safe = np.maximum(np.abs(self.r), 1e-30)
+
+        ones = np.ones_like(self.r)
+        one_over_r = 1.0 / r_safe
         one_over_r2 = one_over_r * one_over_r
         
         d1_hat_chris_dx = np.zeros([self.N, SPACEDIM, SPACEDIM, SPACEDIM, SPACEDIM])

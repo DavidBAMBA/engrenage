@@ -11,7 +11,7 @@ Classes:
 import numpy as np
 from typing import Tuple, Optional
 
-from source.bssn.tensoralgebra import SPACEDIM, get_bar_gamma_LL, get_bar_A_LL, get_hat_D_bar_gamma_LL
+from source.bssn.tensoralgebra import SPACEDIM, get_bar_gamma_LL, get_hat_D_bar_gamma_LL
 from source.core.spacing import NUM_GHOSTS
 from source.matter.hydro.geometry import ADMGeometry, ValenciaGeometry
 from source.matter.hydro.stress_energy import StressEnergyTensor
@@ -108,6 +108,15 @@ class GRHDEquations:
                 eps_center = self.eos.eps_from_rho_p(rho0[NUM_GHOSTS], pressure[NUM_GHOSTS])
                 h[NUM_GHOSTS] = 1.0 + eps_center + pressure[NUM_GHOSTS] / np.maximum(rho0[NUM_GHOSTS], 1e-30)
 
+        # Compute stress-energy tensor components once for use in connection and source terms
+        stress_energy = StressEnergyTensor(
+            geometry=ADMGeometry(geometry.alpha, geometry.beta_U,
+                                geometry.gamma_LL, geometry.gamma_UU),
+            rho0=rho0, v_U=v_U, pressure=pressure, W=W, h=h
+        )
+        T00, T0i, Tij = stress_energy.compute_T4UU()
+        _, T0_j, Ti_j = stress_energy.compute_T4UD()
+
         # Step 1: Reconstruct primitives and convert to conservatives
         UL, UR, primL, primR = self.reconstruct_and_convert(
             rho0, v_U[:, 0], pressure, r, reconstructor, geometry, spacetime_mode
@@ -130,7 +139,8 @@ class GRHDEquations:
         # For example, the "hoop stress" term 2p/r in spherical blast waves comes from
         # connection terms, NOT from explicit source terms.
         conn_D, conn_S, conn_tau = self.compute_connection_terms(
-            rho0, v_U, pressure, W, h, geometry, background.hat_christoffel
+            rho0, v_U, pressure, W, h, geometry, background.hat_christoffel,
+            T0i=T0i, Ti_j=Ti_j
         )
         rhs_D += conn_D
         rhs_S += conn_S
@@ -140,7 +150,8 @@ class GRHDEquations:
         if spacetime_mode == 'dynamic':
             src_S, src_tau = self.compute_source_terms(
                 rho0, v_U, pressure, W, h, geometry,
-                bssn_vars, bssn_d1, background, spacetime_mode, r
+                bssn_vars, bssn_d1, background, spacetime_mode, r,
+                T00=T00, T0i=T0i, Tij=Tij, T0_j=T0_j
             )
             rhs_S += src_S
             rhs_tau += src_tau
@@ -361,6 +372,7 @@ class GRHDEquations:
                                 pressure: np.ndarray, W: np.ndarray, h: np.ndarray,
                                 geometry: ValenciaGeometry,
                                 hat_chris: np.ndarray,
+                                T0i: np.ndarray, Ti_j: np.ndarray,
                                 return_debug: bool = False) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
         """
         Compute Christoffel connection contributions to RHS.
@@ -377,6 +389,10 @@ class GRHDEquations:
             Geometric quantities
         hat_chris : np.ndarray
             Reference Christoffel symbols (N, 3, 3, 3)
+        T0i : np.ndarray
+            Contravariant stress-energy T^{0i} components (N, 3)
+        Ti_j : np.ndarray
+            Mixed stress-energy T^i_j components (N, 3, 3)
 
         Returns
         -------
@@ -386,71 +402,30 @@ class GRHDEquations:
         N = len(rho0)
         alpha = geometry.alpha
         e6phi = geometry.e6phi
-        gamma_LL = geometry.gamma_LL
-        gamma_UU = geometry.gamma_UU
 
-        # Compute 4-velocity components (Valencia formulation)
-        # In Valencia form: u^i = W v^i (NOT coordinate form u^i = W v^i - β^i u^0)
-        u4U = np.zeros((N, 4))
-        u4U[:, 0] = W / alpha  # u^0
-        for i in range(SPACEDIM):
-            u4U[:, i+1] = W * v_U[:, i]  # u^i = W v^i (Valencia form)
-
-        # Compute stress-energy tensor components needed for fluxes
-        # CRITICAL: factor = ρ₀ h (NOT ρ₀ h W²) because u^μ already contains W factors
-        # u^0 = W/α, u^i = W v^i, so T^{μν} = (ρ₀ h) u^μ u^ν already has W² when expanded
-        factor = rho0 * h
-
-        # Conservative density flux
-        rho_star = alpha * e6phi * rho0 * u4U[:, 0]
+        # Conservative density flux rho_star = e^{6φ} ρ₀ W
+        # Note: u^0 = W/α, so α*u^0 = W
+        rho_star = e6phi * rho0 * W
 
         # Physical fluxes at cell centers (partial flux vectors)
-        fD_U = np.zeros((N, SPACEDIM))
-        for j in range(SPACEDIM):
-            fD_U[:, j] = rho_star * v_U[:, j]
+        fD_U = rho_star[:, np.newaxis] * v_U
 
-        # Energy (tau) partial flux vector
-        # Compute T^0j = ρ₀ h u^0 u^j + P g^{0j}, where g^{0j} = β^j / α²
-        T0j = np.zeros((N, SPACEDIM))
-        g4UU_0j = geometry.beta_U / (alpha[:, None] ** 2)  # g^{0j} = β^j / α²
-        for j in range(SPACEDIM):
-            T0j[:, j] = (factor * u4U[:, 0] * u4U[:, j+1] +
-                         pressure * g4UU_0j[:, j])  # CRITICAL: pressure term
-
-        fTau_U = np.zeros((N, SPACEDIM))
-        for j in range(SPACEDIM):
-            fTau_U[:, j] = alpha ** 2 * e6phi * T0j[:, j] - rho_star * v_U[:, j]
+        # Energy (tau) partial flux vector using T^{0j} from stress_energy tensor
+        # fTau_U = α² e^{6φ} T^{0j} - rho_star v^j
+        fTau_U = (alpha ** 2 * e6phi)[:, np.newaxis] * T0i - rho_star[:, np.newaxis] * v_U
 
         # Momentum partial flux tensor F̃^j_i = α e^{6φ} T^j_i
-        # First compute T^ij = ρ₀ h u^i u^j + P g^{ij}, where g^{ij} = γ^{ij} - β^i β^j / α²
-        g4UU_spatial = (gamma_UU -
-                        np.einsum('xi,xj->xij', geometry.beta_U, geometry.beta_U) / (alpha[:, None, None] ** 2))
+        # Use precomputed mixed tensor T^i_j from stress_energy module
+        F_S = (alpha * e6phi)[:, np.newaxis, np.newaxis] * Ti_j
 
-        Tij_UU = np.zeros((N, SPACEDIM, SPACEDIM))
-        for i in range(SPACEDIM):
-            for j in range(SPACEDIM):
-                Tij_UU[:, i, j] = (factor * u4U[:, i+1] * u4U[:, j+1] +
-                                   pressure * g4UU_spatial[:, i, j])  # Use 4D spatial metric
-
-        # Convert to mixed T^j_i
-        Tij_UD = np.zeros((N, SPACEDIM, SPACEDIM))
-        for j in range(SPACEDIM):
-            for i in range(SPACEDIM):
-                for k in range(SPACEDIM):
-                    Tij_UD[:, j, i] += Tij_UU[:, j, k] * gamma_LL[:, i, k]
-
-        F_S_no_ghat = np.zeros((N, SPACEDIM, SPACEDIM))
-        for j in range(SPACEDIM):
-            for i in range(SPACEDIM):
-                F_S_no_ghat[:, j, i] = alpha * e6phi * Tij_UD[:, j, i]
+        Gamma_trace = np.einsum('xkkj->xj', hat_chris)
 
         # Connection contributions
-        Gamma_trace = np.einsum('xkkj->xj', hat_chris)
-        conn_D = -np.einsum('xj,xj->x', Gamma_trace, fD_U)
-        conn_tau = -np.einsum('xj,xj->x', Gamma_trace, fTau_U)
-        conn_S = (
-            -np.einsum('xl,xli->xi', Gamma_trace, F_S_no_ghat)
-            + np.einsum('xlji,xjl->xi', hat_chris, F_S_no_ghat)
+        conn_D   = - np.einsum('xj,xj->x', Gamma_trace, fD_U)
+        conn_tau = - np.einsum('xj,xj->x', Gamma_trace, fTau_U)
+        conn_S   = (
+                   - np.einsum('xl,xli->xi', Gamma_trace, F_S)
+                   + np.einsum('xlji,xjl->xi', hat_chris, F_S)
         )
 
         if not return_debug:
@@ -459,7 +434,7 @@ class GRHDEquations:
         debug = {
             "rho_star_flux": fD_U.copy(),
             "tau_flux": fTau_U.copy(),
-            "momentum_flux": F_S_no_ghat.copy(),
+            "momentum_flux": F_S.copy(),
             "Gamma_trace": Gamma_trace.copy(),
         }
         return conn_D, conn_S, conn_tau, debug
@@ -469,6 +444,7 @@ class GRHDEquations:
                             geometry: ValenciaGeometry,
                             bssn_vars, bssn_d1, background,
                             spacetime_mode: str, r: np.ndarray,
+                            T00: np.ndarray, T0i: np.ndarray, Tij: np.ndarray, T0_j: np.ndarray,
                             return_debug: bool = False) -> Tuple[np.ndarray, np.ndarray]:
         """
         Compute geometric source terms for Valencia equations.
@@ -491,6 +467,14 @@ class GRHDEquations:
             'fixed' or 'dynamic'
         r : np.ndarray
             Radial coordinate
+        T00 : np.ndarray
+            Contravariant stress-energy T^{00} component (N,)
+        T0i : np.ndarray
+            Contravariant stress-energy T^{0i} components (N, 3)
+        Tij : np.ndarray
+            Contravariant stress-energy T^{ij} components (N, 3, 3)
+        T0_j : np.ndarray
+            Mixed stress-energy T^0_j components (N, 3)
 
         Returns
         -------
@@ -531,20 +515,8 @@ class GRHDEquations:
         phi = np.asarray(bssn_vars.phi, dtype=float)
         e4phi = np.exp(4.0 * phi)
 
-        # Create stress-energy tensor object for cleaner code
-        stress_energy = StressEnergyTensor(
-            geometry=ADMGeometry(alpha, beta_U, gamma_LL, gamma_UU),
-            rho0=rho0, v_U=v_U, pressure=pressure, W=W, h=h
-        )
-
-        # Compute stress-energy tensor components
-        T00, T0i, Tij = stress_energy.compute_T4UU()
-
-        # For source terms, we also need mixed components T^0_i
-        T0i_UD = np.zeros((N, SPACEDIM))
-        for i in range(SPACEDIM):
-            for j in range(SPACEDIM):
-                T0i_UD[:, i] += T0i[:, j] * gamma_LL[:, i, j]
+        # For source terms, we use precomputed mixed components T^0_j from stress_energy module
+        T0i_UD = T0_j
 
         # ====================================================================
         # ENERGY SOURCE TERM
@@ -552,46 +524,26 @@ class GRHDEquations:
         # S_τ = α e^{6φ} [K_ij stress_block - T^0_μ ∂_μ α]
 
         # Get BSSN quantities
-        if hasattr(bssn_vars, 'hDD'):
-            h_LL = bssn_vars.hDD
-        elif hasattr(bssn_vars, 'h_LL'):
-            h_LL = bssn_vars.h_LL
-        else:
-            h_LL = get_bar_gamma_LL(bssn_vars, background)
+        h_LL = bssn_vars.h_LL
 
         K = np.asarray(bssn_vars.K, dtype=float)
-
-        if hasattr(bssn_vars, 'aDD'):
-            a_LL = bssn_vars.aDD
-        elif hasattr(bssn_vars, 'a_LL'):
-            a_LL = bssn_vars.a_LL
-        else:
-            a_LL = get_bar_A_LL(bssn_vars)
+        a_LL = bssn_vars.a_LL
 
         # Physical extrinsic curvature: K_ij = e^{4φ} Ā_ij + (1/3) γ_ij K
-        K_LL = np.zeros((N, SPACEDIM, SPACEDIM))
-        for i in range(SPACEDIM):
-            for j in range(SPACEDIM):
-                K_LL[:, i, j] = e4phi * a_LL[:, i, j] + (1.0/3.0) * gamma_LL[:, i, j] * K
+        K_LL = e4phi[:, np.newaxis, np.newaxis] * a_LL + (1.0/3.0) * gamma_LL * K[:, np.newaxis, np.newaxis]
 
-        # Stress block: T^00 β^i β^j + 2 T^{0i} β^j + T^{ij}
-        stress_block = np.zeros((N, SPACEDIM, SPACEDIM))
-        for i in range(SPACEDIM):
-            for j in range(SPACEDIM):
-                stress_block[:, i, j] = (
-                    T00 * beta_U[:, i] * beta_U[:, j] +
-                    2.0 * T0i[:, i] * beta_U[:, j] +
-                    Tij[:, i, j]
-                )
+        # Stress block: T^00 β^i β^j + 2 T^{0i} β^j + T^{ij} 
+        stress_block = (T00[:, None, None] * np.einsum('xi,xj->xij', beta_U, beta_U) +
+                       2.0 * np.einsum('xi,xj->xij', T0i, beta_U) +
+                       Tij)
 
         # Term 1: K_ij × stress_block
         term1_tau = np.einsum('nij,nij->n', K_LL, stress_block)
 
-        # Term 2: Lapse gradient
+        # Term 2: Lapse gradient 
         d_alpha = np.asarray(bssn_d1.lapse, dtype=float)
-        term2_tau = np.zeros(N)
-        for i in range(SPACEDIM):
-            term2_tau -= (T00 * beta_U[:, i] + T0i[:, i]) * d_alpha[:, i]
+        term2_tau = -(np.einsum('x,xi,xi->x', T00, beta_U, d_alpha) +
+                     np.einsum('xi,xi->x', T0i, d_alpha))
 
         src_tau = alpha * e6phi * (term1_tau + term2_tau)
 
@@ -611,77 +563,49 @@ class GRHDEquations:
         # ∂_i β^j = inverse_scaling^j × ∂_i(shift_rescaled^j) + shift_rescaled^j × ∂_i(inverse_scaling^j)
 
         # Get shift derivatives from BSSN
-        if hasattr(bssn_d1, 'shift_U') and bssn_d1.shift_U is not None:
-            shift_d1 = np.asarray(bssn_d1.shift_U, dtype=float)  # ∂_j(shift_rescaled^i)
-        else:
-            # No shift derivatives available - assume zero
-            shift_d1 = np.zeros((N, SPACEDIM, SPACEDIM))
+        shift_d1 = np.asarray(bssn_d1.shift_U, dtype=float)  # ∂_j(shift_rescaled^i)
 
         # Get rescaled shift from BSSN (to apply product rule)
-        if hasattr(bssn_vars, 'shift_U') and bssn_vars.shift_U is not None:
-            shift_rescaled = np.asarray(bssn_vars.shift_U, dtype=float)
-            # Handle 1D case (only radial component)
-            if shift_rescaled.ndim == 1:
-                shift_rescaled_2d = np.zeros((N, SPACEDIM))
-                shift_rescaled_2d[:, 0] = shift_rescaled
-                shift_rescaled = shift_rescaled_2d
-        else:
-            # Compute from physical shift (reverse scaling)
-            if hasattr(background, 'inverse_scaling_vector') and np.any(background.inverse_scaling_vector != 0):
-                shift_rescaled = beta_U / background.inverse_scaling_vector
-            else:
-                shift_rescaled = beta_U
+        shift_rescaled = np.asarray(bssn_vars.shift_U, dtype=float)
+        # Handle 1D case (only radial component)
+        if shift_rescaled.ndim == 1:
+            shift_rescaled_2d = np.zeros((N, SPACEDIM))
+            shift_rescaled_2d[:, 0] = shift_rescaled
+            shift_rescaled = shift_rescaled_2d
 
-        dbeta_dx = np.zeros((N, SPACEDIM, SPACEDIM))
-
-        # Apply product rule if background has d1_inverse_scaling_vector
-        if hasattr(background, 'd1_inverse_scaling_vector') and hasattr(background, 'inverse_scaling_vector'):
-            for i in range(SPACEDIM):
-                for j in range(SPACEDIM):
-                    dbeta_dx[:, i, j] = (
-                        background.inverse_scaling_vector[:, i] * shift_d1[:, i, j] +
-                        shift_rescaled[:, i] * background.d1_inverse_scaling_vector[:, i, j]
-                    )
-        else:
-            # Fallback: no scaling correction (flat spacetime)
-            dbeta_dx = shift_d1
+        # Apply product rule: ∂_i β^j = s^j ∂_i shift^j + shift^j ∂_i s^j
+        dbeta_dx = (background.inverse_scaling_vector[:, :, None] * shift_d1 +
+                   shift_rescaled[:, :, None] * background.d1_inverse_scaling_vector)
 
         hat_chris = background.hat_christoffel
         hatD_beta = np.zeros((N, SPACEDIM, SPACEDIM))
 
-        for i in range(SPACEDIM):
-            for j in range(SPACEDIM):
-                cov_deriv_beta = dbeta_dx[:, i, j]
-                for k in range(SPACEDIM):
-                    cov_deriv_beta += hat_chris[:, j, i, k] * beta_U[:, k]
-                hatD_beta[:, i, j] = cov_deriv_beta
-                second_term[:, i] += T0i_UD[:, j] * cov_deriv_beta
+        # Vectorized computation of shift covariant derivative: ∇̂_i β^j = ∂_i β^j + Γ̂^j_{ik} β^k
+        hatD_beta = dbeta_dx + np.einsum('xjik,xk->xij', hat_chris, beta_U)
+        # Vectorized computation of second term: sum_j T^0_j * ∇̂_i β^j
+        second_term = np.einsum('xj,xij->xi', T0i_UD, hatD_beta)
 
         # Term 3: 0.5 × stress_block × ∇̂_i γ_{jk}
         # ∇̂_i γ_{jk} = e^{4φ} (∂_i γ̄_{jk} + 4 γ̄_{jk} ∂_i φ)
         # where ∂_i γ̄_{jk} = Γ̂_{jik} + Γ̂_{kij} from reference metric
         d_phi = np.asarray(bssn_d1.phi, dtype=float)
 
-        # CRITICAL FIX: Compute bar_gamma_LL (conformal metric), not just h_LL (deviation)
-        # The formula requires γ̄_{jk}, which is the FULL conformal metric, not just the deviation
+        # CRITICAL FIX: Compute bar_gamma_LL (conformal metric)
         bar_gamma_LL = get_bar_gamma_LL(r, h_LL, background)
 
-        if hasattr(background, 'hat_D_gamma'):
-            hat_D_gamma = background.hat_D_gamma
-        else:
-            d1_h = getattr(bssn_d1, 'hDD', getattr(bssn_d1, 'h_LL', None))
-            hat_D_gamma = get_hat_D_bar_gamma_LL(r, h_LL, d1_h, background)
 
-        for i in range(SPACEDIM):
-            for j in range(SPACEDIM):
-                for k in range(SPACEDIM):
-                    # CRITICAL FIX: Correct index order for ∇̂_i γ̄_{jk}
-                    # hat_D_gamma has shape (N, 3, 3, 3) with indices [x, m, n, p] = ∇̂_p γ̄_{mn}
-                    # To get ∇̂_i γ̄_{jk}, we need hat_D_gamma[:, j, k, i]
-                    # CRITICAL FIX: Use bar_gamma_LL (full conformal metric), not h_LL (deviation)
-                    cov_deriv_gamma = e4phi * (hat_D_gamma[:, j, k, i] +
-                                               4.0 * bar_gamma_LL[:, j, k] * d_phi[:, i])
-                    third_term[:, i] += 0.5 * stress_block[:, j, k] * cov_deriv_gamma
+        d1_h = bssn_d1.h_LL
+        hat_D_gamma = get_hat_D_bar_gamma_LL(r, h_LL, d1_h, background)
+
+        # hat_D_gamma has shape (N, 3, 3, 3) with indices [x, m, n, p] = ∇̂_p γ̄_{mn}
+        # To get ∇̂_i γ̄_{jk}, we need hat_D_gamma[:, j, k, i], transpose to (N, i, j, k)
+        # CRITICAL FIX: Use bar_gamma_LL (full conformal metric), not h_LL (deviation)
+        # Formula: ∇̂_i γ_{jk} = e^{4φ} (∂_i γ̄_{jk} + 4 γ̄_{jk} ∂_i φ)
+        hat_D_gamma_reordered = np.moveaxis(hat_D_gamma, 3, 1)  # (N, j, k, i) -> (N, i, j, k)
+        cov_deriv_gamma = (e4phi[:, None, None, None] *
+                          (hat_D_gamma_reordered +
+                           4.0 * bar_gamma_LL[:, None, :, :] * d_phi[:, :, None, None]))
+        third_term = 0.5 * np.einsum('xjk,xijk->xi', stress_block, cov_deriv_gamma)
 
         total_momentum_term = first_term + second_term + third_term
         src_S_vector = alpha[:, None] * e6phi[:, None] * total_momentum_term
@@ -700,3 +624,127 @@ class GRHDEquations:
             "hatD_beta": hatD_beta.copy(),
         }
         return src_S_vector, src_tau, debug
+
+
+# ============================================================================
+# CONSERVATIVE VARIABLES: DENSITIZED FORMULATION
+# ============================================================================
+
+def compute_densitized_conservatives_from_primitives(
+    rho0: np.ndarray,
+    v_U: np.ndarray,
+    W: np.ndarray,
+    h: np.ndarray,
+    pressure: np.ndarray,
+    alpha: np.ndarray,
+    e6phi: np.ndarray,
+    gamma_LL: np.ndarray
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """
+    Compute densitized conservative variables from primitives (3D formulation).
+
+    This implements the Valencia formulation where conservative variables are
+    defined as densitized quantities from the start:
+
+    D̃ = e^{6φ} W ρ₀
+    S̃ᵢ = e^{6φ} W ρ₀ h vᵢ
+    τ̃ = e^{6φ} (α² T⁰⁰ - W ρ₀)
+
+    where T⁰⁰ = ρ₀ h W² - P is the time-time component of the stress-energy tensor.
+
+    Parameters
+    ----------
+    rho0 : np.ndarray
+        Rest mass density (N,)
+    v_U : np.ndarray
+        Contravariant velocity (N, 3)
+    W : np.ndarray
+        Lorentz factor (N,)
+    h : np.ndarray
+        Specific enthalpy (N,)
+    pressure : np.ndarray
+        Pressure (N,)
+    alpha : np.ndarray
+        Lapse function (N,)
+    e6phi : np.ndarray
+        Densitization factor e^{6φ} (N,)
+    gamma_LL : np.ndarray
+        Spatial metric (N, 3, 3)
+
+    Returns
+    -------
+    D_tilde : np.ndarray
+        Densitized rest mass density (N,)
+    S_tildeD : np.ndarray
+        Densitized momentum density (N, 3)
+    tau_tilde : np.ndarray
+        Densitized energy density (N,)
+    """
+    # D̃ = e^{6φ} W ρ₀
+    D_tilde = e6phi * W * rho0
+
+    # S̃ᵢ = e^{6φ} W² ρ₀ h vᵢ
+    # Lower the index: vᵢ = γᵢⱼ vʲ (using Einstein summation)
+    # Handle both scalar and array cases
+    if gamma_LL.ndim == 2:
+        # Scalar case: gamma_LL shape is (3, 3)
+        v_D = np.einsum('ij,j->i', gamma_LL, v_U)  # vᵢ = γᵢⱼ vʲ
+        S_tildeD = (e6phi * W * W * rho0 * h) * v_D
+    else:
+        # Array case: gamma_LL shape is (N, 3, 3)
+        v_D = np.einsum('xij,xj->xi', gamma_LL, v_U)  # vᵢ = γᵢⱼ vʲ
+        S_tildeD = (e6phi * W * W * rho0 * h)[:, np.newaxis] * v_D
+
+    # τ̃ = e^{6φ} (α² T⁰⁰ - W ρ₀)
+    # where T⁰⁰ = ρ₀ h W² - P
+    T00 = rho0 * h * W * W - pressure
+    tau_tilde = e6phi * (alpha**2 * T00 - W * rho0)
+
+    return D_tilde, S_tildeD, tau_tilde
+
+
+def dedensitize_conservatives(
+    D_tilde: np.ndarray,
+    S_tildeD: np.ndarray,
+    tau_tilde: np.ndarray,
+    e6phi: np.ndarray
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """
+    De-densitize conservative variables: U = Ũ / e^{6φ}
+
+    This converts from the densitized conservative variables used in evolution
+    to the physical (non-densitized) conservative variables needed for cons2prim.
+
+    Parameters
+    ----------
+    D_tilde : np.ndarray
+        Densitized rest mass density (N,)
+    S_tildeD : np.ndarray
+        Densitized momentum density (N, 3) or (N,) for 1D
+    tau_tilde : np.ndarray
+        Densitized energy density (N,)
+    e6phi : np.ndarray
+        Densitization factor e^{6φ} (N,)
+
+    Returns
+    -------
+    D : np.ndarray
+        Physical rest mass density (N,)
+    S_D : np.ndarray
+        Physical momentum density (N, 3) or (N,)
+    tau : np.ndarray
+        Physical energy density (N,)
+    """
+    inv_e6phi = 1.0 / np.maximum(e6phi, 1e-30)
+
+    D = D_tilde * inv_e6phi
+
+    # Handle both 1D and 3D momentum
+    if S_tildeD.ndim == 1:
+        S_D = S_tildeD * inv_e6phi
+    else:
+        S_D = S_tildeD * inv_e6phi[:, np.newaxis]
+
+    tau = tau_tilde * inv_e6phi
+
+    return D, S_D, tau

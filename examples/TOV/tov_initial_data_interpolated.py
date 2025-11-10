@@ -445,28 +445,31 @@ def create_initial_data_interpolated(tov_solution, grid, background, eos,
     # Physical metric γ_rr = e^(4φ) × γ̄_rr
     gamma_rr = np.exp(4.0 * phi) * gammabar_rr
 
-    # Convert primitives (rho0, vr=0, P) → conservatives (D, Sr, tau)
-    # using the official prim_to_cons function from cons2prim.py
-    print("  Converting primitives to conservatives using prim_to_cons()...")
-    D_arr, Sr_arr, tau_arr = prim_to_cons(rho_arr, vr_arr, P_arr, gamma_rr, eos)
+    # Densitization factor e^{6φ} for conservative variables
+    e6phi = np.exp(6.0 * phi)
 
-    # Store hydro conservatives
-    bssn_state[NUM_BSSN_VARS + 0, :] = D_arr
-    bssn_state[NUM_BSSN_VARS + 1, :] = Sr_arr
-    bssn_state[NUM_BSSN_VARS + 2, :] = tau_arr
+    # Convert primitives (rho0, vr=0, P) → densitized conservatives (D̃, S̃r, τ̃)
+    # using the official prim_to_cons function from cons2prim.py
+    print("  Converting primitives to densitized conservatives using prim_to_cons()...")
+    D_tilde, Sr_tilde, tau_tilde = prim_to_cons(rho_arr, vr_arr, P_arr, gamma_rr, eos, e6phi=e6phi)
+
+    # Store densitized hydro conservatives
+    bssn_state[NUM_BSSN_VARS + 0, :] = D_tilde
+    bssn_state[NUM_BSSN_VARS + 1, :] = Sr_tilde
+    bssn_state[NUM_BSSN_VARS + 2, :] = tau_tilde
 
     # Ensure exterior is EXACTLY atmosphere (prevent any interpolation artifacts)
     # Recalculate conservative variables for exterior using atmosphere primitives
     exterior_mask = r_grid > R_star
     n_exterior = np.sum(exterior_mask)
     if n_exterior > 0:
-        # Use prim_to_cons for atmosphere to ensure consistency
-        D_atm, Sr_atm, tau_atm = prim_to_cons(
-            atmosphere_rho, 0.0, p_atm, gamma_rr[exterior_mask], eos
+        # Use prim_to_cons for atmosphere to ensure consistency (densitized)
+        D_atm_tilde, Sr_atm_tilde, tau_atm_tilde = prim_to_cons(
+            atmosphere_rho, 0.0, p_atm, gamma_rr[exterior_mask], eos, e6phi=e6phi[exterior_mask]
         )
-        bssn_state[NUM_BSSN_VARS + 0, exterior_mask] = D_atm
-        bssn_state[NUM_BSSN_VARS + 1, exterior_mask] = Sr_atm
-        bssn_state[NUM_BSSN_VARS + 2, exterior_mask] = tau_atm
+        bssn_state[NUM_BSSN_VARS + 0, exterior_mask] = D_atm_tilde
+        bssn_state[NUM_BSSN_VARS + 1, exterior_mask] = Sr_atm_tilde
+        bssn_state[NUM_BSSN_VARS + 2, exterior_mask] = tau_atm_tilde
         print(f"  Set {n_exterior} exterior points (r > {R_star:.6f}) to atmosphere (via prim_to_cons)")
 
     # Fill ghost zones
@@ -480,8 +483,12 @@ def create_initial_data_interpolated(tov_solution, grid, background, eos,
 # Diagnostic/Validation Functions 
 # ============================================================================
 
-def plot_initial_comparison(tov_solution, initial_state_2d, grid, hydro, output_dir="."):
-    """Plot initial data vs TOV comparison (ρ0, P, v^r, α)."""
+def plot_initial_comparison(tov_solution, initial_state_2d, grid, hydro, output_dir=".", suffix=""):
+    """Plot initial data vs TOV comparison (ρ0, P, v^r, α).
+
+    Args:
+        suffix: Optional suffix to append to filename (e.g., "_bssn")
+    """
     bssn_vars = BSSNVars(grid.N)
     bssn_vars.set_bssn_vars(initial_state_2d[:NUM_BSSN_VARS, :])
     hydro.set_matter_vars(initial_state_2d, bssn_vars, grid)
@@ -525,7 +532,8 @@ def plot_initial_comparison(tov_solution, initial_state_2d, grid, hydro, output_
     plt.suptitle('TOV vs Initial Data (t=0)', fontsize=14, y=1.00)
     plt.tight_layout()
     import os
-    filepath = os.path.join(output_dir, 'tov_initial_data_comparison.png')
+    filename = f'tov_initial_data_comparison{suffix}.png'
+    filepath = os.path.join(output_dir, filename)
     plt.savefig(filepath, dpi=150, bbox_inches='tight')
     plt.close(fig)
     print(f"Saved: {filepath}")

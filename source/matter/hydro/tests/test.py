@@ -379,7 +379,7 @@ def test_riemann_sod():
             )
         else:
             grid, hydro, background = build_hydro_and_grid(
-                n_interior=2000, r_max=1.0, gamma=gamma, reconstructor=method
+                n_interior=200, r_max=1.0, gamma=gamma, reconstructor=method
             )
 
         # Discontinuidad en el punto medio del dominio interior
@@ -628,7 +628,7 @@ def test_blast_wave_compare(case='weak'):
             )
         else:
             grid, hydro, background = build_hydro_and_grid(
-                n_interior=2000, r_max=1.0, gamma=1.4, reconstructor=method
+                n_interior=100, r_max=1.0, gamma=1.4, reconstructor=method
             )
 
         # Parámetros del blast

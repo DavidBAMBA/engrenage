@@ -26,10 +26,7 @@ import traceback
 sys.path.insert(0, '/home/yo/repositories/engrenage')
 
 from source.matter.hydro.eos import IdealGasEOS
-from source.matter.hydro.cons2prim import (
-    cons_to_prim, Cons2PrimSolver, prim_to_cons,
-    _solve_pressure, _bracket_pressure, _state_from_p
-)
+from source.matter.hydro.cons2prim import Cons2PrimSolver, prim_to_cons
 
 # ============================================================================
 # TEST DATA GENERATION
@@ -229,11 +226,10 @@ def benchmark_performance():
         D, Sr, tau = prim_to_cons(rho0, vr, p, gamma_rr, eos)
         # Use tuple format (more efficient than dict)
         U = (D, Sr, tau)
-        metric = (np.ones(N), np.zeros(N), gamma_rr)
 
         # Time conversion
         start_time = time.time()
-        result = solver.convert(U, metric=metric)
+        result = solver.convert(U, gamma_rr=gamma_rr)
         elapsed_time = time.time() - start_time
 
         success_rate = np.mean(result['success'])
@@ -288,9 +284,8 @@ def test_correctness():
         D, Sr, tau = prim_to_cons(rho0, vr, p, gamma_rr, eos)
 
         # Convert back
-        U = {'D': D, 'Sr': Sr, 'tau': tau}
-        metric = {'gamma_rr': gamma_rr}
-        result = solver.convert(U, metric=metric)
+        U = (D, Sr, tau)
+        result = solver.convert(U, gamma_rr=gamma_rr)
 
         print(f"  Success: {result['success']}")
         print(f"  Original rho0: {rho0}")
@@ -341,11 +336,10 @@ def analyze_failures():
                                  np.array([p]), np.array([gamma_rr]), eos)
 
         # Try conversion
-        U = {'D': D, 'Sr': Sr, 'tau': tau}
-        metric = {'gamma_rr': np.array([gamma_rr])}
+        U = (D, Sr, tau)
 
         try:
-            result = solver.convert(U, metric=metric)
+            result = solver.convert(U, gamma_rr=np.array([gamma_rr]))
 
             if result['success'][0]:
                 successes.append((rho0, vr, p, description))
@@ -392,11 +386,10 @@ def compare_vectorized_vs_legacy():
     # Test vectorized approach
     print("Testing vectorized solver...")
     solver = Cons2PrimSolver(eos)
-    U = {'D': D, 'Sr': Sr, 'tau': tau}
-    metric = {'gamma_rr': gamma_rr}
+    U = (D, Sr, tau)
 
     start_time = time.time()
-    result_vec = solver.convert(U, metric=metric)
+    result_vec = solver.convert(U, gamma_rr=gamma_rr)
     time_vec = time.time() - start_time
 
     # Test legacy approach (point by point)
@@ -452,51 +445,12 @@ def compare_vectorized_vs_legacy():
 # ============================================================================
 
 def analyze_solver_statistics():
-    """Analyze solver internal statistics."""
+    """Analyze solver internal statistics (DEPRECATED - statistics removed)."""
     print("=" * 60)
     print("SOLVER STATISTICS ANALYSIS")
     print("=" * 60)
-
-    eos = IdealGasEOS(2.0)
-    solver = Cons2PrimSolver(eos)
-
-    # Reset statistics
-    solver.reset_statistics()
-
-    # Run various test cases
-    test_regimes = {
-        'normal': (lambda N: create_test_data_varied(N)[:3]),
-        'extreme': (lambda N: (
-            np.random.uniform(1e-10, 100, N),
-            np.random.uniform(-0.95, 0.95, N),
-            np.random.uniform(1e-15, 1000, N)
-        ))
-    }
-
-    for regime_name, data_func in test_regimes.items():
-        print(f"\nTesting {regime_name} regime:")
-
-        N = 1000
-        rho0, vr, p = data_func(N)
-        gamma_rr = np.ones(N)
-        D, Sr, tau = prim_to_cons(rho0, vr, p, gamma_rr, eos)
-
-        U = {'D': D, 'Sr': Sr, 'tau': tau}
-        metric = {'gamma_rr': gamma_rr}
-
-        start_time = time.time()
-        result = solver.convert(U, metric=metric)
-        elapsed = time.time() - start_time
-
-        stats = solver.get_statistics()
-
-        print(f"  Time: {elapsed:.4f} s")
-        print(f"  Success rate: {stats['success_rate']:.3f}")
-        print(f"  Newton success rate: {stats['newton_rate']:.3f}")
-        print(f"  Bisection fallback rate: {stats['bisection_rate']:.3f}")
-        print(f"  Total calls: {stats['total_calls']}")
-
-        solver.reset_statistics()
+    print("\nNOTE: Statistics tracking has been removed from simplified solver.")
+    print("This test is skipped.\n")
 
 # ============================================================================
 # MAIN TEST RUNNER

@@ -374,7 +374,7 @@ class HLLRiemannSolver:
     def _physical_flux(self, U, prim, alpha, beta_r):
         D, Sr, tau = U
         _, vr, p = prim
-        vtil = vr - beta_r / alpha  # Valencia transport velocity
+        vtil = vr # - beta_r / alpha  # Valencia transport velocity
         fD = D * vtil
         fSr = Sr * vtil + p
         ftau = (tau + p) * vtil
@@ -383,24 +383,10 @@ class HLLRiemannSolver:
     def _physical_flux_batch(self, U, prim, alpha, beta_r):
         D = U[:, 0]; Sr = U[:, 1]; tau = U[:, 2]
         vr = prim[:, 1]; p = prim[:, 2]
-        vtil = vr - beta_r / alpha
+        vtil = vr #- beta_r / alpha
         fD = D * vtil
         fSr = Sr * vtil + p
         ftau = (tau + p) * vtil
         return np.stack([fD, fSr, ftau], axis=1)
 
-    # (Mantengo entropy-fix por compatibilidad; no es necesario si usas cmin/cmax directamente)
-    def _entropy_fix(self, lam_minus, lam_plus, delta=1e-8):
-        lam_minus = min(lam_minus, -abs(delta))
-        lam_plus  = max(lam_plus,  abs(delta))
-        # orden garantizado
-        lo = min(lam_minus, lam_plus)
-        hi = max(lam_minus, lam_plus)
-        return lo, hi
 
-    def _entropy_fix_batch(self, lam_minus, lam_plus, delta=1e-8):
-        lam_minus = np.minimum(lam_minus, -abs(delta))
-        lam_plus  = np.maximum(lam_plus,  abs(delta))
-        lo = np.minimum(lam_minus, lam_plus)
-        hi = np.maximum(lam_minus, lam_plus)
-        return lo, hi

@@ -1,12 +1,12 @@
 import numpy as np
 import sys
 import os
+import matplotlib.pyplot as plt
+from scipy.integrate import ode, trapezoid, simpson
+from scipy.interpolate import interp1d
 import h5py
 import json
 from datetime import datetime
-import matplotlib.pyplot as plt
-from scipy.integrate import ode, trapezoid
-from scipy.interpolate import interp1d
 
 # Create directory for plots
 # Get the directory where this script is located
@@ -27,9 +27,7 @@ from source.bssn.bssnvars import BSSNVars
 from source.bssn.bssnstatevariables import (NUM_BSSN_VARS, idx_phi, idx_hrr, idx_htt, idx_hpp,
                                              idx_K, idx_arr, idx_att, idx_app, idx_lapse)
 from source.bssn.tensoralgebra import get_bar_gamma_LL
-from source.bssn.bssnrhs import get_bssn_rhs
-from source.core.rhsevolution import get_rhs
-from tqdm import tqdm
+from source.bssn.constraintsdiagnostic import get_constraints_diagnostic
 
 # Hydro
 from source.matter.perfect_fluid import PerfectFluid
@@ -43,227 +41,15 @@ from source.bssn.tensoralgebra import get_bar_gamma_LL
 from tov_solver import TOVSolver
 import tov_initial_data_interpolated as tov_id
 
-# Directory for saving plots
-PLOT_DIR = "plots"
-
-
-class SimulationDataManager:
-    """Manages data storage for long TOV simulations."""
-
-    def __init__(self, output_dir, grid, hydro, enable_saving=False):
-        """
-        Initialize data manager.
-
-        Args:
-            output_dir: Directory for output files
-            grid: Grid object
-            hydro: Hydro object
-            enable_saving: If True, saves data to files
-        """
-        self.enable_saving = enable_saving
-        if not self.enable_saving:
-            return
-
-        self.output_dir = output_dir
-        self.grid = grid
-        self.hydro = hydro
-
-        # Create output directory
-        os.makedirs(output_dir, exist_ok=True)
-
-        # Initialize HDF5 files
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        self.snapshot_file = os.path.join(output_dir, f"tov_snapshots_{timestamp}.h5")
-        self.evolution_file = os.path.join(output_dir, f"tov_evolution_{timestamp}.h5")
-        self.metadata_file = os.path.join(output_dir, f"tov_metadata_{timestamp}.json")
-
-        # Initialize evolution data lists (for buffering)
-        self.evolution_buffer = {
-            'step': [],
-            'time': [],
-            'rho_central': [],
-            'p_central': [],
-            'max_rho_error': [],
-            'max_p_error': [],
-            'max_velocity': [],
-            'l1_rho_error': [],
-            'l2_rho_error': [],
-            'max_D': [],
-            'max_Sr': [],
-            'max_tau': [],
-            'c2p_fails': []
-        }
-
-        # Initialize HDF5 files
-        self._init_hdf5_files()
-
-    def _init_hdf5_files(self):
-        """Initialize HDF5 files with proper structure."""
-        if not self.enable_saving:
-            return
-
-        # Snapshot file
-        with h5py.File(self.snapshot_file, 'w') as f:
-            # Create groups
-            f.create_group('snapshots')
-            f.create_group('grid')
-
-            # Save grid data
-            f['grid/r'] = self.grid.r
-            f['grid/N'] = self.grid.N
-            f['grid/r_max'] = self.grid.r[-1]
-
-        # Evolution file
-        with h5py.File(self.evolution_file, 'w') as f:
-            # Create expandable datasets for time series
-            for key in self.evolution_buffer.keys():
-                f.create_dataset(key, shape=(0,), maxshape=(None,),
-                               dtype=np.float64, chunks=True)
-
-    def save_metadata(self, tov_solution, atmosphere_params, dt, integration_method, K=None, Gamma=None, rho_central=None):
-        """Save simulation metadata."""
-        if not self.enable_saving:
-            return
-
-        metadata = {
-            'tov_solution': {
-                'M_star': float(tov_solution['M_star']),
-                'R': float(tov_solution['R']),
-                'C': float(tov_solution['C']),
-                'K': float(K) if K is not None else float(tov_solution.get('K', 0)),
-                'Gamma': float(Gamma) if Gamma is not None else float(tov_solution.get('Gamma', 0)),
-                'rho_central': float(rho_central) if rho_central is not None else float(tov_solution.get('rho_central', 0))
-            },
-            'atmosphere': {
-                'rho_floor': float(atmosphere_params.rho_floor),
-                'p_floor': float(atmosphere_params.p_floor),
-                'v_max': float(atmosphere_params.v_max),
-                'W_max': float(atmosphere_params.W_max)
-            },
-            'simulation': {
-                'dt': float(dt) if dt is not None else None,
-                'integration_method': integration_method,
-                'grid_N': int(self.grid.N),
-                'grid_r_max': float(self.grid.r[-1])
-            },
-            'timestamp': datetime.now().isoformat()
-        }
-
-        with open(self.metadata_file, 'w') as f:
-            json.dump(metadata, f, indent=2)
-
-    def save_snapshot(self, step, time, state_2d, primitives=None):
-        """Save full domain snapshot."""
-        if not self.enable_saving:
-            return
-
-        with h5py.File(self.snapshot_file, 'a') as f:
-            # Check if snapshot already exists, if so skip or overwrite
-            snap_name = f'step_{step:08d}'
-            if snap_name in f['snapshots']:
-                print(f"Warning: Snapshot {snap_name} already exists, skipping...")
-                return
-            snap_group = f['snapshots'].create_group(snap_name)
-
-            # Save metadata for this snapshot
-            snap_group.attrs['step'] = step
-            snap_group.attrs['time'] = time
-
-            # Save conservative variables
-            cons_group = snap_group.create_group('conservatives')
-            cons_group['D'] = state_2d[self.hydro.idx_D, :]
-            cons_group['Sr'] = state_2d[self.hydro.idx_Sr, :]
-            cons_group['tau'] = state_2d[self.hydro.idx_tau, :]
-
-            # Save BSSN variables
-            bssn_group = snap_group.create_group('bssn')
-            bssn_group['phi'] = state_2d[0, :]
-            bssn_group['a'] = state_2d[1, :]
-            bssn_group['alpha'] = state_2d[2, :]
-            bssn_group['betaR'] = state_2d[3, :]
-            bssn_group['Br'] = state_2d[4, :]
-            bssn_group['K'] = state_2d[5, :]
-
-            # Save primitives if provided
-            if primitives is not None:
-                prim_group = snap_group.create_group('primitives')
-                prim_group['rho0'] = primitives['rho0']
-                prim_group['p'] = primitives['p']
-                prim_group['eps'] = primitives['eps']
-                prim_group['vr'] = primitives['vr']
-                prim_group['W'] = primitives['W']
-
-    def add_evolution_point(self, step, time, state_2d, primitives, reference_primitives):
-        """Add a point to the evolution time series."""
-        if not self.enable_saving:
-            return
-
-        interior = slice(NUM_GHOSTS, -NUM_GHOSTS)
-
-        # Calculate errors
-        delta_rho = np.abs(primitives['rho0'][interior] - reference_primitives['rho0'][interior])
-        rel_delta_rho = delta_rho / (np.abs(reference_primitives['rho0'][interior]) + 1e-20)
-
-        delta_p = np.abs(primitives['p'][interior] - reference_primitives['p'][interior])
-        rel_delta_p = delta_p / (np.abs(reference_primitives['p'][interior]) + 1e-20)
-
-        # L1 and L2 norms of density error (inside star only)
-        star_mask = reference_primitives['rho0'][interior] > 10 * self.hydro.atmosphere.rho_floor
-        if np.any(star_mask):
-            l1_rho = np.mean(delta_rho[star_mask])
-            l2_rho = np.sqrt(np.mean(delta_rho[star_mask]**2))
-        else:
-            l1_rho = 0.0
-            l2_rho = 0.0
-
-        # Store in buffer
-        self.evolution_buffer['step'].append(step)
-        self.evolution_buffer['time'].append(time)
-        self.evolution_buffer['rho_central'].append(primitives['rho0'][NUM_GHOSTS])
-        self.evolution_buffer['p_central'].append(primitives['p'][NUM_GHOSTS])
-        self.evolution_buffer['max_rho_error'].append(np.max(rel_delta_rho))
-        self.evolution_buffer['max_p_error'].append(np.max(rel_delta_p))
-        self.evolution_buffer['max_velocity'].append(np.max(np.abs(primitives['vr'])))
-        self.evolution_buffer['l1_rho_error'].append(l1_rho)
-        self.evolution_buffer['l2_rho_error'].append(l2_rho)
-        self.evolution_buffer['max_D'].append(np.max(state_2d[self.hydro.idx_D, :]))
-        self.evolution_buffer['max_Sr'].append(np.max(np.abs(state_2d[self.hydro.idx_Sr, :])))
-        self.evolution_buffer['max_tau'].append(np.max(state_2d[self.hydro.idx_tau, :]))
-        self.evolution_buffer['c2p_fails'].append(np.sum(~primitives['success']))
-
-    def flush_evolution_buffer(self):
-        """Write buffered evolution data to HDF5 file."""
-        if not self.enable_saving or not self.evolution_buffer['step']:
-            return
-
-        with h5py.File(self.evolution_file, 'a') as f:
-            for key, values in self.evolution_buffer.items():
-                dataset = f[key]
-                old_size = dataset.shape[0]
-                new_size = old_size + len(values)
-                dataset.resize(new_size, axis=0)
-                dataset[old_size:new_size] = values
-
-        # Clear buffer
-        for key in self.evolution_buffer:
-            self.evolution_buffer[key] = []
-
-    def finalize(self):
-        """Finalize data storage (flush buffers, close files)."""
-        if not self.enable_saving:
-            return
-
-        self.flush_evolution_buffer()
-        print(f"\nData saved to:")
-        print(f"  - Snapshots: {self.snapshot_file}")
-        print(f"  - Evolution: {self.evolution_file}")
-        print(f"  - Metadata:  {self.metadata_file}")
+# Import utilities (plotting, data management, helper functions)
+import utils_TOVEvolution as utils
 
 
 def diagnose_t0_residuals(state_2d, grid, background, hydro):
     """Compute and print t=0 RHS residuals (especially dS_r/dt) to locate imbalance.
 
     This helps identify discrete hydrostatic imbalance (typically strongest near the surface).
+    Also computes Hamiltonian constraint violation.
     """
     # Build BSSN containers (Cowling)
     bssn_vars = BSSNVars(grid.N)
@@ -284,12 +70,23 @@ def diagnose_t0_residuals(state_2d, grid, background, hydro):
     print(f"  max |dD/dt|   = {np.max(np.abs(rhs_D[interior])):.3e}")
     print(f"  max |dτ/dt|   = {np.max(np.abs(rhs_tau[interior])):.3e}")
 
+    # Compute Hamiltonian constraint
+    print("\nHamiltonian constraint at t=0:")
+    Ham, Mom = compute_hamiltonian_constraint(state_2d, grid, background, hydro)
+    max_Ham = np.max(np.abs(Ham[interior]))
+    i_max_Ham = NUM_GHOSTS + int(np.argmax(np.abs(Ham[interior])))
+    print(f"  max |Ham| = {max_Ham:.3e} at r={grid.r[i_max_Ham]:.6f} (i={i_max_Ham})")
+
+    # L2 norm of Ham (physical measure)
+    L2_Ham = np.sqrt(np.mean(Ham[interior]**2))
+    print(f"  L2(Ham)   = {L2_Ham:.3e}")
+
     # Coarse surface estimate from primitives
-    prim = hydro._get_primitives(bssn_vars, grid.r, grid=grid)
+    prim = hydro._get_primitives(bssn_vars, grid.r)
     mask_interior = prim['rho0'] > 1e-6
     if np.any(mask_interior):
         i_surf = np.where(mask_interior)[0][-1]
-        print(f"  estimated stellar surface near r={grid.r[i_surf]:.6f} (i={i_surf})")
+        print(f"\n  estimated stellar surface near r={grid.r[i_surf]:.6f} (i={i_surf})")
         window = slice(max(NUM_GHOSTS, i_surf-5), min(grid.N-NUM_GHOSTS, i_surf+6))
         print("  dS_r/dt in 11-pt window around surface:")
         for ii in range(window.start, window.stop):
@@ -298,497 +95,342 @@ def diagnose_t0_residuals(state_2d, grid, background, hydro):
         print("  WARNING: could not locate interior points above threshold.")
 
 
-def plot_first_step(state_t0, state_t1, grid, hydro, tov_solution=None):
-    """Plot only t=0 vs t=1×dt to inspect the first update."""
-    bssn_0 = BSSNVars(grid.N)
-    bssn_0.set_bssn_vars(state_t0[:NUM_BSSN_VARS, :])
-    hydro.set_matter_vars(state_t0, bssn_0, grid)
-    prim_0 = hydro._get_primitives(bssn_0, grid.r, grid=grid)
+def get_rhs_bssn(t, y, grid, background, hydro):
+    """RHS for full BSSN + Hydro evolution.
 
-    bssn_1 = BSSNVars(grid.N)
-    bssn_1.set_bssn_vars(state_t1[:NUM_BSSN_VARS, :])
-    hydro.set_matter_vars(state_t1, bssn_1, grid)
-    prim_1 = hydro._get_primitives(bssn_1, grid.r, grid=grid)
-
-    r_int = grid.r[NUM_GHOSTS:-NUM_GHOSTS]
-
-    # Compute mass using integral M(r) = 4π ∫_0^r ρ r^2 dr
-    from scipy.integrate import cumulative_trapezoid
-    rho_0 = prim_0['rho0']
-    rho_1 = prim_1['rho0']
-    # Full grid mass calculation
-    M_0_full = 4.0 * np.pi * cumulative_trapezoid(rho_0 * grid.r**2, grid.r, initial=0.0)
-    M_1_full = 4.0 * np.pi * cumulative_trapezoid(rho_1 * grid.r**2, grid.r, initial=0.0)
-
-    # ========================================================================
-    # ANALYSIS: Print values at key locations
-    # ========================================================================
-    print("\n" + "="*80)
-    print("FIRST STEP ANALYSIS: Changes from t=0 to t=1×dt")
-    print("="*80)
-
-    # Find indices for key locations
-    idx_center = NUM_GHOSTS  # First interior point (center)
-    idx_left = NUM_GHOSTS + 10  # Near left boundary (interior)
-
-    # Find index closest to stellar radius (if TOV solution provided)
-    if tov_solution is not None:
-        R_star = tov_solution['R']
-        idx_star = np.argmin(np.abs(grid.r - R_star))
-        print(f"\nStellar radius R = {R_star:.4f} at grid index {idx_star} (r = {grid.r[idx_star]:.4f})")
-    else:
-        # Estimate stellar surface as where density drops below threshold
-        rho_threshold = 1e-6
-        interior_mask = rho_0 > rho_threshold
-        if np.any(interior_mask):
-            idx_star = np.where(interior_mask)[0][-1]
-            R_star = grid.r[idx_star]
-            print(f"\nEstimated stellar surface at r = {R_star:.4f} (ρ < {rho_threshold})")
-        else:
-            idx_star = len(grid.r) // 2
-            R_star = grid.r[idx_star]
-            print(f"\nUsing midpoint as reference: r = {R_star:.4f}")
-
-    idx_right = -NUM_GHOSTS - 1  # Last interior point (far boundary)
-
-    def analyze_point(idx, label):
-        """Analyze all quantities at a given index."""
-        r = grid.r[idx]
-        print(f"\n{'-'*80}")
-        print(f"{label}: r = {r:.6f} (index {idx})")
-        print(f"{'-'*80}")
-
-        # Hydro primitives
-        rho0_0, rho0_1 = rho_0[idx], rho_1[idx]
-        p0, p1 = prim_0['p'][idx], prim_1['p'][idx]
-        vr0, vr1 = prim_0['vr'][idx], prim_1['vr'][idx]
-
-        # BSSN variables
-        phi0, phi1 = state_t0[idx_phi, idx], state_t1[idx_phi, idx]
-        alpha0, alpha1 = state_t0[idx_lapse, idx], state_t1[idx_lapse, idx]
-        hrr0, hrr1 = state_t0[idx_hrr, idx], state_t1[idx_hrr, idx]
-        K0, K1 = state_t0[idx_K, idx], state_t1[idx_K, idx]
-        arr0, arr1 = state_t0[idx_arr, idx], state_t1[idx_arr, idx]
-
-        # Mass
-        M0, M1 = M_0_full[idx], M_1_full[idx]
-
-        # Conservative variables
-        D0 = state_t0[NUM_BSSN_VARS + 0, idx]
-        D1 = state_t1[NUM_BSSN_VARS + 0, idx]
-        Sr0 = state_t0[NUM_BSSN_VARS + 1, idx]
-        Sr1 = state_t1[NUM_BSSN_VARS + 1, idx]
-        tau0 = state_t0[NUM_BSSN_VARS + 2, idx]
-        tau1 = state_t1[NUM_BSSN_VARS + 2, idx]
-
-        def rel_change(v0, v1):
-            """Relative change with safe division."""
-            if abs(v0) < 1e-30:
-                return f"{v1:.6e}" if abs(v1) > 1e-30 else "0"
-            return f"{(v1-v0)/v0:.6e}"
-
-        def abs_change(v0, v1):
-            """Absolute change."""
-            return f"{v1-v0:.6e}"
-
-        print(f"\nPRIMITIVE VARIABLES:")
-        print(f"  ρ₀:     {rho0_0:.8e} → {rho0_1:.8e}   Δrel = {rel_change(rho0_0, rho0_1)}")
-        print(f"  P:      {p0:.8e} → {p1:.8e}   Δrel = {rel_change(p0, p1)}")
-        print(f"  vʳ:     {vr0:.8e} → {vr1:.8e}   Δabs = {abs_change(vr0, vr1)}")
-
-        print(f"\nCONSERVATIVE VARIABLES:")
-        print(f"  D:      {D0:.8e} → {D1:.8e}   Δrel = {rel_change(D0, D1)}")
-        print(f"  Sʳ:     {Sr0:.8e} → {Sr1:.8e}   Δabs = {abs_change(Sr0, Sr1)}")
-        print(f"  τ:      {tau0:.8e} → {tau1:.8e}   Δrel = {rel_change(tau0, tau1)}")
-
-        print(f"\nBSSN VARIABLES:")
-        print(f"  φ:      {phi0:.8e} → {phi1:.8e}   Δrel = {rel_change(phi0, phi1)}")
-        print(f"  α:      {alpha0:.8e} → {alpha1:.8e}   Δrel = {rel_change(alpha0, alpha1)}")
-        print(f"  hʳʳ:    {hrr0:.8e} → {hrr1:.8e}   Δrel = {rel_change(hrr0, hrr1)}")
-        print(f"  K:      {K0:.8e} → {K1:.8e}   Δabs = {abs_change(K0, K1)}")
-        print(f"  aʳʳ:    {arr0:.8e} → {arr1:.8e}   Δabs = {abs_change(arr0, arr1)}")
-
-        print(f"\nDERIVED QUANTITIES:")
-        print(f"  M(r):   {M0:.8e} → {M1:.8e}   Δrel = {rel_change(M0, M1)}")
-
-        # Compute specific internal energy and enthalpy
-        eps0 = hydro.eos.eps_from_rho_p(rho0_0, p0)
-        eps1 = hydro.eos.eps_from_rho_p(rho0_1, p1)
-        h0 = 1.0 + eps0 + p0/max(rho0_0, 1e-30)
-        h1 = 1.0 + eps1 + p1/max(rho0_1, 1e-30)
-        print(f"  ε:      {eps0:.8e} → {eps1:.8e}   Δrel = {rel_change(eps0, eps1)}")
-        print(f"  h:      {h0:.8e} → {h1:.8e}   Δrel = {rel_change(h0, h1)}")
-
-    # Analyze key points
-    analyze_point(idx_center, "CENTER (r≈0)")
-    analyze_point(idx_left, "LEFT INTERIOR")
-    analyze_point(idx_star, "STELLAR SURFACE")
-    analyze_point(idx_right, "FAR BOUNDARY")
-
-    # Global statistics
-    print(f"\n{'='*80}")
-    print("GLOBAL STATISTICS:")
-    print(f"{'='*80}")
-
-    interior = slice(NUM_GHOSTS, -NUM_GHOSTS)
-
-    def safe_rel_error(arr0, arr1):
-        """Compute relative error safely."""
-        mask = np.abs(arr0) > 1e-30
-        rel_err = np.zeros_like(arr0)
-        rel_err[mask] = np.abs((arr1[mask] - arr0[mask]) / arr0[mask])
-        return rel_err
-
-    rho_rel_err = safe_rel_error(rho_0[interior], rho_1[interior])
-    p_rel_err = safe_rel_error(prim_0['p'][interior], prim_1['p'][interior])
-    phi_rel_err = safe_rel_error(state_t0[idx_phi, interior], state_t1[idx_phi, interior])
-    alpha_rel_err = safe_rel_error(state_t0[idx_lapse, interior], state_t1[idx_lapse, interior])
-
-    print(f"\nMax relative changes (interior points):")
-    print(f"  ρ₀:     {np.max(rho_rel_err):.6e}")
-    print(f"  P:      {np.max(p_rel_err):.6e}")
-    print(f"  φ:      {np.max(phi_rel_err):.6e}")
-    print(f"  α:      {np.max(alpha_rel_err):.6e}")
-    print(f"  |vʳ|:   {np.max(np.abs(prim_1['vr'][interior])):.6e}")
-
-    print(f"\nLocations of maximum changes:")
-    idx_max_rho = NUM_GHOSTS + np.argmax(rho_rel_err)
-    idx_max_p = NUM_GHOSTS + np.argmax(p_rel_err)
-    idx_max_v = NUM_GHOSTS + np.argmax(np.abs(prim_1['vr'][interior]))
-    print(f"  Max Δρ/ρ at r = {grid.r[idx_max_rho]:.6f} (index {idx_max_rho})")
-    print(f"  Max ΔP/P at r = {grid.r[idx_max_p]:.6f} (index {idx_max_p})")
-    print(f"  Max |vʳ| at r = {grid.r[idx_max_v]:.6f} (index {idx_max_v})")
-
-    print("="*80 + "\n")
-
-    fig, axes = plt.subplots(2, 3, figsize=(15, 9))
-
-    # Density
-    axes[0, 0].semilogy(r_int, prim_0['rho0'][NUM_GHOSTS:-NUM_GHOSTS], 'b-', linewidth=2, label='t=0')
-    axes[0, 0].semilogy(r_int, prim_1['rho0'][NUM_GHOSTS:-NUM_GHOSTS], 'r--', linewidth=1.7, label='t=1×dt')
-    axes[0, 0].set_xlabel('r')
-    axes[0, 0].set_ylabel(r'$\rho_0$')
-    axes[0, 0].set_title('Density: first step')
-    axes[0, 0].legend()
-    axes[0, 0].grid(True, alpha=0.3)
-
-    # Pressure
-    axes[0, 1].semilogy(r_int, np.maximum(prim_0['p'][NUM_GHOSTS:-NUM_GHOSTS], 1e-20), 'b-', linewidth=2, label='t=0')
-    axes[0, 1].semilogy(r_int, np.maximum(prim_1['p'][NUM_GHOSTS:-NUM_GHOSTS], 1e-20), 'r--', linewidth=1.7, label='t=1×dt')
-    axes[0, 1].set_xlabel('r')
-    axes[0, 1].set_ylabel('P')
-    axes[0, 1].set_title('Pressure: first step')
-    axes[0, 1].legend()
-    axes[0, 1].grid(True, alpha=0.3)
-
-    # Velocity
-    axes[0, 2].plot(r_int, prim_0['vr'][NUM_GHOSTS:-NUM_GHOSTS], 'b-', linewidth=2, label='t=0')
-    axes[0, 2].plot(r_int, prim_1['vr'][NUM_GHOSTS:-NUM_GHOSTS], 'r--', linewidth=1.7, label='t=1×dt')
-    axes[0, 2].set_xlabel('r')
-    axes[0, 2].set_ylabel(r'$v^r$')
-    axes[0, 2].set_title('Velocity: first step')
-    axes[0, 2].legend()
-    axes[0, 2].grid(True, alpha=0.3)
-
-    # Lapse
-    axes[1, 0].plot(r_int, state_t0[idx_lapse, NUM_GHOSTS:-NUM_GHOSTS], 'b-', linewidth=2, label='t=0')
-    axes[1, 0].plot(r_int, state_t1[idx_lapse, NUM_GHOSTS:-NUM_GHOSTS], 'r--', linewidth=1.7, label='t=1×dt')
-    axes[1, 0].set_xlabel('r')
-    axes[1, 0].set_ylabel(r'$\alpha$')
-    axes[1, 0].set_title('Lapse: first step')
-    axes[1, 0].legend()
-    axes[1, 0].grid(True, alpha=0.3)
-
-    # Mass
-    axes[1, 1].plot(r_int, M_0_full[NUM_GHOSTS:-NUM_GHOSTS], 'b-', linewidth=2, label='t=0')
-    axes[1, 1].plot(r_int, M_1_full[NUM_GHOSTS:-NUM_GHOSTS], 'r--', linewidth=1.7, label='t=1×dt')
-    axes[1, 1].set_xlabel('r')
-    axes[1, 1].set_ylabel('M(r)')
-    axes[1, 1].set_title('Enclosed Mass: first step')
-    axes[1, 1].legend()
-    axes[1, 1].grid(True, alpha=0.3)
-
-    # Phi
-    axes[1, 2].plot(r_int, state_t0[idx_phi, NUM_GHOSTS:-NUM_GHOSTS], 'b-', linewidth=2, label='t=0')
-    axes[1, 2].plot(r_int, state_t1[idx_phi, NUM_GHOSTS:-NUM_GHOSTS], 'r--', linewidth=1.7, label='t=1×dt')
-    axes[1, 2].set_xlabel('r')
-    axes[1, 2].set_ylabel(r'$\phi$')
-    axes[1, 2].set_title('Conformal Factor: first step')
-    axes[1, 2].legend()
-    axes[1, 2].grid(True, alpha=0.3)
-
-    plt.tight_layout()
-    plt.savefig(os.path.join(PLOT_DIR, 'tov_first_step.png'), dpi=150, bbox_inches='tight')
-    plt.close(fig)
-
-
-def plot_surface_zoom(tov_solution, state_t0, state_t1, grid, hydro, window=0.5):
-    """Zoom near the stellar surface R to compare t=0 vs t=1×dt.
-
-    Plots overlays for (ρ0, P, v^r, D, S_r, τ) in a window [R−window, R+window].
+    Standard finite volume workflow:
+    1. Fill conservative ghost zones (parity + outflow)
+    2. Compute primitives via cons2prim
+    3. Reconstruct primitives to cell faces
+    4. Solve Riemann problem for fluxes
+    5. Compute RHS with connection and source terms
+    6. Evolve BSSN variables dynamically
     """
-    R = float(tov_solution['R'])
-    r = grid.r
-    mask = (r >= R - window) & (r <= R + window)
-    if not np.any(mask):
-        return
+    from source.bssn.bssnrhs import get_bssn_rhs
 
-    bssn0 = BSSNVars(grid.N)
-    bssn0.set_bssn_vars(state_t0[:NUM_BSSN_VARS, :])
-    hydro.set_matter_vars(state_t0, bssn0, grid)
-    prim0 = hydro._get_primitives(bssn0, r, grid=grid)
+    state = y.reshape((grid.NUM_VARS, grid.N))
+    grid.fill_boundaries(state)
 
-    bssn1 = BSSNVars(grid.N)
-    bssn1.set_bssn_vars(state_t1[:NUM_BSSN_VARS, :])
-    hydro.set_matter_vars(state_t1, bssn1, grid)
-    prim1 = hydro._get_primitives(bssn1, r, grid=grid)
+    # ATMOSPHERE TREATMENT WITH TRANSITION ZONE
+    # Strategy: Instead of abrupt freeze at atmosphere threshold, use smooth transition
+    # to avoid artificial "wall" that reflects flux from stellar surface.
+    #
+    # IMPORTANT: When modifying STATE directly (not RHS), only modify PHYSICAL cells
+    # [NUM_GHOSTS:-NUM_GHOSTS] to preserve ghost cell parity conditions set by fill_boundaries.
 
-    D0, Sr0, tau0 = state_t0[NUM_BSSN_VARS + 0, :], state_t0[NUM_BSSN_VARS + 1, :], state_t0[NUM_BSSN_VARS + 2, :]
-    D1, Sr1, tau1 = state_t1[NUM_BSSN_VARS + 0, :], state_t1[NUM_BSSN_VARS + 1, :], state_t1[NUM_BSSN_VARS + 2, :]
+    # Define physical cells slice
+    phys = slice(NUM_GHOSTS, -NUM_GHOSTS)
 
-    rZ = r[mask]
-    fig, ax = plt.subplots(2, 3, figsize=(12, 7))
-    # Row 1: rho0, P, vr
-    ax[0, 0].semilogy(rZ, np.maximum(prim0['rho0'][mask], 1e-20), 'b-', label='t=0')
-    ax[0, 0].semilogy(rZ, np.maximum(prim1['rho0'][mask], 1e-20), 'r--', label='t=1×dt')
-    ax[0, 0].axvline(R, color='gray', ls=':'); ax[0, 0].set_title('ρ0 (zoom)'); ax[0, 0].legend(); ax[0, 0].grid(True, alpha=0.3)
+    # Full density array (used for RHS calculations which cover all cells)
+    D_all = state[NUM_BSSN_VARS + 0, :]
 
-    ax[0, 1].semilogy(rZ, np.maximum(prim0['p'][mask], 1e-20), 'b-')
-    ax[0, 1].semilogy(rZ, np.maximum(prim1['p'][mask], 1e-20), 'r--')
-    ax[0, 1].axvline(R, color='gray', ls=':'); ax[0, 1].set_title('P (zoom)'); ax[0, 1].grid(True, alpha=0.3)
+    # Define density thresholds
+    rho_floor = hydro.atmosphere.rho_floor
+    rho_atm = 100.0 * rho_floor  # Pure atmosphere (completely frozen)
+    rho_transition = 1000.0 * rho_floor  # Start of transition zone
 
-    ax[0, 2].plot(rZ, prim0['vr'][mask], 'b-')
-    ax[0, 2].plot(rZ, prim1['vr'][mask], 'r--')
-    ax[0, 2].axvline(R, color='gray', ls=':'); ax[0, 2].set_title('v^r (zoom)'); ax[0, 2].grid(True, alpha=0.3)
+    # Masks for RHS modifications (use full domain D_all)
+    pure_atm_mask = D_all < rho_atm  # Pure atmosphere: freeze completely
+    transition_mask = (D_all >= rho_atm) & (D_all < rho_transition)  # Transition: damping
 
-    # Row 2: D, Sr, tau
-    ax[1, 0].semilogy(rZ, np.maximum(D0[mask], 1e-22), 'b-')
-    ax[1, 0].semilogy(rZ, np.maximum(D1[mask], 1e-22), 'r--')
-    ax[1, 0].axvline(R, color='gray', ls=':'); ax[1, 0].set_title('D (zoom)'); ax[1, 0].grid(True, alpha=0.3)
+    # In pure atmosphere: force Sr=0 (no momentum) - ONLY in PHYSICAL cells
+    # Create physical-only version of mask for state modification
+    pure_atm_mask_phys = D_all[phys] < rho_atm
+    if np.any(pure_atm_mask_phys):
+        state[NUM_BSSN_VARS + 1, phys][pure_atm_mask_phys] = 0.0
 
-    ax[1, 1].plot(rZ, Sr0[mask], 'b-')
-    ax[1, 1].plot(rZ, Sr1[mask], 'r--')
-    ax[1, 1].axvline(R, color='gray', ls=':'); ax[1, 1].set_title('S_r (zoom)'); ax[1, 1].grid(True, alpha=0.3)
-
-    ax[1, 2].semilogy(rZ, np.maximum(np.abs(tau0[mask]), 1e-22), 'b-')
-    ax[1, 2].semilogy(rZ, np.maximum(np.abs(tau1[mask]), 1e-22), 'r--')
-    ax[1, 2].axvline(R, color='gray', ls=':'); ax[1, 2].set_title('τ (zoom)'); ax[1, 2].grid(True, alpha=0.3)
-
-    for a in ax.ravel():
-        a.set_xlabel('r')
-
-    plt.tight_layout()
-    plt.savefig(os.path.join(PLOT_DIR, 'tov_surface_zoom.png'), dpi=150, bbox_inches='tight')
-    plt.close(fig)
-
-
-def _apply_atmosphere_reset(state_2d, grid, hydro, atmosphere, R_star=None):
-    """
-    Apply atmosphere floors using    strategy.
-
-    Strategy (following   / +):
-    1. Recover primitives from conservatives (cons2prim)
-    2. Apply floors to PRIMITIVES (ρ, v, P)
-    3. Apply conservative variable consistency checks (tau floor, S^2 constraint)
-    4. Recompute conservatives from floored primitives if needed
-
-    This ensures thermodynamic consistency: floored conservatives correspond
-    to a valid physical state.
-
-    Args:
-        state_2d: State vector (2D array)
-        grid: Grid object
-        hydro: Hydrodynamics object
-        atmosphere: AtmosphereParams object
-        R_star: Stellar radius - atmosphere reset applied ONLY for r > R_star (optional)
-
-    Returns:
-        state_2d with floors applied
-    """
-    from source.matter.hydro.atmosphere import FloorApplicator
-
-    # DIAGNOSTIC: Print R_star once at the beginning
-    import sys
-    if not hasattr(_apply_atmosphere_reset, '_printed_R_star'):
-        print(f"\n=== ATMOSPHERE RESET DIAGNOSTICS ===", file=sys.stderr)
-        print(f"R_star = {R_star} km" if R_star is not None else "R_star = None (PROBLEM!)", file=sys.stderr)
-        _apply_atmosphere_reset._printed_R_star = True
-
-    # Extract conservatives
-    D = state_2d[NUM_BSSN_VARS + 0, :]
-    Sr = state_2d[NUM_BSSN_VARS + 1, :]
-    tau = state_2d[NUM_BSSN_VARS + 2, :]
-
-    # Build BSSN geometry (needed for cons2prim and floor application)
+    # Build BSSN containers (dynamic)
     bssn_vars = BSSNVars(grid.N)
-    bssn_vars.set_bssn_vars(state_2d[:NUM_BSSN_VARS, :])
+    bssn_vars.set_bssn_vars(state[:NUM_BSSN_VARS, :])
+    bssn_d1 = grid.get_d1_metric_quantities(state)
 
-    # Get metric for floor application
-    bar_gamma_LL = get_bar_gamma_LL(grid.r, bssn_vars.h_LL, hydro.background)
-    phi = np.asarray(bssn_vars.phi, dtype=float)
-    e4phi = np.exp(4.0 * phi)
-    gamma_rr = e4phi * bar_gamma_LL[:, 0, 0]  # Physical γ_rr
+    hydro.set_matter_vars(state, bssn_vars, grid)
 
-    # Recover primitives (cons2prim already has some floor logic built in)
-    hydro.set_matter_vars(state_2d, bssn_vars, grid)
-    prim = hydro._get_primitives(bssn_vars, grid.r, grid=grid)
+    # Get hydro RHS
+    hydro_rhs = hydro.get_matter_rhs(grid.r, bssn_vars, bssn_d1, background)
 
-    rho0 = prim['rho0']
-    vr = prim['vr']
-    p = prim['p']
+    # Apply RHS modifications based on density (RHS covers all cells including ghosts)
 
-    # Create floor applicator
-    floor_app = FloorApplicator(atmosphere, hydro.eos)
+    # 1. Pure atmosphere: freeze completely (RHS=0)
+    if np.any(pure_atm_mask):
+        hydro_rhs[0, pure_atm_mask] = 0.0  # dD/dt = 0
+        hydro_rhs[1, pure_atm_mask] = 0.0  # dSr/dt = 0
+        hydro_rhs[2, pure_atm_mask] = 0.0  # dtau/dt = 0
 
-    # STEP 1: Apply primitive floors (ρ, v, P)
-    rho0_floor, vr_floor, p_floor = floor_app.apply_primitive_floors(rho0, vr, p, gamma_rr)
+    # 2. Transition zone: smooth damping
+    # Damping factor: α(ρ) = (ρ - rho_atm) / (rho_transition - rho_atm)
+    # α=0 at rho_atm (full damping), α=1 at rho_transition (no damping)
+    if np.any(transition_mask):
+        alpha = (D_all[transition_mask] - rho_atm) / (rho_transition - rho_atm)
+        alpha = np.clip(alpha, 0.0, 1.0)  # Ensure [0,1]
 
-    # STEP 2: Identify atmosphere regions (where there is NO real fluid)
-    # SPATIAL CRITERION: Apply atmosphere reset ONLY outside stellar radius (r > R_star)
-    # Inside star (r < R_star): primitives can fluctuate but stay physical
-    # Outside star (r > R_star): force exact atmosphere values (vacuum)
-    if R_star is not None:
-        atm_mask = grid.r > R_star
+        # Apply damping to Sr evolution (damp momentum growth)
+        # Keep D and tau evolution to allow mass/energy drainage
+        hydro_rhs[1, transition_mask] *= alpha  # Gradual reduction of dSr/dt
 
-        # DIAGNOSTIC: Check if reset is being applied
-        n_atm = np.sum(atm_mask)
-        max_vr_before = np.max(np.abs(vr_floor[atm_mask])) if n_atm > 0 else 0.0
-    else:
-        # Fallback to density-based criterion if R_star not provided
-        atm_mask = np.zeros(grid.N, dtype=bool)
-        n_atm = 0
-        max_vr_before = 0.0
+    # 3. ADDITIONAL: Velocity damping near surface to suppress spurious oscillations
+    # This addresses discrete hydrostatic imbalance that creates growing velocities
+    # at the stellar surface. Use exponential damping based on density.
+    # Damping rate: Γ(ρ) = Γ_max * exp(-(ρ/ρ_damp)^2) where ρ_damp ~ surface density
 
-    # CRITICAL: In atmosphere, RESET (not floor) primitives to exact atmosphere values
-    # This is NOT the same as applying floors (max operation) - we force exact values
-    # where there is no real fluid, ensuring clean separation between interior and vacuum
-    if np.any(atm_mask):
-        rho0_floor[atm_mask] = atmosphere.rho_floor  # RESET to exact floor (not max)
-        p_floor[atm_mask] = atmosphere.p_floor        # RESET to exact floor (not max)
-        vr_floor[atm_mask] = 0.0                      # RESET velocity to zero
+    # Only damp where there's actual momentum
+    Sr_all = state[NUM_BSSN_VARS + 1, :]
+    has_momentum = np.abs(Sr_all) > 1e-30
 
-        # DIAGNOSTIC: Verify reset worked
-        max_vr_after = np.max(np.abs(vr_floor[atm_mask]))
-        if max_vr_after > 1e-14:
-            print(f"WARNING: vr reset failed! max_vr_after = {max_vr_after:.3e}")
+    # Characteristic density for damping (around surface, ~1e-5 to 1e-6)
+    rho_surface_characteristic = 1e-5
 
-    # STEP 3: Apply conservative consistency floors (tau, S_i constraints)
-    D_floor, Sr_floor, tau_floor, cons_floor_applied = floor_app.apply_conservative_floors(
-        D, Sr, tau, gamma_rr
-    )
+    # Damping region: low density but above atmosphere (ρ > rho_transition)
+    damp_region_mask = (D_all > rho_transition) & (D_all < 10.0 * rho_surface_characteristic) & has_momentum
 
-    # STEP 4: Recompute conservatives from floored primitives where needed
-    # Identify points where primitive floors were applied
-    prim_floor_applied = (
-        (np.abs(rho0_floor - rho0) > 1e-14) |
-        (np.abs(vr_floor - vr) > 1e-14) |
-        (np.abs(p_floor - p) > 1e-14)
-    )
+    if np.any(damp_region_mask):
+        # Exponential damping coefficient
+        rho_damp = D_all[damp_region_mask]
+        gamma_damp = 0.01 * np.exp(-(rho_damp / rho_surface_characteristic)**2)
 
-    # Combine all masks to identify points that need floor application
-    needs_floor = prim_floor_applied | atm_mask | cons_floor_applied
+        # Apply damping: dSr/dt -= Γ * Sr (exponential decay)
+        hydro_rhs[1, damp_region_mask] -= gamma_damp * Sr_all[damp_region_mask]
 
-    if np.any(needs_floor):
-        # Recompute conservatives from floored primitives ONLY at points that need it
-        # In atmosphere: vr_floor=0, so this gives Sr=0 (no momentum in vacuum)
-        D_new, Sr_new, tau_new = prim_to_cons(rho0_floor, vr_floor, p_floor, gamma_rr, hydro.eos)
+    # Get BSSN RHS (now evolves dynamically)
+    # First get second derivatives
+    bssn_d2 = grid.get_d2_metric_quantities(state)
 
-        # Apply conservative floors again to ensure consistency
-        D_new, Sr_new, tau_new, _ = floor_app.apply_conservative_floors(
-            D_new, Sr_new, tau_new, gamma_rr
-        )
+    # Get energy-momentum tensor from matter
+    emtensor = hydro.get_emtensor(grid.r, bssn_vars, background)
 
-        # Update state ONLY at points that need floors (selective update)
-        state_2d[NUM_BSSN_VARS + 0, needs_floor] = D_new[needs_floor]
-        state_2d[NUM_BSSN_VARS + 1, needs_floor] = Sr_new[needs_floor]
-        state_2d[NUM_BSSN_VARS + 2, needs_floor] = tau_new[needs_floor]
+    # Create container for BSSN RHS (modified in place by get_bssn_rhs)
+    bssn_rhs = BSSNVars(grid.N)
 
-        # DIAGNOSTIC: Verify Sr is zero in atmosphere after update
-        if R_star is not None and np.any(atm_mask):
-            Sr_final = state_2d[NUM_BSSN_VARS + 1, :]
-            max_Sr_atm = np.max(np.abs(Sr_final[atm_mask]))
-            if max_Sr_atm > 1e-14:
-                print(f"WARNING: Sr in atmosphere is not zero! max_Sr_atm = {max_Sr_atm:.3e}", file=sys.stderr)
+    # Call get_bssn_rhs with correct signature
+    get_bssn_rhs(bssn_rhs, grid.r, bssn_vars, bssn_d1, bssn_d2, background, emtensor)
 
-    return state_2d
+    # Extract BSSN RHS values into array form
+    bssn_rhs_array = bssn_rhs.set_bssn_state_vars()
+
+    # Full RHS (BSSN + hydro both evolve)
+    rhs = np.zeros_like(state)
+    rhs[:NUM_BSSN_VARS, :] = bssn_rhs_array
+    rhs[NUM_BSSN_VARS:, :] = hydro_rhs
+    return rhs.flatten()
 
 
-def enforce_origin_symmetry(state_2d):
+
+
+def compute_hamiltonian_constraint(state_2d, grid, background, hydro):
     """
-    Enforce spherical symmetry at origin: set momentum S^r = 0 at first interior cell.
-
-    By spherical symmetry, velocity must be exactly zero at r=0. This prevents
-    spurious mass creation from connection terms -Γ*F near origin where Γ ~ 200/M.
+    Compute Hamiltonian constraint for a single state.
 
     Args:
-        state_2d: State array with shape (NUM_VARS, N)
+        state_2d: State array (NUM_VARS, N)
+        grid: Grid object
+        background: Background object
+        hydro: Hydro object
 
     Returns:
-        Modified state_2d with S^r = 0 at first interior cell
+        Ham: Hamiltonian constraint array (N,)
     """
-    NUM_GHOSTS = 3
-    # S^r_tilde is at index NUM_BSSN_VARS + 1 = 13
-    # Complete index ordering:
-    #   BSSN (0-11): [phi, h_rr, h_tt, h_pp, K, a_rr, a_tt, a_pp, lambda^r, shift^r, b^r, lapse]
-    #   Hydro (12-14): [D, S^r, tau]
-    # We enforce S^r = 0 at first interior cell (index 13 = NUM_BSSN_VARS + 1)
-    state_2d[NUM_BSSN_VARS + 1, NUM_GHOSTS] = 0.0  # S^r = 0 at r ≈ 0
-    return state_2d
+    # Use the get_constraints_diagnostic function with a single state
+    Ham, Mom = get_constraints_diagnostic(state_2d.flatten(), 0.0, grid, background, hydro)
+    return Ham[0, :], Mom[0, :, :]  # Return first (and only) time slice
 
 
-def rk4_step(state_flat, dt, grid, background, hydro, atmosphere, R_star=None):
+def compute_update_mask(state_old, state_new, atmosphere, bssn_vars):
     """
-    Single RK4 (classical 4th order Runge-Kutta) timestep using canonical get_rhs.
-    Full BSSN + hydro evolution following rhsevolution.py pattern.
+    Compute update mask following GRHydro strategy.
+
+    Determines which cells can be safely updated without violating physical constraints.
+    Cells where the update would push D or tau below atmosphere are marked as False.
+
+    This prevents spurious oscillations from repeated floor application
+    (see GRHydro documentation section 8.4).
+
+    Args:
+        state_old: State before update (NUM_VARS, N)
+        state_new: State after RK4 update (NUM_VARS, N)
+        atmosphere: AtmosphereParams object
+        bssn_vars: BSSNVars object (needed for e6phi = exp(6φ))
+
+    Returns:
+        mask: Boolean array (N,) - True = safe to update, False = would violate constraints
+    """
+    from source.bssn.bssnstatevariables import NUM_BSSN_VARS
+
+    # Extract DENSITIZED conservatives from state
+    D_tilde_old = state_old[NUM_BSSN_VARS + 0, :]
+    D_tilde_new = state_new[NUM_BSSN_VARS + 0, :]
+    tau_tilde_old = state_old[NUM_BSSN_VARS + 2, :]
+    tau_tilde_new = state_new[NUM_BSSN_VARS + 2, :]
+
+    # Compute e6phi for de-densitization: e^{6φ}
+    phi = np.asarray(bssn_vars.phi, dtype=float)
+    e6phi = np.exp(6.0 * phi)
+
+    # DE-DENSITIZE to get physical variables for comparison with floors
+    # D = D̃ / e^{6φ}, τ = τ̃ / e^{6φ}
+    inv_e6phi = 1.0 / np.maximum(e6phi, 1e-30)
+    D_old = D_tilde_old * inv_e6phi
+    D_new = D_tilde_new * inv_e6phi
+    tau_old = tau_tilde_old * inv_e6phi
+    tau_new = tau_tilde_new * inv_e6phi
+
+    # Initialize mask (all True by default)
+    mask = np.ones(len(D_old), dtype=bool)
+
+    # Only check physical cells (ghost cells handled by fill_boundaries)
+    phys = slice(NUM_GHOSTS, len(D_old) - NUM_GHOSTS)
+
+    # Cell is safe to update if:
+    # 1. D stays above floor (with 10% tolerance to avoid edge cases)
+    # 2. tau stays above floor (with 10% tolerance)
+    # Using tolerance prevents repeated triggering on cells near floor
+    # NOW comparing PHYSICAL (non-densitized) variables with floors
+    tolerance = 0.9
+
+    mask[phys] = (
+        (D_new[phys] >= atmosphere.rho_floor * tolerance) &
+        (tau_new[phys] >= atmosphere.tau_atm * tolerance)
+    )
+
+    return mask
+
+
+def reset_to_atmosphere(state_2d, failed_mask, atmosphere, eos, bssn_vars):
+    """
+    Reset failed cells to atmosphere values following GRHydro strategy.
+
+    For cells marked as failed (where update would violate constraints),
+    set all hydro variables to atmosphere values:
+    - D̃ = e^{6φ} * rho_floor (DENSITIZED)
+    - S̃r = 0 (no velocity, already densitized)
+    - τ̃ = e^{6φ} * (rho_floor * eps_atm) (DENSITIZED)
+
+    Args:
+        state_2d: State array (NUM_VARS, N) - modified in place
+        failed_mask: Boolean array (N,) - True for cells to reset
+        atmosphere: AtmosphereParams object
+        eos: Equation of state (for computing eps_atm)
+        bssn_vars: BSSNVars object (needed for e6phi = exp(6φ))
+    """
+    from source.bssn.bssnstatevariables import NUM_BSSN_VARS
+
+    # Only operate on physical cells
+    phys = slice(NUM_GHOSTS, state_2d.shape[1] - NUM_GHOSTS)
+    failed_phys = failed_mask[phys]
+
+    if not np.any(failed_phys):
+        return  # No cells to reset
+
+    # Compute e6phi for densitization: e^{6φ}
+    phi = np.asarray(bssn_vars.phi, dtype=float)
+    e6phi = np.exp(6.0 * phi)
+
+    # Compute atmosphere epsilon (small value)
+    eps_atm = eos.eps_from_rho_p(atmosphere.rho_floor, atmosphere.p_floor) if hasattr(eos, 'eps_from_rho_p') else 1e-10
+
+    # DENSITIZE atmosphere values before writing to state
+    # State stores D̃, S̃r, τ̃ (densitized conservatives)
+    D_tilde_atm = e6phi[phys][failed_phys] * atmosphere.rho_floor
+    Sr_tilde_atm = 0.0  # No momentum (already zero in both representations)
+    tau_tilde_atm = e6phi[phys][failed_phys] * (atmosphere.rho_floor * eps_atm)
+
+    # Set DENSITIZED atmosphere values (only in physical cells that failed)
+    state_2d[NUM_BSSN_VARS + 0, phys][failed_phys] = D_tilde_atm  # D̃
+    state_2d[NUM_BSSN_VARS + 1, phys][failed_phys] = Sr_tilde_atm  # S̃r
+    state_2d[NUM_BSSN_VARS + 2, phys][failed_phys] = tau_tilde_atm  # τ̃
+
+
+def rk4_step(state_flat, dt, grid, background, hydro, atmosphere):
+    """
+    Single RK4 timestep with GRHydro-style atmosphere treatment.
+
+    Following GRHydro philosophy (section 8.4):
+    - Cells that would violate constraints are NOT updated
+    - Failed cells are reset to atmosphere values
+    - Floors are applied only at the end (not after each substep)
+    - This reduces spurious oscillations from repeated floor application
 
     Args:
         atmosphere: AtmosphereParams object
-        R_star: Stellar radius for atmosphere reset (optional)
-
-    Note: Uses rhsevolution.get_rhs() which includes:
-        - BSSN RHS (geometric evolution)
-        - Hydro RHS (Valencia formulation)
-        - Gauge evolution (1+log lapse, Gamma-driver shift)
-        - Advection terms (Lie derivatives)
-        - Kreiss-Oliger dissipation (BSSN only)
-        - Constraint enforcement (det(γ̄) = det(γ̂))
-        - Boundary conditions (inner/outer)
     """
-    # Create dummy progress bar for get_rhs (required by signature)
-    dummy_progress = tqdm(total=1, disable=True)
-    time_state = [0, dt]
+    from source.matter.hydro.atmosphere import apply_floors_to_state
+
+    # Get gamma from the EOS to ensure consistency
+    gamma = hydro.eos.gamma
+
+    # Store initial state for update mask
+    state_old = state_flat.reshape((grid.NUM_VARS, grid.N))
 
     # Stage 1
-    k1 = get_rhs(0, state_flat, grid, background, hydro, dummy_progress, time_state)
+    k1 = get_rhs_bssn(0, state_flat, grid, background, hydro)
 
-    # Stage 2
+    # Stage 2 (NO floor - cons2prim applies internal floors)
     state_2 = state_flat + 0.5 * dt * k1
-    k2 = get_rhs(0, state_2, grid, background, hydro, dummy_progress, time_state)
+    k2 = get_rhs_bssn(0, state_2, grid, background, hydro)
 
-    # Stage 3
+    # Stage 3 (NO floor - cons2prim applies internal floors)
     state_3 = state_flat + 0.5 * dt * k2
-    k3 = get_rhs(0, state_3, grid, background, hydro, dummy_progress, time_state)
+    k3 = get_rhs_bssn(0, state_3, grid, background, hydro)
 
-    # Stage 4
+    # Stage 4 (NO floor - cons2prim applies internal floors)
     state_4 = state_flat + dt * k3
-    k4 = get_rhs(0, state_4, grid, background, hydro, dummy_progress, time_state)
+    k4 = get_rhs_bssn(0, state_4, grid, background, hydro)
 
     # Combine
     state_new = state_flat + (dt / 6.0) * (k1 + 2*k2 + 2*k3 + k4)
     snew = state_new.reshape((grid.NUM_VARS, grid.N))
 
-    # Apply atmosphere reset after full step (ONLY outside stellar radius r > R_star)
-    snew_reset = _apply_atmosphere_reset(snew, grid, hydro, atmosphere, R_star=R_star)
+    # Construct BSSN vars from state_old for accessing φ (needed for densitization)
+    bssn_vars = BSSNVars(grid.N)
+    bssn_vars.set_bssn_vars(state_old[:NUM_BSSN_VARS, :])
 
-    dummy_progress.close()
-    return snew_reset.flatten()
+    # GRHydro-style update mask: Don't update cells that would violate constraints
+    update_mask = compute_update_mask(state_old, snew, atmosphere, bssn_vars)
+
+    # For cells that would violate constraints, keep old values
+    for var_idx in range(grid.NUM_VARS):
+        snew[var_idx, ~update_mask] = state_old[var_idx, ~update_mask]
+
+    # Reset failed cells to atmosphere
+    reset_to_atmosphere(snew, ~update_mask, atmosphere, hydro.eos, bssn_vars)
+
+    # CRITICAL: Restore ghost cells with parity after RK4 integration
+    # The RHS includes ghost cells, so after integration they evolve instead of staying static.
+    # This call restores proper parity conditions at inner boundary (r=0).
+    grid.fill_boundaries(snew)
+
+    # Apply atmosphere floors after full step
+    # This handles cells that passed the update mask but still need floor correction
+    # (e.g., velocity limits, pressure floors)
+    apply_floors_to_state(snew, grid, hydro)
+
+    return snew.flatten()
+
+
+def _compute_baryon_mass(grid, state, primitives):
+    """Compute baryon (rest) mass M = ∫ ρ0 W √γ d^3x = 4π ∫ ρ0 W ψ^6 r^2 dr.
+
+    Uses interior points (excludes ghost zones)."""
+    interior = slice(NUM_GHOSTS, grid.N - NUM_GHOSTS)
+    r = grid.r[interior]
+    rho0 = primitives['rho0'][interior]
+    # Prefer W from primitives (accounts for metric), fallback to 1/sqrt(1-v^2)
+    if 'W' in primitives and primitives['W'] is not None:
+        W = primitives['W'][interior]
+    else:
+        v = primitives['vr'][interior]
+        W = 1.0 / np.sqrt(np.maximum(1.0 - v*v, 1e-14))
+
+    phi = state[idx_phi, interior]
+    psi = np.exp(phi)
+    integrand = rho0 * W * (psi**6) * (r**2)
+    return 4.0 * np.pi * simpson(integrand, x=r)
 
 
 def evolve_fixed_timestep(state_initial, dt, num_steps, grid, background, hydro,
                           atmosphere, method='rk4', t_start=0.0,
                           reference_state=None, step_offset=0, data_manager=None,
-                          snapshot_interval=None, evolution_interval=None, R_star=None):
-    """Evolve with fixed timestep using RK4 (full BSSN + hydro).
+                          snapshot_interval=None, evolution_interval=None):
+    """Evolve with fixed timestep using RK4.
 
     Args:
         atmosphere: AtmosphereParams object
@@ -796,10 +438,9 @@ def evolve_fixed_timestep(state_initial, dt, num_steps, grid, background, hydro,
         reference_state: Reference state for error calculation (default: state_initial)
                         Use this to maintain consistent error measurement across multiple segments
         step_offset: Offset for step numbering in output (default: 0)
-        data_manager: SimulationDataManager object for data saving (optional)
+        data_manager: utils.SimulationDataManager object for data saving (optional)
         snapshot_interval: Save full domain snapshot every N steps (optional)
         evolution_interval: Save evolution data every N steps (optional)
-        R_star: Stellar radius for atmosphere reset (optional)
     """
     state_flat = state_initial.flatten()
 
@@ -808,7 +449,7 @@ def evolve_fixed_timestep(state_initial, dt, num_steps, grid, background, hydro,
         bssn_vars = BSSNVars(grid.N)
         bssn_vars.set_bssn_vars(s2d[:NUM_BSSN_VARS, :])
         hydro.set_matter_vars(s2d, bssn_vars, grid)
-        return hydro._get_primitives(bssn_vars, grid.r, grid=grid), s2d
+        return hydro._get_primitives(bssn_vars, grid.r), s2d
 
     # Diagnostics at start
     prim_prev, s_prev = primitives_from_state(state_flat)
@@ -820,16 +461,25 @@ def evolve_fixed_timestep(state_initial, dt, num_steps, grid, background, hydro,
 
     # Save initial snapshot if data manager provided
     if data_manager and data_manager.enable_saving:
-        data_manager.save_snapshot(step_offset, t_start, state_initial, prim_initial)
-        data_manager.add_evolution_point(step_offset, t_start, state_initial, prim_initial, prim_initial)
+        # Compute Hamiltonian constraint for initial state
+        Ham_initial, Mom_initial = compute_hamiltonian_constraint(state_initial, grid, background, hydro)
+        data_manager.save_snapshot(step_offset, t_start, state_initial, prim_initial, Ham=Ham_initial, Mom=Mom_initial)
+        data_manager.add_evolution_point(step_offset, t_start, state_initial, prim_initial, prim_initial, Ham=Ham_initial)
+
+    # Timeseries for mass and central density
+    times_series = [t_start]
+    Mb0 = _compute_baryon_mass(grid, s_initial, prim_initial)
+    Mb_series = [Mb0]
+    rho_c0 = prim_initial['rho0'][NUM_GHOSTS]
+    rho_c_series = [rho_c0]
 
     print("\n===== Evolution diagnostics (per step) =====")
-    print("Columns: step | t | ρ_central | max_Δρ/ρ | max_vʳ (location) | max_D | max_Sʳ | max_τ | c2p_fails")
+    print("Columns: step | t | ρ_central | max_Δρ/ρ | max_vʳ | max_D | max_Sʳ | max_τ | c2p_fails")
     print("-" * 100)
 
     for step in range(num_steps):
         # Advance one RK4 step
-        state_flat_next = rk4_step(state_flat, dt, grid, background, hydro, atmosphere, R_star=R_star)
+        state_flat_next = rk4_step(state_flat, dt, grid, background, hydro, atmosphere)
 
         # Compute primitives BEFORE and AFTER to measure change
         prim_next, s_next = primitives_from_state(state_flat_next)
@@ -858,38 +508,49 @@ def evolve_fixed_timestep(state_initial, dt, num_steps, grid, background, hydro,
         # Maximum relative density error vs initial state
         rel_rho_err = np.abs(rho_next - rho_init) / (np.abs(rho_init) + 1e-20)
         max_rel_rho_err = float(np.max(rel_rho_err))
+        idx_max_rel_rho = NUM_GHOSTS + int(np.argmax(rel_rho_err))
+        r_max_rel_rho = grid.r[idx_max_rel_rho]
 
         # Maximum velocity
         max_abs_v = float(np.max(np.abs(v_next)))
-        idx_max_v = int(np.argmax(np.abs(v_next)))
-        r_max_v = float(grid.r[idx_max_v])
-
-        # Check if max velocity is in atmosphere or interior
-        if R_star is not None:
-            in_atmosphere = "ATM" if r_max_v > R_star else "INT"
-        else:
-            in_atmosphere = "?"
+        idx_max_v = NUM_GHOSTS + int(np.argmax(np.abs(v_next)))
+        r_max_v = grid.r[idx_max_v]
 
         # Maximum conserved variables (more useful than minimum)
         max_D = float(np.max(D_next))
+        idx_max_D = NUM_GHOSTS + int(np.argmax(D_next))
+        r_max_D = grid.r[idx_max_D]
+
         max_Sr = float(np.max(np.abs(Sr_next)))
+        idx_max_Sr = NUM_GHOSTS + int(np.argmax(np.abs(Sr_next)))
+        r_max_Sr = grid.r[idx_max_Sr]
+
         max_tau = float(np.max(np.abs(tau_next)))
+        idx_max_tau = NUM_GHOSTS + int(np.argmax(np.abs(tau_next)))
+        r_max_tau = grid.r[idx_max_tau]
 
         # Cons2prim failures
         c2p_fail_count = int(np.sum(~prim_next['success']))
 
         t_curr = t_start + (step + 1) * dt
         step_num = step_offset + step + 1
-        if step_num % 100 == 0:
-            print(f"step {step_num:4d}  t={t_curr:.6e}:  ρ_c={rho_central:.6e}  max_Δρ/ρ={max_rel_rho_err:.3e}  "
-              f"max_vʳ={max_abs_v:.3e} (r={r_max_v:.2f} {in_atmosphere})  max_D={max_D:.3e}  max_Sʳ={max_Sr:.3e}  "
-              f"max_τ={max_tau:.3e}  c2p_fail={c2p_fail_count}")
+        if step_num % 200 == 0:
+            print(f"step {step_num:4d}  t={t_curr:.6e}:  ρ_c={rho_central:.6e}  max_Δρ/ρ={max_rel_rho_err:.3e} (r={r_max_rel_rho:.2f})  "
+              f"max_vʳ={max_abs_v:.3e} (r={r_max_v:.2f})  max_D={max_D:.3e} (r={r_max_D:.2f})  max_Sʳ={max_Sr:.3e} (r={r_max_Sr:.2f})  "
+              f"max_τ={max_tau:.3e} (r={r_max_tau:.2f})  c2p_fail={c2p_fail_count}")
 
-        # Save data if data manager provided
+        # Save data if requested
         if data_manager and data_manager.enable_saving:
+            # Compute Ham if needed for saving
+            Ham_next = None
+            Mom_next = None
+            if (evolution_interval and step_num % evolution_interval == 0) or \
+               (snapshot_interval and step_num % snapshot_interval == 0):
+                Ham_next, Mom_next = compute_hamiltonian_constraint(s_next, grid, background, hydro)
+
             # Save evolution data at specified interval
             if evolution_interval and step_num % evolution_interval == 0:
-                data_manager.add_evolution_point(step_num, t_curr, s_next, prim_next, prim_initial)
+                data_manager.add_evolution_point(step_num, t_curr, s_next, prim_next, prim_initial, Ham=Ham_next)
 
                 # Periodic buffer flush
                 if step_num % (evolution_interval * 10) == 0:
@@ -897,7 +558,13 @@ def evolve_fixed_timestep(state_initial, dt, num_steps, grid, background, hydro,
 
             # Save full snapshot at specified interval
             if snapshot_interval and step_num % snapshot_interval == 0:
-                data_manager.save_snapshot(step_num, t_curr, s_next, prim_next)
+                data_manager.save_snapshot(step_num, t_curr, s_next, prim_next, Ham=Ham_next, Mom=Mom_next)
+
+        # Append to time series (mass and central density)
+        Mb_next = _compute_baryon_mass(grid, s_next, prim_next)
+        times_series.append(t_curr)
+        Mb_series.append(Mb_next)
+        rho_c_series.append(float(prim_next['rho0'][NUM_GHOSTS]))
 
         # Detect first signs of instability / non-physical values
         issues = []
@@ -954,414 +621,59 @@ def evolve_fixed_timestep(state_initial, dt, num_steps, grid, background, hydro,
             state_flat = state_flat_next  # return the last state
             actual_steps = step + 1
             actual_time = t_start + actual_steps * dt
-            return state_flat.reshape((grid.NUM_VARS, grid.N)), actual_steps, actual_time
+            return state_flat.reshape((grid.NUM_VARS, grid.N)), actual_steps, actual_time, {
+                't': np.array(times_series),
+                'Mb': np.array(Mb_series),
+                'rho_c': np.array(rho_c_series),
+            }
 
         # Prepare next step
         state_flat = state_flat_next
         prim_prev, s_prev = prim_next, s_next
 
-        # Light progress marker
-        if (step + 1) % 20 == 0:
-            print(f"  Step {step_num}/{step_offset + num_steps} OK  (t={t_curr:.6e})")
 
     # Final flush of buffers if data manager is provided
     if data_manager and data_manager.enable_saving:
         data_manager.flush_evolution_buffer()
 
     actual_time = t_start + num_steps * dt
-    return state_flat.reshape((grid.NUM_VARS, grid.N)), num_steps, actual_time
+    return state_flat.reshape((grid.NUM_VARS, grid.N)), num_steps, actual_time, {
+        't': np.array(times_series),
+        'Mb': np.array(Mb_series),
+        'rho_c': np.array(rho_c_series),
+    }
 
 
-def evolve_adaptive(state_initial, t_final, grid, background, hydro, atmosphere,
-                   method='RK45', rtol=1e-6, atol=1e-8, R_star=None):
-    """
-    Evolve with adaptive timestep using scipy.integrate.solve_ivp.
-    Uses canonical get_rhs from rhsevolution.py (full BSSN + hydro).
-
-    Args:
-        atmosphere: AtmosphereParams object
-        R_star: Stellar radius for atmosphere reset (optional)
-    """
+def evolve_adaptive(state_initial, t_final, grid, background, hydro,
+                   method='RK45', rtol=1e-6, atol=1e-8):
+    """Evolve with adaptive timestep using scipy.integrate.solve_ivp."""
     from scipy.integrate import solve_ivp
+
+    # Wrapper for RHS compatible with solve_ivp
+    def rhs_wrapper(t, y):
+        return get_rhs_bssn(t, y, grid, background, hydro)
 
     state_flat = state_initial.flatten()
 
     print(f"  Using solve_ivp with method={method}, rtol={rtol}, atol={atol}")
-    print(f"  Evolving from t=0 to t={t_final}")
 
-    # Use get_rhs with progress tracking
-    with tqdm(total=1000, unit="‰", desc=f"  Adaptive to t={t_final}") as progress_bar:
-        # Wrapper for RHS compatible with solve_ivp
-        def rhs_wrapper(t, y):
-            time_state = [0, t_final/1000]
-            return get_rhs(t, y, grid, background, hydro, progress_bar, time_state)
+    solution = solve_ivp(
+        rhs_wrapper,
+        t_span=(0, t_final),
+        y0=state_flat,
+        method=method,  # 'RK45', 'RK23', 'DOP853', 'Radau', 'BDF', 'LSODA'
+        rtol=rtol,
+        atol=atol,
+        dense_output=False
+    )
 
-        solution = solve_ivp(
-            rhs_wrapper,
-            t_span=(0, t_final),
-            y0=state_flat,
-            method=method,  # 'RK45', 'RK23', 'DOP853', 'Radau', 'BDF', 'LSODA'
-            max_step=0.4 * grid.min_dr,  # For stability with KO dissipation σ=1.0
-            rtol=rtol,
-            atol=atol,
-            dense_output=False
-        )
+    print(f"  solve_ivp: {solution.nfev} function evaluations, status={solution.status}")
 
-    print(f"  ✓ solve_ivp: {solution.nfev} function evaluations, status={solution.status}")
-
-    # Apply atmosphere reset to final state
-    state_final = solution.y[:, -1].reshape((grid.NUM_VARS, grid.N))
-    state_final_reset = _apply_atmosphere_reset(state_final, grid, hydro, atmosphere, R_star=R_star)
-
-    return state_final_reset
-
-
-def plot_tov_diagnostics(tov_solution, r_max):
-    """Plot TOV solution diagnostics (without conformal factor)."""
-    r = tov_solution['r']
-    R_star = tov_solution['R']
-    M_star = tov_solution['M_star']
-
-    fig, axes = plt.subplots(2, 3, figsize=(16, 8))
-
-    # Density
-    axes[0, 0].semilogy(r, tov_solution['rho_baryon'], color='navy')
-    axes[0, 0].axvline(R_star, color='gray', linestyle=':', alpha=0.5, label=f'R={R_star:.2f}')
-    axes[0, 0].set_xlabel(r"$r$")
-    axes[0, 0].set_ylabel(r"$\rho_0$")
-    axes[0, 0].set_title('Baryon Density')
-    axes[0, 0].set_xlim(0, r_max)
-    axes[0, 0].legend()
-    axes[0, 0].grid(True, alpha=0.3)
-
-    # Pressure
-    axes[0, 1].semilogy(r, tov_solution['P'], color='darkgreen')
-    axes[0, 1].axvline(R_star, color='gray', linestyle=':', alpha=0.5)
-    axes[0, 1].set_xlabel(r"$r$")
-    axes[0, 1].set_ylabel('P')
-    axes[0, 1].set_title('Pressure')
-    axes[0, 1].set_xlim(0, r_max)
-    axes[0, 1].grid(True, alpha=0.3)
-
-    # Enclosed Mass
-    axes[0, 2].plot(r, tov_solution['M'], color='maroon')
-    axes[0, 2].axvline(R_star, color='gray', linestyle=':', alpha=0.5)
-    axes[0, 2].axhline(M_star, color='gray', linestyle='--', alpha=0.3, label=f'M={M_star:.3f}')
-    axes[0, 2].set_xlabel(r"$r$")
-    axes[0, 2].set_ylabel('M(r)')
-    axes[0, 2].set_title('Enclosed Mass')
-    axes[0, 2].set_xlim(0, r_max)
-    axes[0, 2].legend()
-    axes[0, 2].grid(True, alpha=0.3)
-
-    # Lapse alpha(r)
-    axes[1, 0].plot(r, tov_solution['alpha'], color='purple')
-    axes[1, 0].axvline(R_star, color='gray', linestyle=':', alpha=0.5)
-    axes[1, 0].set_xlabel(r"$r$")
-    axes[1, 0].set_ylabel(r'$\alpha$')
-    axes[1, 0].set_title('Lapse Function')
-    axes[1, 0].set_xlim(0, r_max)
-    axes[1, 0].grid(True, alpha=0.3)
-
-    # Phi(r)
-    phi = 0.25 * np.log(tov_solution['exp4phi'])
-    axes[1, 1].plot(r, phi, color='teal')
-    axes[1, 1].axvline(R_star, color='gray', linestyle=':', alpha=0.5)
-    axes[1, 1].set_xlabel(r"$r$")
-    axes[1, 1].set_ylabel(r'$\phi$')
-    axes[1, 1].set_title(r'Conformal Factor $\phi$')
-    axes[1, 1].set_xlim(0, r_max)
-    axes[1, 1].grid(True, alpha=0.3)
-
-    # a(r) metric function: a = exp(2*phi) = sqrt(exp4phi)
-    a_metric = np.sqrt(tov_solution['exp4phi'])
-    axes[1, 2].plot(r, a_metric, color='orange')
-    axes[1, 2].axvline(R_star, color='gray', linestyle=':', alpha=0.5)
-    axes[1, 2].set_xlabel(r"$r$")
-    axes[1, 2].set_ylabel(r'$a(r)$')
-    axes[1, 2].set_title('Metric $a(r)$')
-    axes[1, 2].set_xlim(0, r_max)
-    axes[1, 2].grid(True, alpha=0.3)
-
-    plt.tight_layout()
-    plt.savefig(os.path.join(PLOT_DIR, 'tov_solution.png'), dpi=150, bbox_inches='tight')
-    plt.close(fig)
-
-
-def plot_bssn_evolution(state_t0, state_tfinal, grid, t_0=0.0, t_final=1.0):
-    """Plot BSSN variables at initial and final time to show their evolution.
-
-    In full BSSN evolution, BSSN variables evolve dynamically.
-    This plot shows how the spacetime geometry changes during evolution.
-
-    Note on spherical symmetry:
-    - In spherical symmetry, h_θθ should equal h_φφ (isotropy)
-    - Similarly, A_θθ should equal A_φφ
-    - We plot all components to verify this consistency
-    - Only h_rr and A_rr are truly independent radial variables
-
-    Args:
-        state_t0: Initial state
-        state_tfinal: Final state
-        grid: Grid object
-        t_0: Initial time (for labeling)
-        t_final: Final time (for labeling)
-    """
-    r_int = grid.r[NUM_GHOSTS:-NUM_GHOSTS]
-
-    fig, axes = plt.subplots(3, 3, figsize=(16, 14))
-
-    # Row 1: Conformal factor φ, Lapse α, Trace of extrinsic curvature K
-    # φ
-    axes[0, 0].plot(r_int, state_t0[idx_phi, NUM_GHOSTS:-NUM_GHOSTS], 'b-', linewidth=2, label=f't={t_0:.6e}')
-    axes[0, 0].plot(r_int, state_tfinal[idx_phi, NUM_GHOSTS:-NUM_GHOSTS], 'r--', linewidth=1.7, label=f't={t_final:.6e}')
-    axes[0, 0].set_xlabel('r')
-    axes[0, 0].set_ylabel(r'$\phi$')
-    axes[0, 0].set_title('Conformal Factor')
-    axes[0, 0].legend()
-    axes[0, 0].grid(True, alpha=0.3)
-
-    # α
-    axes[0, 1].plot(r_int, state_t0[idx_lapse, NUM_GHOSTS:-NUM_GHOSTS], 'b-', linewidth=2, label=f't={t_0:.6e}')
-    axes[0, 1].plot(r_int, state_tfinal[idx_lapse, NUM_GHOSTS:-NUM_GHOSTS], 'r--', linewidth=1.7, label=f't={t_final:.6e}')
-    axes[0, 1].set_xlabel('r')
-    axes[0, 1].set_ylabel(r'$\alpha$')
-    axes[0, 1].set_title('Lapse Function')
-    axes[0, 1].legend()
-    axes[0, 1].grid(True, alpha=0.3)
-
-    # K
-    axes[0, 2].plot(r_int, state_t0[idx_K, NUM_GHOSTS:-NUM_GHOSTS], 'b-', linewidth=2, label=f't={t_0:.6e}')
-    axes[0, 2].plot(r_int, state_tfinal[idx_K, NUM_GHOSTS:-NUM_GHOSTS], 'r--', linewidth=1.7, label=f't={t_final:.6e}')
-    axes[0, 2].set_xlabel('r')
-    axes[0, 2].set_ylabel(r'$K$')
-    axes[0, 2].set_title('Trace of Extrinsic Curvature')
-    axes[0, 2].legend()
-    axes[0, 2].grid(True, alpha=0.3)
-
-    # Row 2: Conformal metric components h_rr, h_θθ, h_φφ
-    # h_rr
-    axes[1, 0].plot(r_int, state_t0[idx_hrr, NUM_GHOSTS:-NUM_GHOSTS], 'b-', linewidth=2, label=f't={t_0:.6e}')
-    axes[1, 0].plot(r_int, state_tfinal[idx_hrr, NUM_GHOSTS:-NUM_GHOSTS], 'r--', linewidth=1.7, label=f't={t_final:.6e}')
-    axes[1, 0].set_xlabel('r')
-    axes[1, 0].set_ylabel(r'$h_{rr}$')
-    axes[1, 0].set_title('Conformal Metric $h_{rr}$')
-    axes[1, 0].legend()
-    axes[1, 0].grid(True, alpha=0.3)
-
-    # h_θθ
-    axes[1, 1].plot(r_int, state_t0[idx_htt, NUM_GHOSTS:-NUM_GHOSTS], 'b-', linewidth=2, label=f't={t_0:.6e}')
-    axes[1, 1].plot(r_int, state_tfinal[idx_htt, NUM_GHOSTS:-NUM_GHOSTS], 'r--', linewidth=1.7, label=f't={t_final:.6e}')
-    axes[1, 1].set_xlabel('r')
-    axes[1, 1].set_ylabel(r'$h_{\theta\theta}$')
-    axes[1, 1].set_title(r'Conformal Metric $h_{\theta\theta}$')
-    axes[1, 1].legend()
-    axes[1, 1].grid(True, alpha=0.3)
-
-    # h_φφ
-    axes[1, 2].plot(r_int, state_t0[idx_hpp, NUM_GHOSTS:-NUM_GHOSTS], 'b-', linewidth=2, label=f't={t_0:.6e}')
-    axes[1, 2].plot(r_int, state_tfinal[idx_hpp, NUM_GHOSTS:-NUM_GHOSTS], 'r--', linewidth=1.7, label=f't={t_final:.6e}')
-    axes[1, 2].set_xlabel('r')
-    axes[1, 2].set_ylabel(r'$h_{\phi\phi}$')
-    axes[1, 2].set_title(r'Conformal Metric $h_{\phi\phi}$')
-    axes[1, 2].legend()
-    axes[1, 2].grid(True, alpha=0.3)
-
-    # Row 3: Traceless extrinsic curvature components A_rr, A_θθ, A_φφ
-    # A_rr
-    axes[2, 0].plot(r_int, state_t0[idx_arr, NUM_GHOSTS:-NUM_GHOSTS], 'b-', linewidth=2, label=f't={t_0:.6e}')
-    axes[2, 0].plot(r_int, state_tfinal[idx_arr, NUM_GHOSTS:-NUM_GHOSTS], 'r--', linewidth=1.7, label=f't={t_final:.6e}')
-    axes[2, 0].set_xlabel('r')
-    axes[2, 0].set_ylabel(r'$A_{rr}$')
-    axes[2, 0].set_title('Traceless Extrinsic Curvature $A_{rr}$')
-    axes[2, 0].legend()
-    axes[2, 0].grid(True, alpha=0.3)
-
-    # A_θθ
-    axes[2, 1].plot(r_int, state_t0[idx_att, NUM_GHOSTS:-NUM_GHOSTS], 'b-', linewidth=2, label=f't={t_0:.6e}')
-    axes[2, 1].plot(r_int, state_tfinal[idx_att, NUM_GHOSTS:-NUM_GHOSTS], 'r--', linewidth=1.7, label=f't={t_final:.6e}')
-    axes[2, 1].set_xlabel('r')
-    axes[2, 1].set_ylabel(r'$A_{\theta\theta}$')
-    axes[2, 1].set_title(r'Traceless Extrinsic Curvature $A_{\theta\theta}$')
-    axes[2, 1].legend()
-    axes[2, 1].grid(True, alpha=0.3)
-
-    # A_φφ
-    axes[2, 2].plot(r_int, state_t0[idx_app, NUM_GHOSTS:-NUM_GHOSTS], 'b-', linewidth=2, label=f't={t_0:.6e}')
-    axes[2, 2].plot(r_int, state_tfinal[idx_app, NUM_GHOSTS:-NUM_GHOSTS], 'r--', linewidth=1.7, label=f't={t_final:.6e}')
-    axes[2, 2].set_xlabel('r')
-    axes[2, 2].set_ylabel(r'$A_{\phi\phi}$')
-    axes[2, 2].set_title(r'Traceless Extrinsic Curvature $A_{\phi\phi}$')
-    axes[2, 2].legend()
-    axes[2, 2].grid(True, alpha=0.3)
-
-    plt.suptitle(f'BSSN Variables Evolution (Full Dynamics)\nt={t_0:.6e} → t={t_final:.6e}',
-                 fontsize=14, y=0.995)
-    plt.tight_layout()
-    plt.savefig(os.path.join(PLOT_DIR, 'tov_bssn_evolution.png'), dpi=150, bbox_inches='tight')
-    plt.close(fig)
-
-    # Compute and print maximum changes
-    print("\n" + "="*70)
-    print("BSSN VARIABLES EVOLUTION STATISTICS")
-    print("="*70)
-    print("Maximum absolute changes during evolution:\n")
-
-    interior = slice(NUM_GHOSTS, -NUM_GHOSTS)
-
-    def max_change(var_idx, var_name):
-        change = np.abs(state_tfinal[var_idx, interior] - state_t0[var_idx, interior])
-        max_val = np.max(np.abs(state_t0[var_idx, interior]))
-        max_abs_change = np.max(change)
-        max_rel_change = max_abs_change / (max_val + 1e-30)
-        print(f"  {var_name:10s}: max |Δ| = {max_abs_change:.6e}  max |Δ/val| = {max_rel_change:.6e}")
-        return max_abs_change
-
-    max_change(idx_phi, 'φ')
-    max_change(idx_lapse, 'α')
-    max_change(idx_K, 'K')
-    max_change(idx_hrr, 'h_rr')
-    max_change(idx_htt, 'h_θθ')
-    max_change(idx_hpp, 'h_φφ')
-    max_change(idx_arr, 'A_rr')
-    max_change(idx_att, 'A_θθ')
-    max_change(idx_app, 'A_φφ')
-
-    # Verify spherical symmetry: h_θθ should equal h_φφ, A_θθ should equal A_φφ
-    print("\nSpherical symmetry verification (should be ~0):")
-    diff_h = np.abs(state_t0[idx_htt, interior] - state_t0[idx_hpp, interior])
-    diff_A = np.abs(state_t0[idx_att, interior] - state_t0[idx_app, interior])
-    print(f"  max |h_θθ - h_φφ| at t={t_0:.6e}: {np.max(diff_h):.6e}")
-    print(f"  max |A_θθ - A_φφ| at t={t_0:.6e}: {np.max(diff_A):.6e}")
-
-    diff_h_final = np.abs(state_tfinal[idx_htt, interior] - state_tfinal[idx_hpp, interior])
-    diff_A_final = np.abs(state_tfinal[idx_att, interior] - state_tfinal[idx_app, interior])
-    print(f"  max |h_θθ - h_φφ| at t={t_final:.6e}: {np.max(diff_h_final):.6e}")
-    print(f"  max |A_θθ - A_φφ| at t={t_final:.6e}: {np.max(diff_A_final):.6e}")
-
-    print("="*70 + "\n")
-
-
-def plot_evolution(state_t0, state_t1, state_t100, state_t10000, grid, hydro,
-                   t_1, t_100, t_10000, label_100='t_100', label_10000='t_final'):
-    """Plot evolution snapshots with actual times reached.
-
-    Args:
-        label_100: Label for third snapshot (may be same as t_10000 if not enough steps)
-        label_10000: Label for fourth snapshot
-    """
-    bssn_0 = BSSNVars(grid.N)
-    bssn_0.set_bssn_vars(state_t0[:NUM_BSSN_VARS, :])
-    hydro.set_matter_vars(state_t0, bssn_0, grid)
-    prim_0 = hydro._get_primitives(bssn_0, grid.r, grid=grid)
-
-    bssn_1 = BSSNVars(grid.N)
-    bssn_1.set_bssn_vars(state_t1[:NUM_BSSN_VARS, :])
-    hydro.set_matter_vars(state_t1, bssn_1, grid)
-    prim_1 = hydro._get_primitives(bssn_1, grid.r, grid=grid)
-
-    bssn_100 = BSSNVars(grid.N)
-    bssn_100.set_bssn_vars(state_t100[:NUM_BSSN_VARS, :])
-    hydro.set_matter_vars(state_t100, bssn_100, grid)
-    prim_100 = hydro._get_primitives(bssn_100, grid.r, grid=grid)
-
-    bssn_10000 = BSSNVars(grid.N)
-    bssn_10000.set_bssn_vars(state_t10000[:NUM_BSSN_VARS, :])
-    hydro.set_matter_vars(state_t10000, bssn_10000, grid)
-    prim_10000 = hydro._get_primitives(bssn_10000, grid.r, grid=grid)
-
-    r_int = grid.r[NUM_GHOSTS:-NUM_GHOSTS]
-
-    fig, axes = plt.subplots(3, 2, figsize=(14, 14))
-
-    # Density
-    axes[0, 0].plot(r_int, prim_0['rho0'][NUM_GHOSTS:-NUM_GHOSTS], 'b-', linewidth=2, label='t=0')
-    axes[0, 0].plot(r_int, prim_1['rho0'][NUM_GHOSTS:-NUM_GHOSTS], 'orange', linestyle='--', linewidth=1.5, label=f't={t_1:.6e}')
-    if t_100 != t_10000:  # Only plot if different from final
-        axes[0, 0].plot(r_int, prim_100['rho0'][NUM_GHOSTS:-NUM_GHOSTS], 'green', linestyle='-.', linewidth=1.5, label=f'{label_100}={t_100:.6e}')
-    axes[0, 0].plot(r_int, prim_10000['rho0'][NUM_GHOSTS:-NUM_GHOSTS], 'red', linestyle=':', linewidth=1.5, label=f'{label_10000}={t_10000:.6e}')
-    axes[0, 0].set_xlabel('r')
-    axes[0, 0].set_ylabel(r'$\rho_0$')
-    axes[0, 0].set_title('Baryon Density Evolution')
-    axes[0, 0].legend()
-    axes[0, 0].set_ylim(0.0, 0.002)
-    axes[0, 0].grid(True, alpha=0.3)
-
-    # Pressure
-    axes[0, 1].plot(r_int, np.maximum(prim_0['p'][NUM_GHOSTS:-NUM_GHOSTS], 1e-20), 'b-', linewidth=2, label='t=0')
-    axes[0, 1].plot(r_int, np.maximum(prim_1['p'][NUM_GHOSTS:-NUM_GHOSTS], 1e-20), 'orange', linestyle='--', linewidth=1.5, label=f't={t_1:.6e}')
-    if t_100 != t_10000:
-        axes[0, 1].plot(r_int, np.maximum(prim_100['p'][NUM_GHOSTS:-NUM_GHOSTS], 1e-20), 'green', linestyle='-.', linewidth=1.5, label=f'{label_100}={t_100:.6e}')
-    axes[0, 1].plot(r_int, np.maximum(prim_10000['p'][NUM_GHOSTS:-NUM_GHOSTS], 1e-20), 'red', linestyle=':', linewidth=1.5, label=f'{label_10000}={t_10000:.6e}')
-    axes[0, 1].set_xlabel('r')
-    axes[0, 1].set_ylabel('P')
-    axes[0, 1].set_title('Pressure Evolution')
-    axes[0, 1].legend()
-    axes[0, 1].grid(True, alpha=0.3)
-
-    # Velocity
-    axes[1, 0].plot(r_int, prim_0['vr'][NUM_GHOSTS:-NUM_GHOSTS], 'b-', linewidth=2, label='t=0')
-    axes[1, 0].plot(r_int, prim_1['vr'][NUM_GHOSTS:-NUM_GHOSTS], 'orange', linestyle='--', linewidth=1.5, label=f't={t_1:.6e}')
-    if t_100 != t_10000:
-        axes[1, 0].plot(r_int, prim_100['vr'][NUM_GHOSTS:-NUM_GHOSTS], 'green', linestyle='-.', linewidth=1.5, label=f'{label_100}={t_100:.6e}')
-    axes[1, 0].plot(r_int, prim_10000['vr'][NUM_GHOSTS:-NUM_GHOSTS], 'red', linestyle=':', linewidth=1.5, label=f'{label_10000}={t_10000:.6e}')
-    axes[1, 0].set_xlabel('r')
-    axes[1, 0].set_ylabel(r'$v^r$')
-    axes[1, 0].set_title('Radial Velocity Evolution')
-    axes[1, 0].legend()
-    axes[1, 0].grid(True, alpha=0.3)
-
-    # Relative density error
-    delta_rho_1 = np.abs(prim_1['rho0'][NUM_GHOSTS:-NUM_GHOSTS] - prim_0['rho0'][NUM_GHOSTS:-NUM_GHOSTS]) / (np.abs(prim_0['rho0'][NUM_GHOSTS:-NUM_GHOSTS]) + 1e-20)
-    delta_rho_100 = np.abs(prim_100['rho0'][NUM_GHOSTS:-NUM_GHOSTS] - prim_0['rho0'][NUM_GHOSTS:-NUM_GHOSTS]) / (np.abs(prim_0['rho0'][NUM_GHOSTS:-NUM_GHOSTS]) + 1e-20)
-    delta_rho_10000 = np.abs(prim_10000['rho0'][NUM_GHOSTS:-NUM_GHOSTS] - prim_0['rho0'][NUM_GHOSTS:-NUM_GHOSTS]) / (np.abs(prim_0['rho0'][NUM_GHOSTS:-NUM_GHOSTS]) + 1e-20)
-
-    axes[1, 1].semilogy(r_int, delta_rho_1, 'orange', linestyle='--', linewidth=1.5, label=f't={t_1:.6e}')
-    if t_100 != t_10000:
-        axes[1, 1].semilogy(r_int, delta_rho_100, 'green', linestyle='-.', linewidth=1.5, label=f'{label_100}={t_100:.6e}')
-    axes[1, 1].semilogy(r_int, delta_rho_10000, 'red', linestyle=':', linewidth=1.5, label=f'{label_10000}={t_10000:.6e}')
-    axes[1, 1].set_xlabel('r')
-    axes[1, 1].set_ylabel(r'$|\Delta\rho|/\rho$')
-    axes[1, 1].set_title('Relative Density Error')
-    axes[1, 1].legend()
-    axes[1, 1].grid(True, alpha=0.3)
-
-    # Lapse function (alpha)
-    axes[2, 0].plot(r_int, state_t0[idx_lapse, NUM_GHOSTS:-NUM_GHOSTS], 'b-', linewidth=2, label='t=0')
-    axes[2, 0].plot(r_int, state_t1[idx_lapse, NUM_GHOSTS:-NUM_GHOSTS], 'orange', linestyle='--', linewidth=1.5, label=f't={t_1:.6e}')
-    if t_100 != t_10000:
-        axes[2, 0].plot(r_int, state_t100[idx_lapse, NUM_GHOSTS:-NUM_GHOSTS], 'green', linestyle='-.', linewidth=1.5, label=f'{label_100}={t_100:.6e}')
-    axes[2, 0].plot(r_int, state_t10000[idx_lapse, NUM_GHOSTS:-NUM_GHOSTS], 'red', linestyle=':', linewidth=1.5, label=f'{label_10000}={t_10000:.6e}')
-    axes[2, 0].set_xlabel('r')
-    axes[2, 0].set_ylabel(r'$\alpha$')
-    axes[2, 0].set_title('Lapse Function Evolution')
-    axes[2, 0].legend()
-    axes[2, 0].grid(True, alpha=0.3)
-
-    # Conformal factor (phi)
-    axes[2, 1].plot(r_int, state_t0[idx_phi, NUM_GHOSTS:-NUM_GHOSTS], 'b-', linewidth=2, label='t=0')
-    axes[2, 1].plot(r_int, state_t1[idx_phi, NUM_GHOSTS:-NUM_GHOSTS], 'orange', linestyle='--', linewidth=1.5, label=f't={t_1:.6e}')
-    if t_100 != t_10000:
-        axes[2, 1].plot(r_int, state_t100[idx_phi, NUM_GHOSTS:-NUM_GHOSTS], 'green', linestyle='-.', linewidth=1.5, label=f'{label_100}={t_100:.6e}')
-    axes[2, 1].plot(r_int, state_t10000[idx_phi, NUM_GHOSTS:-NUM_GHOSTS], 'red', linestyle=':', linewidth=1.5, label=f'{label_10000}={t_10000:.6e}')
-    axes[2, 1].set_xlabel('r')
-    axes[2, 1].set_ylabel(r'$\phi$')
-    axes[2, 1].set_title('Conformal Factor Evolution')
-    axes[2, 1].legend()
-    axes[2, 1].grid(True, alpha=0.3)
-
-    plt.suptitle(f'Evolution: t=0 → t={t_1:.6e} → {label_100}={t_100:.6e} → {label_10000}={t_10000:.6e}', fontsize=14, y=0.995)
-    plt.tight_layout()
-    plt.savefig(os.path.join(PLOT_DIR, 'tov_evolution.png'), dpi=150, bbox_inches='tight')
-    plt.close(fig)
+    return solution.y[:, -1].reshape((grid.NUM_VARS, grid.N))
 
 
 def main():
     """Main execution."""
-    # Create output directory for plots
-    os.makedirs(PLOT_DIR, exist_ok=True)
-    print(f"Plots will be saved to: {PLOT_DIR}/")
-
     print("="*70)
     print("TOV Star Evolution - Full BSSN + Hydro")
     print("="*70)
@@ -1373,17 +685,17 @@ def main():
     num_points = 500
     K = 100.0
     Gamma = 2.0
-    rho_central = 1.28e-3
-    num_steps_total = 1000  # Temporarily reduced for faster testing
+    rho_central = 1.28e-3  # Central density
+    num_steps_total = 10000  # Quick test run
 
 
     # ==================================================================
     # DATA SAVING CONFIGURATION
     # ==================================================================
     ENABLE_DATA_SAVING = True  # Set to True to save data to files
-    OUTPUT_DIR = os.path.join(plots_dir, "tov_evolution_data_bssn")  # Directory for output data (differentiated with 'bssn')
-    SNAPSHOT_INTERVAL = 100  # Save full domain every N timesteps (None to disable)
-    EVOLUTION_INTERVAL = 100  # Save time series every N timesteps (None to disable)
+    OUTPUT_DIR = os.path.join(plots_dir, "tov_evolution_data_bssn")  # Directory for output data
+    SNAPSHOT_INTERVAL = 10  # Save full domain every N timesteps (None to disable)
+    EVOLUTION_INTERVAL = 10  # Save time series every N timesteps (None to disable)
 
     if ENABLE_DATA_SAVING:
         print(f"Data saving enabled:")
@@ -1393,29 +705,35 @@ def main():
         print()
 
     # ==================================================================
-    # ATMOSPHERE CONFIGURATION (Centralized floor management)
+    # ATMOSPHERE CONFIGURATION (Following   approach)
     # ==================================================================
-    # Define atmosphere parameters ONCE - all subsystems will use these
+    # Atmosphere floors ( /  -style): choose small but nonzero floors
+    # Central density is our maximum density: rho_central = 1.28e-3
+    rho_max = rho_central
+    rho_floor_value = 1.0e-10#1.0e-8 * rho_max  # Following  : 1e-10 * rho_max
+
     ATMOSPHERE = AtmosphereParams(
-        rho_floor=1.0e-10,      # Rest mass density floor
-        p_floor=1.0e-11,        # Pressure floor
-        v_max=0.9999,           # Maximum velocity
-        W_max=100.0,            # Maximum Lorentz factor
-        tau_atm_factor=1.0,     # tau_atm = tau_atm_factor * p_floor
-        conservative_floor_safety=0.999999  # Safety factor for S^2 constraint
-    )
+        rho_floor=rho_floor_value,
+        p_floor=1.0e-10,
+        v_max=0.9999,
+        W_max=100.0,
+        tau_atm_factor=1.0,
+        conservative_floor_safety=0.999999,
+        mb=1.0
+        )
 
     print("=" * 70)
     print("ATMOSPHERE CONFIGURATION")
     print("=" * 70)
-    print(f"  rho_floor = {ATMOSPHERE.rho_floor:.2e}")
-    print(f"  p_floor   = {ATMOSPHERE.p_floor:.2e}")
-    print(f"  tau_atm   = {ATMOSPHERE.tau_atm:.2e}")
-    print(f"  v_max     = {ATMOSPHERE.v_max}")
+    print(f"  rho_max       = {rho_max:.2e} (central density)")
+    print(f"  rho_floor     = {ATMOSPHERE.rho_floor:.2e} (1e-10 * rho_max)")
+    print(f"  p_floor       = {ATMOSPHERE.p_floor:.2e} (polytropic EOS)")
+    print(f"  tau_atm       = {ATMOSPHERE.tau_atm:.2e}")
+    print(f"  v_max         = {ATMOSPHERE.v_max}")
     print()
 
     # Time integration method
-    # 'fixed': RK4 with fixed timestep (fast, stable)
+    # 'fixed': RK4 with fixed timestep 
     # 'adaptive': solve_ivp with adaptive timestep (slower, more accurate)
     integration_method = 'fixed'  # 'fixed' or 'adaptive'
 
@@ -1429,8 +747,8 @@ def main():
         eos=eos,
         spacetime_mode="dynamic",
         atmosphere=ATMOSPHERE,
-        reconstructor=create_reconstruction("wenoz"),
-        riemann_solver=HLLRiemannSolver()
+        reconstructor=create_reconstruction("mp5"),
+        riemann_solver=HLLRiemannSolver(atmosphere=ATMOSPHERE)
     )
 
     state_vector = StateVector(hydro)
@@ -1444,141 +762,185 @@ def main():
     # ==================================================================
     # SOLVE TOV DIRECTLY ON EVOLUTION GRID (for discrete equilibrium)
     # ==================================================================
-    print("Solving TOV equations directly on evolution grid...")
-    # Strategy: Solve TOV at exact grid points to minimize interpolation error
-    # This ensures discrete hydrostatic equilibrium is satisfied at grid points
+    print("Solving TOV equations (Schwarzschild coordinates)...")
     tov_solver = TOVSolver(K=K, Gamma=Gamma)
-
-    print(f"  TOV solver: adaptive-step integration on independent grid")
-
-    # Solve TOV with adaptive step; interpolation to evolution grid will be applied below
     tov_solution = tov_solver.solve(rho_central, r_max=r_max)
-
-    # Extract stellar radius for atmosphere reset (r > R_star criterion)
-    R_star = tov_solution['R']
-
-    print(f"TOV Solution: M={tov_solution['M_star']:.6f}, R={R_star:.3f}, C={tov_solution['C']:.4f}\n")
-
-    plot_tov_diagnostics(tov_solution, r_max)
+    print(f"TOV Solution: M={tov_solution['M_star']:.6f}, R={tov_solution['R']:.3f}, C={tov_solution['C']:.4f}\n")
+    utils.plot_tov_diagnostics(tov_solution, r_max)
 
     # ==================================================================
     # INITIAL DATA (HIGH-ORDER INTERPOLATION)
     # ==================================================================
     print("Creating initial data from TOV solution...")
-    # 1. Interpolate ρ, P ONLY up to stellar radius R
-    # 2. Outside R: use atmosphere values directly (no interpolation)
-    # 3. Interpolate geometry (α, exp4φ) everywhere
-    # 4. Stencil NEVER crosses the stellar surface (avoids Gibbs phenomenon)
     initial_state_2d = tov_id.create_initial_data_interpolated(
         tov_solution, grid, background, eos,
         atmosphere=ATMOSPHERE,
-        interp_order=11  # High order Lagrange interpolation
+        interp_order=11
     )
 
     # Diagnostics: check discrete hydrostatic balance at t=0
-    # diagnose_t0_residuals(initial_state_2d, grid, background, hydro)  # TEMPORARILY DISABLED FOR FASTER TESTING
+    diagnose_t0_residuals(initial_state_2d, grid, background, hydro)
 
     # Initial-data diagnostics
-    # tov_id.plot_initial_comparison(tov_solution, initial_state_2d, grid, hydro)  # TEMPORARILY DISABLED FOR FASTER TESTING
+    tov_id.plot_initial_comparison(tov_solution, initial_state_2d, grid, hydro)
 
-    # ==================================================================
-    # DATA MANAGER INITIALIZATION
-    # ==================================================================
-    # Initialize data manager for saving
-    data_manager = SimulationDataManager(OUTPUT_DIR, grid, hydro, enable_saving=ENABLE_DATA_SAVING)
-
-    # Save metadata
-    if ENABLE_DATA_SAVING:
-        data_manager.save_metadata(tov_solution, ATMOSPHERE, None, integration_method, K=K, Gamma=Gamma, rho_central=rho_central)
+    # Zoom comparison: TOV solution vs interpolated initial data
+    utils.plot_tov_vs_initial_data_zoom(tov_solution, initial_state_2d, grid, hydro, window=0.1)
 
     # ==================================================================
     # EVOLUTION
     # ==================================================================
+    # Initialize data manager for saving
+    data_manager = utils.SimulationDataManager(OUTPUT_DIR, grid, hydro, enable_saving=ENABLE_DATA_SAVING)
+
+
     if integration_method == 'fixed':
         dt = 0.2 * grid.min_dr  # CFL condition
-        print(f"\nEvolving with fixed dt={dt:.6f} (CFL=0.2) for {num_steps_total} steps using RK4")
+        print(f"\nEvolving with fixed dt={dt:.6f} (CFL=0.1) for {num_steps_total} steps using RK4")
 
-        # Update metadata with dt
+        # Save metadata now that we have dt
         if ENABLE_DATA_SAVING:
             data_manager.save_metadata(tov_solution, ATMOSPHERE, dt, integration_method, K=K, Gamma=Gamma, rho_central=rho_central)
 
-        # Single step for comparison
-        state_t1 = rk4_step(initial_state_2d.flatten(), dt, grid, background, hydro,
-                           ATMOSPHERE, R_star=R_star).reshape((grid.NUM_VARS, grid.N))
-        t_1 = dt
+        # Plot only the first step changes (for diagnostics)
+        state_t1_diag = rk4_step(initial_state_2d.flatten(), dt, grid, background, hydro,
+                           ATMOSPHERE).reshape((grid.NUM_VARS, grid.N))
+        utils.plot_first_step(initial_state_2d, state_t1_diag, grid, hydro, tov_solution)
+        utils.plot_surface_zoom(tov_solution, initial_state_2d, state_t1_diag, grid, hydro, window=0.1)
 
-        # Plot only the first step changes
-        # plot_first_step(initial_state_2d, state_t1, grid, hydro, tov_solution)  # TEMPORARILY DISABLED FOR FASTER TESTING
-        # plot_surface_zoom(tov_solution, initial_state_2d, state_t1, grid, hydro, window=0.1)  # TEMPORARILY DISABLED FOR FASTER TESTING
+        # Define checkpoints at 1/3, 2/3, and 1 of total steps
+        checkpoint_1 = num_steps_total // 3
+        checkpoint_2 = 2 * num_steps_total // 3
+        checkpoint_3 = num_steps_total
 
-        # Define intermediate checkpoint (around 10% of total, or 100 if total is large)
-        if num_steps_total <= 100:
-            checkpoint_mid = max(10, num_steps_total // 10)
-        else:
-            checkpoint_mid = 100
+        print(f"\nEvolution checkpoints:")
+        print(f"  t=0:         initial state")
+        print(f"  step {checkpoint_1}:    1/3 of evolution")
+        print(f"  step {checkpoint_2}:   2/3 of evolution")
+        print(f"  step {checkpoint_3}: final state")
 
-        # Evolve incrementally to intermediate checkpoint
-        print(f"\nEvolving to step {checkpoint_mid}...")
-        state_t100, steps_100, t_100 = evolve_fixed_timestep(
-            initial_state_2d, dt, checkpoint_mid, grid, background,
+        # Evolve to checkpoint 1 (1/3 of total)
+        print(f"\nEvolving to step {checkpoint_1} (1/3)...")
+        state_t1, steps_1, t_1, series_1 = evolve_fixed_timestep(
+            initial_state_2d, dt, checkpoint_1, grid, background,
             hydro, ATMOSPHERE, method='rk4',
             reference_state=initial_state_2d,
             data_manager=data_manager,
             snapshot_interval=SNAPSHOT_INTERVAL,
-            evolution_interval=EVOLUTION_INTERVAL,
-            R_star=R_star)
-        print(f"  -> Reached step {steps_100}, t={t_100:.6e}")
+            evolution_interval=EVOLUTION_INTERVAL)
+        print(f"  -> Reached step {steps_1}, t={t_1:.6e}")
 
-        # Continue evolution to num_steps_total (or until it breaks)
-        if num_steps_total > checkpoint_mid and steps_100 == checkpoint_mid:
-            remaining_steps = num_steps_total - checkpoint_mid
-            print(f"\nContinuing evolution from step {checkpoint_mid} to {num_steps_total} ({remaining_steps} more steps)...")
-            state_tfinal, steps_more, t_final = evolve_fixed_timestep(
-                state_t100, dt, remaining_steps, grid, background,
+        # Continue evolution to checkpoint 2 (2/3 of total)
+        if num_steps_total > checkpoint_1 and steps_1 == checkpoint_1:
+            remaining_steps_2 = checkpoint_2 - checkpoint_1
+            print(f"\nContinuing evolution from step {checkpoint_1} to {checkpoint_2} (2/3)...")
+            state_t2, steps_more_2, t_2, series_2 = evolve_fixed_timestep(
+                state_t1, dt, remaining_steps_2, grid, background,
                 hydro, ATMOSPHERE, method='rk4',
-                t_start=t_100, reference_state=initial_state_2d,
-                step_offset=checkpoint_mid,
+                t_start=t_1, reference_state=initial_state_2d,
+                step_offset=checkpoint_1,
                 data_manager=data_manager,
                 snapshot_interval=SNAPSHOT_INTERVAL,
-                evolution_interval=EVOLUTION_INTERVAL,
-                R_star=R_star)
-            # t_final already includes t_start from evolve_fixed_timestep
-            steps_final = checkpoint_mid + steps_more
+                evolution_interval=EVOLUTION_INTERVAL)
+            steps_2 = checkpoint_1 + steps_more_2
+            print(f"  -> Reached step {steps_2}, t={t_2:.6e}")
+        else:
+            # Evolution stopped early
+            state_t2 = state_t1
+            t_2 = t_1
+            steps_2 = steps_1
+            series_2 = None
+
+        # Continue evolution to checkpoint 3 (final)
+        if num_steps_total > checkpoint_2 and steps_2 == checkpoint_2:
+            remaining_steps_3 = checkpoint_3 - checkpoint_2
+            print(f"\nContinuing evolution from step {checkpoint_2} to {checkpoint_3} (final)...")
+            state_tfinal, steps_more_3, t_final, series_3 = evolve_fixed_timestep(
+                state_t2, dt, remaining_steps_3, grid, background,
+                hydro, ATMOSPHERE, method='rk4',
+                t_start=t_2, reference_state=initial_state_2d,
+                step_offset=checkpoint_2,
+                data_manager=data_manager,
+                snapshot_interval=SNAPSHOT_INTERVAL,
+                evolution_interval=EVOLUTION_INTERVAL)
+            steps_final = checkpoint_2 + steps_more_3
             print(f"  -> Reached step {steps_final}, t={t_final:.6e}")
         else:
-            # Evolution stopped early at checkpoint, or checkpoint == total
-            state_tfinal = state_t100
-            t_final = t_100
-            steps_final = steps_100
-        
-        # For plotting: use intermediate state and final state (wherever it stopped)
+            # Evolution stopped early
+            state_tfinal = state_t2
+            t_final = t_2
+            steps_final = steps_2
+            series_3 = None
+
+        # For plotting: use all four checkpoints (t=0, t=1/3, t=2/3, t=final)
+        # Keep state_t1 as the 1/3 checkpoint
+        # state_t2 is the 2/3 checkpoint
+        # state_tfinal is the final state
+        state_t100 = state_t2  # Renamed for compatibility with existing plot calls
+        t_100 = t_2
         state_t10000 = state_tfinal
         t_10000 = t_final
         num_steps = steps_final
 
+        # Build full-series arrays for mass and central density
+        try:
+            series_list = [series_1]
+            if series_2 is not None:
+                series_list.append(series_2)
+            if series_3 is not None:
+                series_list.append(series_3)
+
+            if len(series_list) == 1:
+                times_full = series_1['t']
+                Mb_full = series_1['Mb']
+                rho_c_full = series_1['rho_c']
+            else:
+                times_full = series_list[0]['t']
+                Mb_full = series_list[0]['Mb']
+                rho_c_full = series_list[0]['rho_c']
+                for series in series_list[1:]:
+                    times_full = np.concatenate([times_full, series['t'][1:]])
+                    Mb_full = np.concatenate([Mb_full, series['Mb'][1:]])
+                    rho_c_full = np.concatenate([rho_c_full, series['rho_c'][1:]])
+        except Exception:
+            times_full = np.array([])
+            Mb_full = np.array([])
+            rho_c_full = np.array([])
+
     elif integration_method == 'adaptive':
         # NOTE: Adaptive methods are slower but can be more accurate
         # Available methods: 'RK45', 'RK23', 'DOP853', 'Radau', 'BDF', 'LSODA'
-        t_100 = 1.00  # Time for intermediate snapshot
         t_10000 = 10.00  # Final time
+        t_1 = t_10000 / 3.0  # Time for 1/3 snapshot
+        t_100 = 2.0 * t_10000 / 3.0  # Time for 2/3 snapshot
+
         print(f"\nEvolving to t={t_10000} using solve_ivp (adaptive)")
+        print(f"Evolution checkpoints:")
+        print(f"  t=0:     initial state")
+        print(f"  t={t_1:.6e}:  1/3 of evolution")
+        print(f"  t={t_100:.6e}:  2/3 of evolution")
+        print(f"  t={t_10000:.6e}: final state")
 
-        # For single step comparison, use small fixed dt
-        dt = 0.5 * grid.min_dr
-        t_1 = dt
         # Define an effective number of steps for labeling/plots
-        # so code paths that expect 'num_steps' still work.
+        dt = 0.5 * grid.min_dr
         num_steps = max(1, int(round(t_10000 / dt)))
-        state_t1 = rk4_step(initial_state_2d.flatten(), dt, grid, background, hydro,
-                           ATMOSPHERE, R_star=R_star).reshape((grid.NUM_VARS, grid.N))
 
-        # Adaptive evolution to t=1.0
-        state_t100 = evolve_adaptive(initial_state_2d, t_100, grid, background, hydro, ATMOSPHERE,
-                                    method='RK45', rtol=1e-5, atol=1e-7, R_star=R_star)
+        # Adaptive evolution to t=1/3
+        state_t1 = evolve_adaptive(initial_state_2d, t_1, grid, background, hydro,
+                                    method='RK45', rtol=1e-5, atol=1e-7)
 
-        # Adaptive evolution to t=10.0
-        state_t10000 = evolve_adaptive(initial_state_2d, t_10000, grid, background, hydro, ATMOSPHERE,
-                                      method='RK45', rtol=1e-5, atol=1e-7, R_star=R_star)
+        # Adaptive evolution to t=2/3
+        state_t100 = evolve_adaptive(initial_state_2d, t_100, grid, background, hydro,
+                                    method='RK45', rtol=1e-5, atol=1e-7)
+
+        # Adaptive evolution to t=final
+        state_t10000 = evolve_adaptive(initial_state_2d, t_10000, grid, background, hydro,
+                                      method='RK45', rtol=1e-5, atol=1e-7)
+
+        # No time series data for adaptive method
+        times_full = np.array([])
+        Mb_full = np.array([])
+        rho_c_full = np.array([])
 
     # ==================================================================
     # DIAGNOSTICS
@@ -1588,49 +950,64 @@ def main():
         # For fixed timestep: use step numbers for clarity
         if t_100 == t_10000:
             # Same state (evolution stopped early or only ran to checkpoint)
-            label_100 = f't(step={steps_final})'
-            label_10000 = f't(step={steps_final})'
+            label_100 = f't=2/3 (step={steps_final})'
+            label_10000 = f't=final (step={steps_final})'
         else:
-            label_100 = f't(step={steps_100})'
-            label_10000 = f't(step={steps_final})'
+            label_100 = f't=2/3 (step={steps_2})'
+            label_10000 = f't=final (step={steps_final})'
     else:
         # For adaptive timestep: use time labels
-        label_100 = 't_mid'
-        label_10000 = 't_final'
+        label_100 = 't=2/3'
+        label_10000 = 't=final'
 
-    # CRITICAL: Apply atmosphere reset to final states before plotting
-    # This ensures primitives calculated for plots have vr=0 in atmosphere
-    # (during evolution, this happens in rk4_step, but plots call _get_primitives separately)
-    state_t1 = _apply_atmosphere_reset(state_t1, grid, hydro, ATMOSPHERE, R_star=R_star)
-    state_t100 = _apply_atmosphere_reset(state_t100, grid, hydro, ATMOSPHERE, R_star=R_star)
-    state_t10000 = _apply_atmosphere_reset(state_t10000, grid, hydro, ATMOSPHERE, R_star=R_star)
+    # Combined 3x2 figure: keep 4 panels and replace bottom row with the two new time-series
+    try:
+        if 'times_full' in locals() and len(times_full) > 0:
+            utils.plot_evolution(initial_state_2d, state_t1, state_t100, state_t10000, grid, hydro,
+                           t_1, t_100, t_10000, label_100=label_100, label_10000=label_10000,
+                           times_series=times_full, Mb_series=Mb_full, rho_c_series=rho_c_full)
+        else:
+            utils.plot_evolution(initial_state_2d, state_t1, state_t100, state_t10000, grid, hydro,
+                           t_1, t_100, t_10000, label_100=label_100, label_10000=label_10000)
+    except Exception:
+        utils.plot_evolution(initial_state_2d, state_t1, state_t100, state_t10000, grid, hydro,
+                       t_1, t_100, t_10000, label_100=label_100, label_10000=label_10000)
 
-    plot_evolution(initial_state_2d, state_t1, state_t100, state_t10000, grid, hydro,
-                   t_1, t_100, t_10000, label_100=label_100, label_10000=label_10000)
+    # Plot BSSN variables evolution to verify BSSN dynamics
+    utils.plot_bssn_evolution(initial_state_2d, state_t10000, grid, t_0=0.0, t_final=t_10000)
 
-    # Plot BSSN variables evolution to verify Cowling approximation
-    plot_bssn_evolution(initial_state_2d, state_t10000, grid, t_0=0.0, t_final=t_10000)
+    # Plot Hamiltonian constraint evolution
+    if ENABLE_DATA_SAVING and data_manager:
+        try:
+            utils.plot_hamiltonian_constraint_evolution(
+                data_manager.snapshot_file,
+                data_manager.evolution_file,
+                grid,
+                output_dir=plots_dir
+            )
+        except Exception as e:
+            print(f"Warning: Could not generate Hamiltonian constraint plot: {e}")
 
     # Print detailed statistics
     bssn_0 = BSSNVars(grid.N)
     bssn_0.set_bssn_vars(initial_state_2d[:NUM_BSSN_VARS, :])
     hydro.set_matter_vars(initial_state_2d, bssn_0, grid)
-    prim_0 = hydro._get_primitives(bssn_0, grid.r, grid=grid)
+    prim_0 = hydro._get_primitives(bssn_0, grid.r)
 
     bssn_1 = BSSNVars(grid.N)
     bssn_1.set_bssn_vars(state_t1[:NUM_BSSN_VARS, :])
     hydro.set_matter_vars(state_t1, bssn_1, grid)
-    prim_1 = hydro._get_primitives(bssn_1, grid.r, grid=grid)
+    prim_1 = hydro._get_primitives(bssn_1, grid.r)
 
     bssn_100 = BSSNVars(grid.N)
     bssn_100.set_bssn_vars(state_t100[:NUM_BSSN_VARS, :])
     hydro.set_matter_vars(state_t100, bssn_100, grid)
-    prim_100 = hydro._get_primitives(bssn_100, grid.r, grid=grid)
+    prim_100 = hydro._get_primitives(bssn_100, grid.r)
 
     bssn_10000 = BSSNVars(grid.N)
     bssn_10000.set_bssn_vars(state_t10000[:NUM_BSSN_VARS, :])
     hydro.set_matter_vars(state_t10000, bssn_10000, grid)
-    prim_10000 = hydro._get_primitives(bssn_10000, grid.r, grid=grid)
+    prim_10000 = hydro._get_primitives(bssn_10000, grid.r)
 
     # Calculate actual final time (already stored in t_10000)
     t_final_actual = t_10000
@@ -1649,25 +1026,60 @@ def main():
 
     # Error growth factor
     max_err_rho_1 = np.max(delta_rho_1)
+    idx_max_err_rho_1 = NUM_GHOSTS + int(np.argmax(delta_rho_1))
+    r_max_err_rho_1 = grid.r[idx_max_err_rho_1]
+
     max_err_rho_100 = np.max(delta_rho_100)
+    idx_max_err_rho_100 = NUM_GHOSTS + int(np.argmax(delta_rho_100))
+    r_max_err_rho_100 = grid.r[idx_max_err_rho_100]
+
     max_err_rho_10000 = np.max(delta_rho_10000)
+    idx_max_err_rho_10000 = NUM_GHOSTS + int(np.argmax(delta_rho_10000))
+    r_max_err_rho_10000 = grid.r[idx_max_err_rho_10000]
+
     growth_rho = max_err_rho_10000 / max_err_rho_1 if max_err_rho_1 > 1e-15 else 0
 
     max_err_P_1 = np.max(delta_P_1)
+    idx_max_err_P_1 = NUM_GHOSTS + int(np.argmax(delta_P_1))
+    r_max_err_P_1 = grid.r[idx_max_err_P_1]
+
     max_err_P_100 = np.max(delta_P_100)
+    idx_max_err_P_100 = NUM_GHOSTS + int(np.argmax(delta_P_100))
+    r_max_err_P_100 = grid.r[idx_max_err_P_100]
+
     max_err_P_10000 = np.max(delta_P_10000)
+    idx_max_err_P_10000 = NUM_GHOSTS + int(np.argmax(delta_P_10000))
+    r_max_err_P_10000 = grid.r[idx_max_err_P_10000]
+
     growth_P = max_err_P_10000 / max_err_P_1 if max_err_P_1 > 1e-15 else 0
+
+    # Calculate max velocity and positions
+    max_v_0 = np.max(np.abs(prim_0['vr'][interior]))
+    idx_max_v_0 = NUM_GHOSTS + int(np.argmax(np.abs(prim_0['vr'][interior])))
+    r_max_v_0 = grid.r[idx_max_v_0]
+
+    max_v_1 = np.max(np.abs(prim_1['vr'][interior]))
+    idx_max_v_1 = NUM_GHOSTS + int(np.argmax(np.abs(prim_1['vr'][interior])))
+    r_max_v_1 = grid.r[idx_max_v_1]
+
+    max_v_100 = np.max(np.abs(prim_100['vr'][interior]))
+    idx_max_v_100 = NUM_GHOSTS + int(np.argmax(np.abs(prim_100['vr'][interior])))
+    r_max_v_100 = grid.r[idx_max_v_100]
+
+    max_v_10000 = np.max(np.abs(prim_10000['vr'][interior]))
+    idx_max_v_10000 = NUM_GHOSTS + int(np.argmax(np.abs(prim_10000['vr'][interior])))
+    r_max_v_10000 = grid.r[idx_max_v_10000]
 
     print(f"\n{'='*70}")
     print(f"EVOLUTION DIAGNOSTICS (t=0 → t={t_1:.6e} → t={t_100:.6e} → t={t_10000:.6e})")
     print(f"{'='*70}")
 
     print(f"\n1. VELOCITY EVOLUTION:")
-    print(f"   Max |v^r| at t=0:             {np.max(np.abs(prim_0['vr'])):.3e}")
-    print(f"   Max |v^r| at t={t_1:.6e}:   {np.max(np.abs(prim_1['vr'])):.3e}")
+    print(f"   Max |v^r| at t=0:             {max_v_0:.3e} (r={r_max_v_0:.2f})")
+    print(f"   Max |v^r| at t={t_1:.6e}:   {max_v_1:.3e} (r={r_max_v_1:.2f})")
     if t_100 != t_10000:
-        print(f"   Max |v^r| at t={t_100:.6e}:   {np.max(np.abs(prim_100['vr'])):.3e}")
-    print(f"   Max |v^r| at t={t_10000:.6e}: {np.max(np.abs(prim_10000['vr'])):.3e}")
+        print(f"   Max |v^r| at t={t_100:.6e}:   {max_v_100:.3e} (r={r_max_v_100:.2f})")
+    print(f"   Max |v^r| at t={t_10000:.6e}: {max_v_10000:.3e} (r={r_max_v_10000:.2f})")
 
     print(f"\n2. CENTRAL DENSITY:")
     print(f"   ρ_c at t=0:                 {prim_0['rho0'][NUM_GHOSTS]:.6e}")
@@ -1681,17 +1093,17 @@ def main():
     print(f"   Δρ_c/ρ_c (t={t_10000:.6e}):{abs(prim_10000['rho0'][NUM_GHOSTS] - prim_0['rho0'][NUM_GHOSTS])/prim_0['rho0'][NUM_GHOSTS]:.3e}")
 
     print(f"\n3. DENSITY ERROR (max over domain):")
-    print(f"   Max |Δρ|/ρ at t={t_1:.6e}:    {max_err_rho_1:.3e}")
+    print(f"   Max |Δρ|/ρ at t={t_1:.6e}:    {max_err_rho_1:.3e} (r={r_max_err_rho_1:.2f})")
     if t_100 != t_10000:
-        print(f"   Max |Δρ|/ρ at t={t_100:.6e}:  {max_err_rho_100:.3e}")
-    print(f"   Max |Δρ|/ρ at t={t_10000:.6e}: {max_err_rho_10000:.3e}")
+        print(f"   Max |Δρ|/ρ at t={t_100:.6e}:  {max_err_rho_100:.3e} (r={r_max_err_rho_100:.2f})")
+    print(f"   Max |Δρ|/ρ at t={t_10000:.6e}: {max_err_rho_10000:.3e} (r={r_max_err_rho_10000:.2f})")
     print(f"   Growth factor (final/1):        {growth_rho:.1f}x")
 
     print(f"\n4. PRESSURE ERROR (max over domain):")
-    print(f"   Max |ΔP|/P at t={t_1:.6e}:    {max_err_P_1:.3e}")
+    print(f"   Max |ΔP|/P at t={t_1:.6e}:    {max_err_P_1:.3e} (r={r_max_err_P_1:.2f})")
     if t_100 != t_10000:
-        print(f"   Max |ΔP|/P at t={t_100:.6e}:  {max_err_P_100:.3e}")
-    print(f"   Max |ΔP|/P at t={t_10000:.6e}: {max_err_P_10000:.3e}")
+        print(f"   Max |ΔP|/P at t={t_100:.6e}:  {max_err_P_100:.3e} (r={r_max_err_P_100:.2f})")
+    print(f"   Max |ΔP|/P at t={t_10000:.6e}: {max_err_P_10000:.3e} (r={r_max_err_P_10000:.2f})")
     print(f"   Growth factor (final/1):        {growth_P:.1f}x")
 
     print(f"\n5. CONS2PRIM STATUS:")
@@ -1706,19 +1118,21 @@ def main():
         print(f"   Failed points: {failed_idx[:5]} (first 5)")
         print(f"   Failed radii:  {grid.r[failed_idx[:5]]}")
 
-    # Finalize data manager (flush buffers and close files)
+    # Finalize data saving
     if ENABLE_DATA_SAVING:
         data_manager.finalize()
 
     print("\n" + "="*70)
-    print(f"Evolution complete. Plots saved to {PLOT_DIR}/:")
-    print(f"  1. {PLOT_DIR}/tov_solution.png                - TOV solution (ρ, P, M, α)")
-    print(f"  2. {PLOT_DIR}/tov_initial_data_comparison.png - TOV vs Initial data at t=0")
+    print("Evolution complete. Plots saved:")
+    print("  1. tov_solution.png                   - TOV solution (ρ, P, M, α)")
+    print("  2. tov_initial_data_comparison.png    - TOV vs Initial data at t=0")
     if t_100 != t_10000:
-        print(f"  3. {PLOT_DIR}/tov_evolution.png               - Hydro evolution: t=0 → t={t_1:.6e} → t={t_100:.6e} → t={t_10000:.6e}")
+        print(f"  3. tov_evolution.png                  - Hydro evolution: t=0 → t={t_1:.6e} → t={t_100:.6e} → t={t_10000:.6e}")
     else:
-        print(f"  3. {PLOT_DIR}/tov_evolution.png               - Hydro evolution: t=0 → t={t_1:.6e} → t={t_10000:.6e}")
-    print(f"  4. {PLOT_DIR}/tov_bssn_evolution.png          - BSSN variables: t=0 → t={t_10000:.6e} (Full evolution)")
+        print(f"  3. tov_evolution.png                  - Hydro evolution: t=0 → t={t_1:.6e} → t={t_10000:.6e}")
+    print(f"  4. tov_bssn_evolution.png             - BSSN variables: t=0 → t={t_10000:.6e} (Full evolution)")
+    if ENABLE_DATA_SAVING:
+        print(f"  5. tov_hamiltonian_constraint.png     - Hamiltonian constraint evolution")
     print("="*70)
 
 

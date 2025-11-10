@@ -56,7 +56,7 @@ class DummyProgress:
         pass
 
 # -------------------- RK4 Time Evolution --------------------
-def rk4_step_hwh(state, grid: Grid, background, matter, cfl=0.5):
+def rk4_step_hwh(state, grid: Grid, background, matter, cfl=0.2):
     """
     RK4 time integration for Hydro-without-Hydro test.
     Evolves BSSN while keeping T^μν fixed (matter sources from TOV).
@@ -223,7 +223,20 @@ def run_hwh_test(
     p = primitives['p'].copy()
     v = primitives['vr'].copy()
 
-    # Set final time based on TOV mass 
+    # CRITICAL: Fix stress-energy tensor sources for hydro-without-hydro test
+    # Compute T^{μν} projections (ρ, S_i, S_{ij}, S) from initial data and freeze them.
+    # This prevents matter sources from changing as the metric evolves during BSSN evolution.
+    # See Baumgarte et al. (1999) gr-qc/9902024: "We only evolve the gravitational fields,
+    # holding the matter sources to their OV [TOV] values."
+    emtensor_initial = hydro.get_emtensor(grid.r, bssn_vars, background)
+    hydro.set_fixed_emtensor_sources(
+        rho=emtensor_initial.rho,
+        Si=emtensor_initial.Si,
+        Sij=emtensor_initial.Sij,
+        S=emtensor_initial.S
+    )
+
+    # Set final time based on TOV mass
     t_final = t_final_factor * M_star
 
     # Initialize data storage
@@ -785,7 +798,7 @@ def plot_baumgarte_fig3_outer_boundary(results_list, ob_locations, save_plots=Tr
     plt.close()
 
 
-def run_convergence_test(resolutions=[72, 96], cfl=0.1, plot=True):
+def run_convergence_test(resolutions=[72, 94], cfl=0.1, plot=True):
     """
     Run convergence 
 
@@ -917,7 +930,7 @@ if __name__ == "__main__":
         K=1.0,                # Polytropic constant
         rho_central=0.2,      # Central density (Baumgarte paper)
         cfl=0.1,              # CFL factor
-        dr=0.02,              # Spatial resolution
+        dr=0.01,              # Spatial resolution
         progress=True         # Show progress
     )
 
@@ -930,7 +943,7 @@ if __name__ == "__main__":
     # Option 2: Convergence test
     print("\nOption 2: Running convergence test...")
     convergence_results = run_convergence_test(
-        resolutions=[72, 96],
+        resolutions=[72, 94],
         cfl=0.1,
         plot=True
     )

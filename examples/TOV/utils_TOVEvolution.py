@@ -420,8 +420,12 @@ def _apply_atmosphere_reset(state_2d, grid, hydro, atmosphere, rho_threshold=Non
 # =============================================================================
 
 
-def plot_first_step(state_t0, state_t1, grid, hydro, tov_solution=None):
-    """Plot only t=0 vs t=1×dt to inspect the first update."""
+def plot_first_step(state_t0, state_t1, grid, hydro, tov_solution=None, suffix=""):
+    """Plot only t=0 vs t=1×dt to inspect the first update.
+
+    Args:
+        suffix: Optional suffix to append to filename (e.g., "_bssn")
+    """
     bssn_0 = BSSNVars(grid.N)
     bssn_0.set_bssn_vars(state_t0[:NUM_BSSN_VARS, :])
     hydro.set_matter_vars(state_t0, bssn_0, grid)
@@ -639,14 +643,18 @@ def plot_first_step(state_t0, state_t1, grid, hydro, tov_solution=None):
     axes[1, 2].grid(True, alpha=0.3)
 
     plt.tight_layout()
-    plt.savefig(os.path.join(plots_dir, 'tov_first_step.png'), dpi=150, bbox_inches='tight')
+    filename = f'tov_first_step{suffix}.png'
+    plt.savefig(os.path.join(plots_dir, filename), dpi=150, bbox_inches='tight')
     plt.close(fig)
 
 
-def plot_surface_zoom(tov_solution, state_t0, state_t1, grid, hydro, window=0.5):
+def plot_surface_zoom(tov_solution, state_t0, state_t1, grid, hydro, window=0.5, suffix=""):
     """Zoom near the stellar surface R to compare t=0 vs t=1×dt.
 
     Plots overlays for (ρ0, P, v^r, D, S_r, τ) in a window [R−window, R+window].
+
+    Args:
+        suffix: Optional suffix to append to filename (e.g., "_bssn")
     """
     R = float(tov_solution['R'])
     r = grid.r
@@ -699,17 +707,21 @@ def plot_surface_zoom(tov_solution, state_t0, state_t1, grid, hydro, window=0.5)
         a.set_xlabel('r')
 
     plt.tight_layout()
-    plt.savefig(os.path.join(plots_dir, 'tov_surface_zoom.png'), dpi=150, bbox_inches='tight')
+    filename = f'tov_surface_zoom{suffix}.png'
+    plt.savefig(os.path.join(plots_dir, filename), dpi=150, bbox_inches='tight')
     plt.close(fig)
 
 
-def plot_tov_vs_initial_data_zoom(tov_solution, initial_state_2d, grid, hydro, window=0.5):
+def plot_tov_vs_initial_data_zoom(tov_solution, initial_state_2d, grid, hydro, window=0.5, suffix=""):
     """Zoom near the stellar surface R to compare TOV solution vs interpolated initial data.
 
     This plot helps identify interpolation errors and differences between the analytic
     TOV solution and the discretized initial data on the evolution grid.
 
     Plots overlays for (ρ0, P, v^r, D, S_r, τ) in a window [R−window, R+window].
+
+    Args:
+        suffix: Optional suffix to append to filename (e.g., "_bssn")
     """
     R = float(tov_solution['R'])
     r = grid.r
@@ -794,12 +806,17 @@ def plot_tov_vs_initial_data_zoom(tov_solution, initial_state_2d, grid, hydro, w
     plt.suptitle(f'TOV Solution vs Initial Data: Surface Zoom [R−{window}, R+{window}]',
                  fontsize=13, y=0.995)
     plt.tight_layout()
-    plt.savefig(os.path.join(plots_dir, 'tov_vs_initial_zoom.png'), dpi=150, bbox_inches='tight')
+    filename = f'tov_vs_initial_zoom{suffix}.png'
+    plt.savefig(os.path.join(plots_dir, filename), dpi=150, bbox_inches='tight')
     plt.close(fig)
 
 
-def plot_tov_diagnostics(tov_solution, r_max):
-    """Plot TOV solution diagnostics (without conformal factor)."""
+def plot_tov_diagnostics(tov_solution, r_max, suffix=""):
+    """Plot TOV solution diagnostics (without conformal factor).
+
+    Args:
+        suffix: Optional suffix to append to filename (e.g., "_bssn")
+    """
     r = tov_solution['r']
     R_star = tov_solution['R']
     M_star = tov_solution['M_star']
@@ -866,11 +883,12 @@ def plot_tov_diagnostics(tov_solution, r_max):
     axes[1, 2].grid(True, alpha=0.3)
 
     plt.tight_layout()
-    plt.savefig(os.path.join(plots_dir, 'tov_solution.png'), dpi=150, bbox_inches='tight')
+    filename = f'tov_solution{suffix}.png'
+    plt.savefig(os.path.join(plots_dir, filename), dpi=150, bbox_inches='tight')
     plt.close(fig)
 
 
-def plot_bssn_evolution(state_t0, state_tfinal, grid, t_0=0.0, t_final=1.0):
+def plot_bssn_evolution(state_t0, state_tfinal, grid, t_0=0.0, t_final=1.0, suffix=""):
     """Plot BSSN variables at initial and final time to verify Cowling approximation.
 
     In Cowling approximation, BSSN variables should remain constant.
@@ -888,6 +906,7 @@ def plot_bssn_evolution(state_t0, state_tfinal, grid, t_0=0.0, t_final=1.0):
         grid: Grid object
         t_0: Initial time (for labeling)
         t_final: Final time (for labeling)
+        suffix: Optional suffix to append to filename (e.g., "_bssn")
     """
     r_int = grid.r
 
@@ -980,7 +999,8 @@ def plot_bssn_evolution(state_t0, state_tfinal, grid, t_0=0.0, t_final=1.0):
     plt.suptitle(f'BSSN Variables Evolution (Cowling Approximation)\nt={t_0:.6e} → t={t_final:.6e}',
                  fontsize=14, y=0.995)
     plt.tight_layout()
-    plt.savefig(os.path.join(plots_dir, 'tov_bssn_evolution.png'), dpi=150, bbox_inches='tight')
+    filename = f'tov_bssn_evolution{suffix}.png'
+    plt.savefig(os.path.join(plots_dir, filename), dpi=150, bbox_inches='tight')
     plt.close(fig)
 
     # Compute and print maximum changes to verify Cowling approximation
@@ -1087,13 +1107,16 @@ def plot_mass_and_central_density(times, Mb_series, rho_c_series, out_path):
 
 def plot_evolution(state_t0, state_t1, state_t100, state_t10000, grid, hydro,
                    t_1, t_100, t_10000, label_100='t_2/3', label_10000='t_final',
-                   times_series=None, Mb_series=None, rho_c_series=None):
+                   times_series=None, Mb_series=None, rho_c_series=None, suffix=""):
     """Evolution plot with 6 panels showing snapshots at t=0, t=1/3, t=2/3, and t=final.
 
     Top 4 panels: (ρ, P, v^r, |Δρ|/ρ) at four evolution times
     Bottom row:
       - Left: log10(|M - M0|) vs t (if time series provided; else legacy ΔM/M0 sparse)
       - Right: ρ_c/ρ_c(0) - 1 vs t (if time series provided; else legacy L1 density error)
+
+    Args:
+        suffix: Optional suffix to append to filename (e.g., "_bssn")
     """
     bssn_0 = BSSNVars(grid.N)
     bssn_0.set_bssn_vars(state_t0[:NUM_BSSN_VARS, :])
@@ -1236,12 +1259,12 @@ def plot_evolution(state_t0, state_t1, state_t100, state_t10000, grid, hydro,
 
     plt.suptitle(f'Evolution: t=0 → t=1/3 ({t_1:.6e}) → t=2/3 ({t_100:.6e}) → t=final ({t_10000:.6e})', fontsize=14, y=0.995)
     plt.tight_layout()
-    plt.savefig(os.path.join(plots_dir, 'tov_evolution.png'), dpi=150, bbox_inches='tight')
-    plt.show()
-    # plt.close(fig)
+    filename = f'tov_evolution{suffix}.png'
+    plt.savefig(os.path.join(plots_dir, filename), dpi=150, bbox_inches='tight')
+    plt.close(fig)
 
 
-def plot_hamiltonian_constraint_evolution(snapshot_file, evolution_file, grid, output_dir=plots_dir):
+def plot_hamiltonian_constraint_evolution(snapshot_file, evolution_file, grid, output_dir=plots_dir, suffix=""):
     """
     Plot Hamiltonian constraint evolution from HDF5 data files.
 
@@ -1254,6 +1277,7 @@ def plot_hamiltonian_constraint_evolution(snapshot_file, evolution_file, grid, o
         evolution_file: Path to evolution HDF5 file
         grid: Grid object
         output_dir: Directory to save plot
+        suffix: Optional suffix to append to filename (e.g., "_bssn")
     """
     print("\nGenerating Hamiltonian constraint evolution plot...")
 
@@ -1367,8 +1391,8 @@ def plot_hamiltonian_constraint_evolution(snapshot_file, evolution_file, grid, o
     plt.suptitle('Hamiltonian Constraint Evolution', fontsize=15, fontweight='bold')
     plt.tight_layout()
 
-    output_path = os.path.join(output_dir, 'tov_hamiltonian_constraint.png')
+    filename = f'tov_hamiltonian_constraint{suffix}.png'
+    output_path = os.path.join(output_dir, filename)
     plt.savefig(output_path, dpi=150, bbox_inches='tight')
     print(f"Saved: {output_path}")
-    plt.show()
-    # plt.close(fig)
+    plt.close(fig)
