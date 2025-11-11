@@ -1,0 +1,43 @@
+================================================================================
+               CRITICAL BUG: CONNECTION TERM SIGNS IN ENGRENAGE
+================================================================================
+
+LOCATION: source/matter/hydro/grhd_equations.py:451-454
+
+CURRENT CODE (WRONG):
+─────────────────────
+conn_S = (
+    -np.einsum('xl,xli->xi', Gamma_trace, F_S_no_ghat)      # ❌ WRONG: negative
+    + np.einsum('xlji,xjl->xi', hat_chris, F_S_no_ghat)     # ❌ WRONG: positive
+)
+
+CORRECT CODE (from NRPy+):
+──────────────────────────
+conn_S = (
+    +np.einsum('xl,xli->xi', Gamma_trace, F_S_no_ghat)      # ✓ CORRECT: positive
+    - np.einsum('xlji,xjl->xi', hat_chris, F_S_no_ghat)     # ✓ CORRECT: negative
+)
+
+MATHEMATICAL FORM:
+──────────────────
+Conservation law:  ∂_t Ũ_i + ∂_j F̃^j_i = S_i
+RHS form:          ∂_t Ũ_i = -∂_j F̃^j_i + conn_S_i + src_S_i
+
+Connection terms:  conn_S_i = +Γ̂^j_{jl} F̃^l_i - Γ̂^l_{ji} F̃^j_l
+
+VERIFICATION:
+─────────────
+Test at TOV surface (r ≈ 9.55):
+  NRPy+:     conn_S_r = +2.876e-08  ✓
+  Engrenage: conn_S_r = -2.876e-08  ❌ (opposite sign)
+
+IMPACT:
+───────
+This bug causes spurious momentum sources that make radial velocity grow
+from v^r = 0.011 to v^r = 0.214 at the TOV stellar surface.
+
+FIX:
+────
+Change BOTH signs in lines 451-454 of grhd_equations.py
+
+================================================================================

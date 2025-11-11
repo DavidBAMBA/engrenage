@@ -420,8 +420,7 @@ def prim_to_cons(rho0, vr, pressure, gamma_rr, eos, e6phi=None, alpha=None):
     W = 1.0 / np.sqrt(1.0 - v2)
     
     # Thermodynamics
-    eps = eos.eps_from_rho_p(rho0, pressure)
-    h = eos.enthalpy(rho0, pressure, eps)
+    h = eos.enthalpy_from_rho_p(rho0, pressure)
     
     # Build 3D arrays (for interface with auxiliary function)
     is_scalar = (rho0.ndim == 0)

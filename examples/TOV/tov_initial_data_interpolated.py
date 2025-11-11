@@ -450,6 +450,7 @@ def create_initial_data_interpolated(tov_solution, grid, background, eos,
 
     # Convert primitives (rho0, vr=0, P) → densitized conservatives (D̃, S̃r, τ̃)
     # using the official prim_to_cons function from cons2prim.py
+    # NOTE: For initial data, use default alpha=1.0 (Valencia conventions for initial data)
     print("  Converting primitives to densitized conservatives using prim_to_cons()...")
     D_tilde, Sr_tilde, tau_tilde = prim_to_cons(rho_arr, vr_arr, P_arr, gamma_rr, eos, e6phi=e6phi)
 
@@ -464,6 +465,7 @@ def create_initial_data_interpolated(tov_solution, grid, background, eos,
     n_exterior = np.sum(exterior_mask)
     if n_exterior > 0:
         # Use prim_to_cons for atmosphere to ensure consistency (densitized)
+        # NOTE: Use default alpha=1.0 for initial data (Valencia conventions)
         D_atm_tilde, Sr_atm_tilde, tau_atm_tilde = prim_to_cons(
             atmosphere_rho, 0.0, p_atm, gamma_rr[exterior_mask], eos, e6phi=e6phi[exterior_mask]
         )

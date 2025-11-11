@@ -1,0 +1,124 @@
+================================================================================
+FASE 1 DIAGNÓSTICO: Inconsistencia en Flujos
+================================================================================
+
+Grid: N=256, r_max=20.0, dr=0.0792
+
+Solving TOV...
+  M_star = 1.400154
+  R_star = 9.5763
+
+Creating initial data...
+
+Creating TOV initial data with high-order interpolation + ADM→BSSN:
+  Coordinate system: Schwarzschild
+  Interpolation order: 11
+  Interpolating TOV solution to evolution grid (order 11)...
+    Stellar radius: R = 9.576350
+    Evolution grid: N = 256, r ∈ [-0.198, 20.000]
+  Converting ADM → BSSN (enforcing det(γ̄) = det(ĝ) constraint)...
+    det(γ̄) = det(ĝ) constraint violation: max = 3.686e-15
+    ADM → BSSN conversion complete
+  Setting hydro variables (primitives → conservatives)...
+  Converting primitives to conservatives using prim_to_cons()...
+  Set 132 exterior points (r > 9.576350) to atmosphere (via prim_to_cons)
+  Initial data created successfully!
+
+
+================================================================================
+FASE 1.1: VERIFICACIÓN DE SHIFT β^r
+================================================================================
+
+Shift β^r en t=0:
+  max(|β^r|) = 0.000000e+00 at i=0, r=-0.20
+  mean(|β^r|) = 0.000000e+00
+
+✓ Shift es esencialmente CERO (< 1e-14)
+  → La diferencia vtil vs v^r NO debería ser importante
+
+Perfil de β^r (primeros 20 puntos):
+   i        r          β^r            α
+----------------------------------------
+   3     0.04   +0.000e+00     0.669866
+   4     0.12   +0.000e+00     0.669900
+   5     0.20   +0.000e+00     0.669968
+   6     0.28   +0.000e+00     0.670070
+   7     0.36   +0.000e+00     0.670207
+   8     0.44   +0.000e+00     0.670377
+   9     0.51   +0.000e+00     0.670581
+  10     0.59   +0.000e+00     0.670819
+  11     0.67   +0.000e+00     0.671091
+  12     0.75   +0.000e+00     0.671397
+  13     0.83   +0.000e+00     0.671737
+  14     0.91   +0.000e+00     0.672111
+  15     0.99   +0.000e+00     0.672518
+  16     1.07   +0.000e+00     0.672959
+  17     1.15   +0.000e+00     0.673434
+  18     1.23   +0.000e+00     0.673942
+  19     1.31   +0.000e+00     0.674484
+  20     1.39   +0.000e+00     0.675059
+  21     1.47   +0.000e+00     0.675667
+  22     1.54   +0.000e+00     0.676308
+
+================================================================================
+FASE 1.2: COMPARACIÓN DE FORMULACIONES DE FLUJOS
+================================================================================
+
+1. Flujos del Riemann Solver (simplificados):
+   F^r_Sr = Sr × (v^r - β^r/α) + p
+   where vtil = v^r - β^r/α (velocidad de transporte Valencia)
+
+2. Flujos de Connection Terms (tensor completo):
+   F^r_r = α × e^{6φ} × T^r_r
+   T^r_r = ρ₀ h W² (v^r)² + P (γ^{rr} - β^r β^r / α²)
+
+3. Diferencia entre formulaciones:
+   ΔF = F_connection - F_riemann
+   max(|ΔF|) = 5.408543e-05 at i=2, r=-0.04
+
+En la superficie estelar (r=9.54):
+   F_riemann = +1.976136e-09
+   F_connection = +1.760113e-09
+   Diferencia = -2.160227e-10
+
+================================================================================
+COMPARACIÓN DETALLADA EN UBICACIONES CLAVE
+================================================================================
+
+Ubicación           r           Sr      F_riemann   F_connection             ΔF          β^r
+----------------------------------------------------------------------------------------------------
+Centro           0.04   +0.000e+00  +1.638298e-04  +1.097443e-04  -5.408543e-05   +0.000e+00
+Interior         2.42   +0.000e+00  +1.291844e-04  +8.956033e-05  -3.962410e-05   +0.000e+00
+Superficie       9.54   +0.000e+00  +1.976136e-09  +1.760113e-09  -2.160227e-10   +0.000e+00
+Atmósfera       10.34   +0.000e+00  +1.000006e-11  +9.000421e-12  -9.996403e-13   +0.000e+00
+
+================================================================================
+ANÁLISIS DE TÉRMINOS
+================================================================================
+
+Desglose de T^r_r:
+En la superficie (r=9.54):
+  T^r_r = (ρ₀ h W² v² term) + (P γ^{rr} term) + (P shift correction)
+        = +0.000000e+00 + +1.760139e-09 + -0.000000e+00
+        = +1.760139e-09
+
+  β^r correction to pressure: -0.000000e+00
+  Relative size: 0.000000e+00
+
+Diferencia en velocidades:
+  v^r = +0.000000e+00
+  vtil = v^r - β^r/α = +0.000000e+00
+  Diferencia: +0.000000e+00
+
+================================================================================
+VEREDICTO
+================================================================================
+
+✓ Las formulaciones son esencialmente EQUIVALENTES:
+  - Shift β^r ≈ 0 (max = 0.000e+00)
+  - Diferencia relativa < 1e-10
+
+→ Esta inconsistencia probablemente NO es la causa del problema
+→ Buscar causa en otro lugar (condiciones iniciales, ecuación de energía, etc.)
+
+Resumen guardado en: flux_inconsistency_diagnosis.txt

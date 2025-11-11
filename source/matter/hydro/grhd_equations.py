@@ -13,10 +13,83 @@ from typing import Tuple, Optional
 
 from source.bssn.tensoralgebra import SPACEDIM, get_bar_gamma_LL, get_hat_D_bar_gamma_LL
 from source.core.spacing import NUM_GHOSTS
+from source.matter.hydro import geometry
 from source.matter.hydro.geometry import ADMGeometry, ValenciaGeometry
 from source.matter.hydro.stress_energy import StressEnergyTensor
 from source.matter.hydro.cons2prim import prim_to_cons
 from source.matter.hydro.atmosphere import AtmosphereParams
+
+
+def compute_grhd_flux_vectors(
+    rho0: np.ndarray,
+    v_U: np.ndarray,
+    W: np.ndarray,
+    alpha: np.ndarray,
+    e6phi: np.ndarray,
+    T0i: np.ndarray,
+    Ti_j: np.ndarray
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """
+    Compute GRHD flux vectors for connection terms and Riemann solver.
+
+    This centralizes the flux calculation to ensure consistency between
+    connection terms and Riemann solver, following NRPy+ conventions.
+
+    Flux definitions (Valencia formulation with densitized variables):
+        fD^j = ρ* v^j                    (mass flux)
+        fτ^j = α² e^{6φ} T^{0j} - ρ* v^j    (energy flux)
+        F^j_i = α e^{6φ} T^j_i              (momentum flux)
+
+    where ρ* = e^{6φ} ρ₀ W is the conservative density.
+
+    These definitions are based on the stress-energy tensor T^{μν} and ensure
+    correct transformation properties under conformal rescaling (BSSN).
+
+    Parameters
+    ----------
+    rho0 : np.ndarray
+        Rest mass density (N,)
+    v_U : np.ndarray
+        Contravariant velocity (N, 3)
+    W : np.ndarray
+        Lorentz factor (N,)
+    alpha : np.ndarray
+        Lapse function (N,)
+    e6phi : np.ndarray
+        Densitization factor e^{6φ} (N,)
+    T0i : np.ndarray
+        Contravariant stress-energy T^{0i} (N, 3)
+    Ti_j : np.ndarray
+        Mixed stress-energy T^i_j (N, 3, 3)
+
+    Returns
+    -------
+    fD_U : np.ndarray
+        Mass flux vector (N, 3)
+    fTau_U : np.ndarray
+        Energy flux vector (N, 3)
+    F_S : np.ndarray
+        Momentum flux tensor (N, 3, 3)
+
+    References
+    ----------
+    - NRPy+: nrpy/equations/grhd/GRHD_equations.py (lines 282-329)
+    - IllinoisGRMHD: Original implementation of Valencia formulation
+    """
+    # Conservative density: ρ* = e^{6φ} ρ₀ W
+    # Note: u^0 = W/α, so α u^0 = W
+    rho_star = e6phi * rho0 * W
+
+    # Mass flux: fD^j = ρ* v^j
+    fD_U = rho_star[:, np.newaxis] * v_U
+
+    # Energy flux: fτ^j = α² e^{6φ} T^{0j} - ρ* v^j
+    fTau_U = (alpha**2 * e6phi)[:, np.newaxis] * T0i - rho_star[:, np.newaxis] * v_U
+
+    # Momentum flux: F^j_i = α e^{6φ} T^j_i
+    F_S = (alpha * e6phi)[:, np.newaxis, np.newaxis] * Ti_j
+
+    return fD_U, fTau_U, F_S
 
 
 class GRHDEquations:
@@ -341,7 +414,7 @@ class GRHDEquations:
 
         # Densitization: F̃ = α e^{6φ} F^phys
         dens_factor = alpha_f * e6phi_f
-        F_batch = dens_factor[:, None] * F_phys_batch
+        F_batch =  dens_factor[:, np.newaxis] * F_phys_batch
 
         # Enforce zero momentum flux at the r≈0 interface (spherical boundary)
         # This is the last guard against numerical drift creating spurious fluxes at origin
@@ -403,20 +476,11 @@ class GRHDEquations:
         alpha = geometry.alpha
         e6phi = geometry.e6phi
 
-        # Conservative density flux rho_star = e^{6φ} ρ₀ W
-        # Note: u^0 = W/α, so α*u^0 = W
-        rho_star = e6phi * rho0 * W
-
-        # Physical fluxes at cell centers (partial flux vectors)
-        fD_U = rho_star[:, np.newaxis] * v_U
-
-        # Energy (tau) partial flux vector using T^{0j} from stress_energy tensor
-        # fTau_U = α² e^{6φ} T^{0j} - rho_star v^j
-        fTau_U = (alpha ** 2 * e6phi)[:, np.newaxis] * T0i - rho_star[:, np.newaxis] * v_U
-
-        # Momentum partial flux tensor F̃^j_i = α e^{6φ} T^j_i
-        # Use precomputed mixed tensor T^i_j from stress_energy module
-        F_S = (alpha * e6phi)[:, np.newaxis, np.newaxis] * Ti_j
+        # Compute flux vectors using centralized function
+        # This ensures consistency with Riemann solver flux definitions
+        fD_U, fTau_U, f_S = compute_grhd_flux_vectors(
+            rho0, v_U, W, alpha, e6phi, T0i, Ti_j
+        )
 
         Gamma_trace = np.einsum('xkkj->xj', hat_chris)
 
@@ -424,8 +488,8 @@ class GRHDEquations:
         conn_D   = - np.einsum('xj,xj->x', Gamma_trace, fD_U)
         conn_tau = - np.einsum('xj,xj->x', Gamma_trace, fTau_U)
         conn_S   = (
-                   - np.einsum('xl,xli->xi', Gamma_trace, F_S)
-                   + np.einsum('xlji,xjl->xi', hat_chris, F_S)
+                   - np.einsum('xl,xli->xi', Gamma_trace, f_S)
+                   + np.einsum('xlji,xjl->xi', hat_chris, f_S)
         )
 
         if not return_debug:
@@ -434,7 +498,7 @@ class GRHDEquations:
         debug = {
             "rho_star_flux": fD_U.copy(),
             "tau_flux": fTau_U.copy(),
-            "momentum_flux": F_S.copy(),
+            "momentum_flux": f_S.copy(),
             "Gamma_trace": Gamma_trace.copy(),
         }
         return conn_D, conn_S, conn_tau, debug
@@ -736,14 +800,15 @@ def dedensitize_conservatives(
         Physical energy density (N,)
     """
     inv_e6phi = 1.0 / np.maximum(e6phi, 1e-30)
+    #alpha = geometry.alpha
 
     D = D_tilde * inv_e6phi
 
     # Handle both 1D and 3D momentum
     if S_tildeD.ndim == 1:
-        S_D = S_tildeD * inv_e6phi
+        S_D = S_tildeD * inv_e6phi# * 1.0/alpha
     else:
-        S_D = S_tildeD * inv_e6phi[:, np.newaxis]
+        S_D = S_tildeD * inv_e6phi[:, np.newaxis]# * 1.0/alpha[:, np.newaxis]
 
     tau = tau_tilde * inv_e6phi
 

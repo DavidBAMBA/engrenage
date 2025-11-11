@@ -1,0 +1,17 @@
+================================================================================
+TOV SURFACE MOMENTUM DIAGNOSTIC
+================================================================================
+================================================================================
+GENERATING TOV INITIAL DATA
+================================================================================
+Traceback (most recent call last):
+  File "/home/yo/repositories/engrenage/diagnose_surface_momentum.py", line 408, in <module>
+    main()
+    ~~~~^^
+  File "/home/yo/repositories/engrenage/diagnose_surface_momentum.py", line 376, in main
+    state_2d, tov_sol = generate_initial_data(grid, background, eos)
+                        ~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/yo/repositories/engrenage/diagnose_surface_momentum.py", line 92, in generate_initial_data
+    print(f"TOV Solution: M={tov_sol['M']:.6f}, R={tov_sol['R']:.3f}, C={tov_sol['C']:.4f}")
+                            ^^^^^^^^^^^^^^^^^^
+TypeError: unsupported format string passed to numpy.ndarray.__format__

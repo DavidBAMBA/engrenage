@@ -10,12 +10,14 @@ Key fixes & alignment:
 - Entropy-fix batch swap corrected.
 - estimate_dt now accepts beta_r (default 0) and uses it in g^{μν}.
 
-Fluxes are non-densitized Valencia {D, S_r, tau}.
+Fluxes are non-densitized Valencia {D, S_r, tau} using stress-energy tensor formulation.
 """
 
 import numpy as np
 from .atmosphere import AtmosphereParams
 from .geometry import ADMGeometry
+from .stress_energy import StressEnergyTensor
+from source.matter.hydro.grhd_equations import compute_grhd_flux_vectors
 
 
 class HLLRiemannSolver:
@@ -89,9 +91,9 @@ class HLLRiemannSolver:
         cmax = max(0.0, max(cpL, cpR))
         cmin = -min(0.0, min(cmL, cmR))
 
-        # Physical fluxes (non-densitized Valencia)
-        FL = self._physical_flux(np.array([DL, SrL, tauL]), (rho0L, vrL, pL), alpha, beta_r)
-        FR = self._physical_flux(np.array([DR, SrR, tauR]), (rho0R, vrR, pR), alpha, beta_r)
+        # Physical fluxes (non-densitized Valencia) using stress-energy tensor
+        FL = self._physical_flux((rho0L, vrL, pL), eos, gamma_rr, alpha, beta_r)
+        FR = self._physical_flux((rho0R, vrR, pR), eos, gamma_rr, alpha, beta_r)
 
         # HLL (cmin/cmax form; equivalent a lambda± con el mapeo anterior)
         Udiff = np.array([DR - DL, SrR - SrL, tauR - tauL])
@@ -150,16 +152,14 @@ class HLLRiemannSolver:
         cmax = np.maximum(0.0, np.maximum(cpL, cpR))
         cmin = -np.minimum(0.0, np.minimum(cmL, cmR))
 
-        # Flujos físicos (no densitizados)
+        # Physical fluxes (non-densitized) using stress-energy tensor
         FL = self._physical_flux_batch(
-            np.stack([DL, SrL, tauL], axis=1),
             np.stack([rho0L, vrL, pL], axis=1),
-            alpha_batch, beta_r_batch
+            eos, gamma_rr_batch, alpha_batch, beta_r_batch
         )
         FR = self._physical_flux_batch(
-            np.stack([DR, SrR, tauR], axis=1),
             np.stack([rho0R, vrR, pR], axis=1),
-            alpha_batch, beta_r_batch
+            eos, gamma_rr_batch, alpha_batch, beta_r_batch
         )
 
         # HLL (cmin/cmax) vectorizado
@@ -369,24 +369,176 @@ class HLLRiemannSolver:
         return cminus, cplus
 
     # ----------------------------------------------------------------------
-    # Flux helpers
+    # Flux helpers - using stress-energy tensor formulation for consistency
     # ----------------------------------------------------------------------
-    def _physical_flux(self, U, prim, alpha, beta_r):
-        D, Sr, tau = U
-        _, vr, p = prim
-        vtil = vr # - beta_r / alpha  # Valencia transport velocity
-        fD = D * vtil
-        fSr = Sr * vtil + p
-        ftau = (tau + p) * vtil
-        return np.array([fD, fSr, ftau], dtype=float)
+    def _physical_flux(self, prim, eos, gamma_rr, alpha=1.0, beta_r=0.0):
+        """
+        Compute physical fluxes F^r for Valencia formulation using stress-energy tensor.
 
-    def _physical_flux_batch(self, U, prim, alpha, beta_r):
-        D = U[:, 0]; Sr = U[:, 1]; tau = U[:, 2]
-        vr = prim[:, 1]; p = prim[:, 2]
-        vtil = vr #- beta_r / alpha
-        fD = D * vtil
-        fSr = Sr * vtil + p
-        ftau = (tau + p) * vtil
+        This uses the centralized compute_grhd_flux_vectors() function with alpha=1.0
+        and e6phi=1.0 to get physical (non-densitized) fluxes based on T^{μν}.
+
+        This ensures consistency with connection_terms flux definitions.
+
+        Parameters
+        ----------
+        prim : tuple
+            Primitive variables (rho0, vr, p)
+        eos : EOS
+            Equation of state for computing enthalpy
+        gamma_rr : float
+            Radial metric component γ_rr at face
+        alpha : float
+            Lapse (default 1.0 for physical fluxes)
+        beta_r : float
+            Shift (unused, for signature compatibility)
+
+        Returns
+        -------
+        np.ndarray
+            Physical flux [F_D, F_Sr, F_tau]
+        """
+        rho0, vr, p = prim
+
+        # Compute auxiliary quantities
+        N = 1
+        alpha_arr = np.ones(N)  # Use alpha=1.0 for physical fluxes (densitization applied later)
+        beta_U = np.zeros((N, 3))
+
+        # CRITICAL: Use actual metric, not Minkowski!
+        # In TOV spacetime, γ_rr ≠ 1
+        gamma_LL = np.zeros((N, 3, 3))
+        gamma_LL[0, 0, 0] = gamma_rr  # Physical γ_rr from face
+        gamma_LL[0, 1, 1] = 1.0  # Assuming spherical (not used in 1D)
+        gamma_LL[0, 2, 2] = 1.0
+
+        gamma_UU = np.zeros((N, 3, 3))
+        gamma_UU[0, 0, 0] = 1.0 / gamma_rr  # γ^rr = 1/γ_rr
+        gamma_UU[0, 1, 1] = 1.0
+        gamma_UU[0, 2, 2] = 1.0
+
+        # 3D velocity (radial only)
+        v_U = np.zeros((N, 3))
+        v_U[0, 0] = vr
+
+        # Lorentz factor - CRITICAL: Use metric!
+        # v² = γ_ij v^i v^j = γ_rr (v^r)² for general spacetime
+        v_squared = gamma_rr * vr * vr  # NOT just vr²!
+        W = 1.0 / np.sqrt(max(1.0 - v_squared, 1e-16))
+        W_arr = np.array([W])
+
+        # Specific enthalpy: h = 1 + eps + P/rho
+        eps = max(eos.eps_from_rho_p(rho0, p), 0.0)
+        h = 1.0 + eps + p / max(rho0, 1e-30)
+
+        rho0_arr = np.array([rho0])
+        p_arr = np.array([p])
+        h_arr = np.array([h])
+
+        # Compute stress-energy tensor
+        geom = ADMGeometry(alpha_arr, beta_U, gamma_LL, gamma_UU)
+        stress_energy = StressEnergyTensor(geom, rho0_arr, v_U, p_arr, W_arr, h_arr)
+
+        # Get T^{0i} and T^i_j needed for flux computation
+        _, T0i, _ = stress_energy.compute_T4UU()
+        _, _, Ti_j = stress_energy.compute_T4UD()
+
+        # Compute flux vectors using centralized function
+        # Use alpha=1.0, e6phi=1.0 for physical (non-densitized) fluxes
+        e6phi_phys = np.ones(N)
+
+        fD_U, fTau_U, F_S = compute_grhd_flux_vectors(
+            rho0_arr, v_U, W_arr, alpha_arr, e6phi_phys, T0i, Ti_j
+        )
+
+        # Extract radial components
+        fD = fD_U[0, 0]      # Mass flux
+        fSr = F_S[0, 0, 0]   # Momentum flux F^r_r
+        ftau = fTau_U[0, 0]  # Energy flux
+
+        return np.array([fD, fSr, ftau], dtype=float)
+        
+    
+    def _physical_flux_batch(self, prim, eos, gamma_rr, alpha, beta_r):
+        """
+        Compute physical fluxes F^r for Valencia formulation using stress-energy tensor (vectorized).
+
+        This uses the centralized compute_grhd_flux_vectors() function to ensure
+        consistency with connection_terms flux definitions.
+
+        Parameters
+        ----------
+        prim : np.ndarray
+            Primitive variables (M, 3) with columns [rho0, vr, p]
+        eos : EOS
+            Equation of state for computing enthalpy
+        gamma_rr : np.ndarray
+            Radial metric component γ_rr at each face (M,)
+        alpha : np.ndarray
+            Lapse at each face (M,)
+        beta_r : np.ndarray
+            Shift at each face (M,)
+
+        Returns
+        -------
+        np.ndarray
+            Physical fluxes (M, 3) with columns [F_D, F_Sr, F_tau]
+        """
+        M = len(prim)
+        rho0 = prim[:, 0]
+        vr = prim[:, 1]
+        p = prim[:, 2]
+
+        # Create 3D geometry with actual metric (not Minkowski!)
+        alpha_arr = np.ones(M)  # Use alpha=1.0 for physical fluxes (densitization applied later)
+        beta_U = np.zeros((M, 3))
+
+        # CRITICAL: Use actual metric from faces
+        gamma_LL = np.zeros((M, 3, 3))
+        gamma_LL[:, 0, 0] = gamma_rr  # Physical γ_rr at each face
+        gamma_LL[:, 1, 1] = 1.0  # Spherical (not used in 1D)
+        gamma_LL[:, 2, 2] = 1.0
+
+        gamma_UU = np.zeros((M, 3, 3))
+        gamma_UU[:, 0, 0] = 1.0 / gamma_rr  # γ^rr = 1/γ_rr
+        gamma_UU[:, 1, 1] = 1.0
+        gamma_UU[:, 2, 2] = 1.0
+
+        # 3D velocity (radial only)
+        v_U = np.zeros((M, 3))
+        v_U[:, 0] = vr
+
+        # Lorentz factor - CRITICAL: Use metric!
+        # v² = γ_ij v^i v^j = γ_rr (v^r)² for general spacetime
+        v_squared = gamma_rr * vr * vr  # NOT just vr²!
+        W = 1.0 / np.sqrt(np.maximum(1.0 - v_squared, 1e-16))
+
+        # Specific enthalpy: h = 1 + eps + P/rho
+        eps = np.maximum(eos.eps_from_rho_p(rho0, p), 0.0)
+        h = 1.0 + eps + p / np.maximum(rho0, 1e-30)
+
+        # Compute stress-energy tensor
+        geom = ADMGeometry(alpha_arr, beta_U, gamma_LL, gamma_UU)
+        stress_energy = StressEnergyTensor(geom, rho0, v_U, p, W, h)
+
+        # Get T^{0i} and T^i_j needed for flux computation
+        _, T0i, _ = stress_energy.compute_T4UU()
+        _, _, Ti_j = stress_energy.compute_T4UD()
+
+        # Compute flux vectors using centralized function
+        # Use e6phi=1.0 for physical (non-densitized) fluxes
+        e6phi_phys = np.ones(M)
+
+        fD_U, fTau_U, F_S = compute_grhd_flux_vectors(
+            rho0, v_U, W, alpha_arr, e6phi_phys, T0i, Ti_j
+        )
+
+        # Extract radial components
+        fD = fD_U[:, 0]       # Mass flux
+        fSr = F_S[:, 0, 0]    # Momentum flux F^r_r
+        ftau = fTau_U[:, 0]   # Energy flux
+
         return np.stack([fD, fSr, ftau], axis=1)
+
 
 
