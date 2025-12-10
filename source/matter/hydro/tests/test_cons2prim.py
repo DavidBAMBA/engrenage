@@ -149,15 +149,19 @@ def benchmark_performance():
 
         # Convert to conservative
         D, Sr, tau = prim_to_cons(rho0, vr, p, gamma_rr, eos)
-        U = {'D': D, 'Sr': Sr, 'tau': tau}
-        metric = {'gamma_rr': gamma_rr}
 
-        # Time conversion
+        # Use tuples (efficient) instead of dicts
+        U = (D, Sr, tau)
+        alpha = np.ones_like(D)
+        beta_r = np.zeros_like(D)
+        metric = (alpha, beta_r, gamma_rr)
+
+        # Time conversion - unpack tuple result
         start_time = time.time()
-        result = solver.convert(U, metric=metric)
+        rho0_result, vr_result, p_result, eps_result, W_result, h_result, success = solver.convert(U, metric=metric)
         elapsed_time = time.time() - start_time
 
-        success_rate = np.mean(result['success'])
+        success_rate = np.mean(success)
         time_per_point = elapsed_time / N * 1e6  # μs
 
         print(f"  Time: {elapsed_time:.6f} s")
@@ -167,11 +171,10 @@ def benchmark_performance():
         tracker.add_measurement(N, elapsed_time, success_rate)
 
         # Check results quality
-        success_mask = result['success']
-        if np.any(success_mask):
-            print(f"  rho0 range: [{np.min(result['rho0'][success_mask]):.3e}, {np.max(result['rho0'][success_mask]):.3e}]")
-            print(f"  vr range: [{np.min(result['vr'][success_mask]):.3e}, {np.max(result['vr'][success_mask]):.3e}]")
-            print(f"  p range: [{np.min(result['p'][success_mask]):.3e}, {np.max(result['p'][success_mask]):.3e}]")
+        if np.any(success):
+            print(f"  rho0 range: [{np.min(rho0_result[success]):.3e}, {np.max(rho0_result[success]):.3e}]")
+            print(f"  vr range: [{np.min(vr_result[success]):.3e}, {np.max(vr_result[success]):.3e}]")
+            print(f"  p range: [{np.min(p_result[success]):.3e}, {np.max(p_result[success]):.3e}]")
 
     tracker.plot_performance()
     return tracker
@@ -208,24 +211,26 @@ def test_correctness():
         # Convert to conservative
         D, Sr, tau = prim_to_cons(rho0, vr, p, gamma_rr, eos)
 
-        # Convert back
-        U = {'D': D, 'Sr': Sr, 'tau': tau}
-        metric = {'gamma_rr': gamma_rr}
-        result = solver.convert(U, metric=metric)
+        # Convert back using tuples - unpack result
+        U = (D, Sr, tau)
+        alpha = np.ones_like(D)
+        beta_r = np.zeros_like(D)
+        metric = (alpha, beta_r, gamma_rr)
+        rho0_rec, vr_rec, p_rec, eps_rec, W_rec, h_rec, success = solver.convert(U, metric=metric)
 
-        print(f"  Success: {result['success']}")
+        print(f"  Success: {success}")
         print(f"  Original rho0: {rho0}")
-        print(f"  Recovered rho0: {result['rho0']}")
+        print(f"  Recovered rho0: {rho0_rec}")
         print(f"  Original vr: {vr}")
-        print(f"  Recovered vr: {result['vr']}")
+        print(f"  Recovered vr: {vr_rec}")
         print(f"  Original p: {p}")
-        print(f"  Recovered p: {result['p']}")
+        print(f"  Recovered p: {p_rec}")
 
         # Check energy conservation
         for j in range(len(D)):
-            if result['success'][j]:
+            if success[j]:
                 lhs = tau[j] + D[j]
-                rhs = result['rho0'][j] * result['h'][j] * result['W'][j]**2 - result['p'][j]
+                rhs = rho0_rec[j] * h_rec[j] * W_rec[j]**2 - p_rec[j]
                 error = abs(lhs - rhs) / max(abs(lhs), 1e-10)
                 total_errors.append(error)
                 print(f"  Point {j}: Energy conservation error = {error:.2e}")
@@ -261,18 +266,21 @@ def analyze_failures():
         D, Sr, tau = prim_to_cons(np.array([rho0]), np.array([vr]),
                                  np.array([p]), np.array([gamma_rr]), eos)
 
-        # Try conversion
-        U = {'D': D, 'Sr': Sr, 'tau': tau}
-        metric = {'gamma_rr': np.array([gamma_rr])}
+        # Try conversion using tuples
+        U = (D, Sr, tau)
+        alpha = np.ones_like(D)
+        beta_r = np.zeros_like(D)
+        metric = (alpha, beta_r, np.array([gamma_rr]))
 
         try:
-            result = solver.convert(U, metric=metric)
+            # Unpack tuple result
+            rho0_result, vr_result, p_result, eps_result, W_result, h_result, success = solver.convert(U, metric=metric)
 
-            if result['success'][0]:
+            if success[0]:
                 successes.append((rho0, vr, p, description))
                 print(f"✓ SUCCESS: {description}")
                 print(f"    Input: rho0={rho0:.3e}, vr={vr:.3f}, p={p:.3e}")
-                print(f"    Output: rho0={result['rho0'][0]:.3e}, vr={result['vr'][0]:.3f}, p={result['p'][0]:.3e}")
+                print(f"    Output: rho0={rho0_result[0]:.3e}, vr={vr_result[0]:.3f}, p={p_result[0]:.3e}")
             else:
                 failures.append((rho0, vr, p, description))
                 print(f"✗ FAILURE: {description}")
@@ -313,11 +321,16 @@ def compare_vectorized_vs_legacy():
     # Test vectorized approach
     print("Testing vectorized solver...")
     solver = Cons2PrimSolver(eos)
-    U = {'D': D, 'Sr': Sr, 'tau': tau}
-    metric = {'gamma_rr': gamma_rr}
+
+    # Use tuples for efficiency
+    U = (D, Sr, tau)
+    alpha = np.ones(N)
+    beta_r = np.zeros(N)
+    metric = (alpha, beta_r, gamma_rr)
 
     start_time = time.time()
-    result_vec = solver.convert(U, metric=metric)
+    # Unpack tuple result
+    rho0_vec, vr_vec, p_vec, eps_vec, W_vec, h_vec, success_vec = solver.convert(U, metric=metric)
     time_vec = time.time() - start_time
 
     # Test legacy approach (point by point)
@@ -331,14 +344,18 @@ def compare_vectorized_vs_legacy():
 
     for i in range(N):
         try:
-            result_single = cons_to_prim(
-                {'D': D[i:i+1], 'Sr': Sr[i:i+1], 'tau': tau[i:i+1]},
-                eos, metric={'gamma_rr': gamma_rr[i:i+1]}
+            # Use tuple format
+            U_single = (D[i:i+1], Sr[i:i+1], tau[i:i+1])
+            metric_single = (np.ones(1), np.zeros(1), gamma_rr[i:i+1])
+            # cons_to_prim returns: (rho0, vr, p, eps, W, h, success)
+            rho0_single, vr_single, p_single, eps_single, W_single, h_single, success_single = cons_to_prim(
+                U_single, eos, metric=metric_single
             )
-            if result_single['success'][0]:
-                rho0_legacy[i] = result_single['rho0'][0]
-                vr_legacy[i] = result_single['vr'][0]
-                p_legacy[i] = result_single['p'][0]
+
+            if success_single[0]:
+                rho0_legacy[i] = rho0_single[0]
+                vr_legacy[i] = vr_single[0]
+                p_legacy[i] = p_single[0]
                 success_legacy[i] = True
         except:
             pass
@@ -346,7 +363,7 @@ def compare_vectorized_vs_legacy():
     time_legacy = time.time() - start_time
 
     # Compare results
-    success_rate_vec = np.mean(result_vec['success'])
+    success_rate_vec = np.mean(success_vec)
     success_rate_legacy = np.mean(success_legacy)
     speedup = time_legacy / time_vec
 
@@ -358,11 +375,11 @@ def compare_vectorized_vs_legacy():
     print(f"  Legacy success rate: {success_rate_legacy:.3f}")
 
     # Check agreement where both succeeded
-    both_success = result_vec['success'] & success_legacy
+    both_success = success_vec & success_legacy
     if np.any(both_success):
-        rho0_diff = np.max(np.abs(result_vec['rho0'][both_success] - rho0_legacy[both_success]))
-        vr_diff = np.max(np.abs(result_vec['vr'][both_success] - vr_legacy[both_success]))
-        p_diff = np.max(np.abs(result_vec['p'][both_success] - p_legacy[both_success]))
+        rho0_diff = np.max(np.abs(rho0_vec[both_success] - rho0_legacy[both_success]))
+        vr_diff = np.max(np.abs(vr_vec[both_success] - vr_legacy[both_success]))
+        p_diff = np.max(np.abs(p_vec[both_success] - p_legacy[both_success]))
 
         print(f"  Max rho0 difference: {rho0_diff:.2e}")
         print(f"  Max vr difference: {vr_diff:.2e}")
@@ -402,11 +419,15 @@ def analyze_solver_statistics():
         gamma_rr = np.ones(N)
         D, Sr, tau = prim_to_cons(rho0, vr, p, gamma_rr, eos)
 
-        U = {'D': D, 'Sr': Sr, 'tau': tau}
-        metric = {'gamma_rr': gamma_rr}
+        # Use tuples for efficiency
+        U = (D, Sr, tau)
+        alpha = np.ones(N)
+        beta_r = np.zeros(N)
+        metric = (alpha, beta_r, gamma_rr)
 
         start_time = time.time()
-        result = solver.convert(U, metric=metric)
+        # Unpack tuple result
+        rho0_result, vr_result, p_result, eps_result, W_result, h_result, success = solver.convert(U, metric=metric)
         elapsed = time.time() - start_time
 
         stats = solver.get_statistics()

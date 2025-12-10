@@ -2,7 +2,7 @@
 Centralized atmosphere and floor management for relativistic hydrodynamics.
 
 This module provides a unified interface for atmospheric parameters and floor
-application strategies, following the IllinoisGRMHD/NRPy+ approach.
+application strategies, following the IllinoisGRMHD/ approach.
 
 References:
     - IllinoisGRMHD: apply_tau_floor__enforce_limits_on_primitives_and_recompute_conservs.C
@@ -49,16 +49,16 @@ class AtmosphereParams:
     """
 
     # Primary floors
-    rho_floor: float = 1e-13
-    p_floor: float = 1e-15
+    rho_floor: float = 1e-10
+    p_floor: float = 100*(rho_floor)**2
 
     # Velocity and Lorentz factor limits
     v_max: float = 0.999999
-    W_max: float = 1.0e3
+    W_max: float = 1.0e2
 
     # Conservative variable floor parameters
     tau_atm_factor: float = 1.0  # tau_atm = tau_atm_factor * p_floor
-    conservative_floor_safety: float = 0.999999  # Safety factor for inequalities
+    conservative_floor_safety: float = 0.99  # Safety factor for inequalities
 
     def __post_init__(self):
         """Validate parameters."""
@@ -77,7 +77,12 @@ class AtmosphereParams:
         return self.tau_atm_factor * self.p_floor
 
     def to_cons2prim_params(self):
-        """Export parameters in format expected by Cons2PrimSolver."""
+        """
+        Convert atmosphere parameters to cons2prim solver format.
+
+        Returns:
+            dict: Parameters for Cons2PrimSolver
+        """
         return {
             "rho_floor": self.rho_floor,
             "p_floor": self.p_floor,
@@ -156,14 +161,19 @@ class FloorApplicator:
         - tau >= tau_atm
         - S^2 <= tau * (tau + 2*D)
 
+        IMPORTANT: This method expects PHYSICAL (non-densitized) conservative variables.
+        The floor thresholds (tau_atm, etc.) are calibrated for physical values.
+        If your state vector stores densitized variables D̃ = e^{6φ}D, you must
+        de-densitify them before calling this method.
+
         Parameters
         ----------
         D : array
-            Conserved density
+            Conserved density (PHYSICAL, non-densitized: D = ρ₀W)
         Sr : array
-            Conserved radial momentum
+            Conserved radial momentum (PHYSICAL, non-densitized: Sʳ = ρ₀hW²vʳγᵣᵣ)
         tau : array
-            Conserved energy
+            Conserved energy (PHYSICAL, non-densitized: τ = ρ₀hW² - p - D)
         gamma_rr : array
             Radial metric component
         metric_psi6 : array, optional
@@ -172,7 +182,7 @@ class FloorApplicator:
         Returns
         -------
         D_floor, Sr_floor, tau_floor : arrays
-            Floored conservative variables
+            Floored conservative variables (physical, non-densitized)
         floor_applied : bool array
             Mask indicating where floors were applied
         """

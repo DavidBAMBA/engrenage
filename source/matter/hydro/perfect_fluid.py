@@ -69,7 +69,7 @@ class PerfectFluid:
             self.eos,
             atmosphere=self.atmosphere,
             tol=1e-10,
-            max_iter=200
+            max_iter=100
         )
 
         # Numerical methods for Valencia evolution
@@ -110,8 +110,7 @@ class PerfectFluid:
         emtensor = EMTensor(N)
 
         # Primitivas
-        prim = self._get_primitives(bssn_vars, r)
-        rho0, vr, p, W, h = prim['rho0'], prim['vr'], prim['p'], prim['W'], prim['h']
+        rho0, vr, p, eps, W, h, success = self._get_primitives(bssn_vars, r)
 
         # Geometría coherente con BSSN
         from source.bssn.tensoralgebra import get_bar_gamma_LL
@@ -149,13 +148,13 @@ class PerfectFluid:
         self.background = background
 
         # Convert to primitive variables
-        primitives = self._get_primitives(bssn_vars, r)
+        rho0, vr, p, eps, W, h, success = self._get_primitives(bssn_vars, r)
 
         # Valencia evolution equations
         dDdt, dSrdt, dtaudt = self.valencia.compute_rhs(
             self.D, self.Sr, self.tau,
-            primitives['rho0'], primitives['vr'], primitives['p'],
-            primitives['W'], primitives['h'],
+            rho0, vr, p,
+            W, h,
             r, bssn_vars, bssn_d1, background,
             self.spacetime_mode, self.eos, self.grid,
             self.reconstructor, self.riemann_solver
@@ -164,7 +163,16 @@ class PerfectFluid:
         return np.array([dDdt, dSrdt, dtaudt])
 
     def _get_primitives(self, bssn_vars, r, grid=None):
-        """Convert conservative to primitive variables using cons2prim module."""
+        """Convert conservative to primitive variables using cons2prim module.
+
+        IMPORTANT: State vector stores DENSITIZED conservatives (D̃, S̃ʳ, τ̃) where
+        D̃ = e^{6φ}D. This method de-densitizes them before calling cons2prim, which
+        expects PHYSICAL conservatives.
+
+        Returns:
+            tuple: (rho0, vr, p, eps, W, h, success) - Primitive hydrodynamic variables
+                   success is a boolean array indicating which points converged
+        """
 
         # Build metric for cons2prim
         # Use geometry from valencia (eliminate duplication)
@@ -175,28 +183,34 @@ class PerfectFluid:
         beta_r = self.valencia.beta_U[:, 0]
         gamma_rr = self.valencia.gamma_LL[:, 0, 0]
 
-        metric = {
-            "alpha": alpha,
-            "beta_r": beta_r,
-            "gamma_rr": gamma_rr,
-        }
+        # Extract densitization factor: √γ = e^{6φ}
+        # State vector contains DENSITIZED conservatives: Ũ = e^{6φ} U
+        # We must de-densitize them to PHYSICAL conservatives for cons2prim
+        phi = np.asarray(bssn_vars.phi, dtype=float)
+        e6phi = np.exp(6.0 * phi)
+
+        # De-densitify conservative variables: U = Ũ / e^{6φ}
+        D_phys = self.D / e6phi
+        Sr_phys = self.Sr / e6phi
+        tau_phys = self.tau / e6phi
 
         # Use pressure cache if available
         p_guess = self.pressure_cache
 
-        # Call cons2prim solver (now with intelligent floor application)
-        U = {"D": self.D, "Sr": self.Sr, "tau": self.tau}
-        primitives = self.cons2prim_solver.convert(
-            U=U,
-            metric=metric,
+        # Call cons2prim solver with PHYSICAL (non-densitized) conservatives
+        # Solver expects: D = ρ₀W, Sʳ = ρ₀hW²vʳγᵣᵣ, τ = ρ₀hW² - p - D
+        # Returns: (rho0, vr, p, eps, W, h, success)
+        rho0, vr, p, eps, W, h, success = self.cons2prim_solver.convert(
+            U=(D_phys, Sr_phys, tau_phys),
+            metric=(alpha, beta_r, gamma_rr),
             p_guess=p_guess,
-            apply_conservative_floors=True  # Apply tau and S_i floors
+            apply_conservative_floors=True  # Apply tau and S_i floors to physical values
         )
 
         # Update pressure cache for next timestep
-        self.pressure_cache = primitives['p'].copy()
+        self.pressure_cache = p.copy()
 
         # Note: Failed points are already handled by cons2prim_solver with atmosphere fallback
         # No need for additional manual handling here
 
-        return primitives
+        return rho0, vr, p, eps, W, h, success

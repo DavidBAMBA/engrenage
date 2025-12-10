@@ -76,7 +76,8 @@ def load_primitives(state_path: Path, grid, hydro):
     bssn_vars = BSSNVars(grid.N)
     bssn_vars.set_bssn_vars(state[:NUM_BSSN_VARS, :])
     hydro.set_matter_vars(state, bssn_vars, grid)
-    prims = hydro._get_primitives(bssn_vars, grid.r)
+    rho0, vr, p, eps, W, h, success = hydro._get_primitives(bssn_vars, grid.r)
+    prims = {'rho0': rho0, 'vr': vr, 'p': p, 'eps': eps, 'W': W, 'h': h, 'success': success}
     return prims
 
 

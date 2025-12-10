@@ -51,7 +51,7 @@ class SimpleGrid:
         self.dr = float(dr)
 
 
-def build_grid(n_interior=256, r_min=1e-3, r_max=1.0, ng=NUM_GHOSTS):
+def build_grid(n_interior=512, r_min=1e-3, r_max=1.0, ng=NUM_GHOSTS):
     """
     Build grid using engrenage infrastructure.
     Returns (r_array, simple_grid_obj, n_interior) to match original interface.
@@ -112,13 +112,17 @@ def to_conserved(rho0, v, p, eos):
 
 def to_primitives(D, Sr, tau, eos, p_guess=None):
     """Convert conservatives to primitives using cons_to_prim."""
-    res = cons_to_prim(
-        {'D': D, 'Sr': Sr, 'tau': tau},
+    # cons_to_prim expects:
+    #   U: tuple (D, Sr, tau)
+    #   metric: tuple (alpha, beta_r, gamma_rr)
+    # Returns: (rho0, vr, p, eps, W, h, success)
+    rho0, vr, p, eps, W, h, success = cons_to_prim(
+        (D, Sr, tau),
         eos,
-        metric={'gamma_rr': np.ones_like(D), 'alpha': np.ones_like(D), 'beta_r': np.zeros_like(D)},
+        metric=(np.ones_like(D), np.zeros_like(D), np.ones_like(D)),  # (alpha, beta_r, gamma_rr)
         p_guess=p_guess,
     )
-    return res['rho0'], res['vr'], res['p']
+    return rho0, vr, p
 
 
 def max_signal_speed(rho0, v, p, eos, cfl_guard=1e-6):
@@ -279,7 +283,7 @@ def test_uniform_state():
     print("TEST 1: Estado uniforme (Minkowski, engrenage infrastructure)")
     print("="*60)
 
-    r, grid, Nin = build_grid(n_interior=100, r_min=1e-3, r_max=1.0)
+    r, grid, Nin = build_grid(n_interior=300, r_min=1e-3, r_max=1.0)
     N = len(r)
     eos = IdealGasEOS(gamma=1.4)
     recon = create_reconstruction("minmod")
@@ -338,15 +342,16 @@ def test_riemann_sod():
     print("="*60)
 
     # Configuración base
-    r, grid, Nin = build_grid(n_interior=500, r_min=1e-3, r_max=1.0)
+    r, grid, Nin = build_grid(n_interior=1000, r_min=1e-3, r_max=1.0)
     N = len(r)
-    eos = IdealGasEOS(gamma=5.0/3.0)
+    gamma =1.4
+    eos = IdealGasEOS(gamma=gamma)
     rsolve = HLLRiemannSolver()
 
     # Discontinuidad en el punto medio del dominio interior
     r_mid = 0.5*(r[NUM_GHOSTS] + r[-NUM_GHOSTS-1])
     rho0_base = np.where(r < r_mid, 10.0, 1.0)
-    p_base = np.where(r < r_mid, 40000.0/3.0, 1.0e-6)
+    p_base = np.where(r < r_mid, 40.0/3.0, 1.0e-6)
     v_base = np.zeros(N)
 
     # Lista de métodos de reconstrucción a probar
@@ -368,7 +373,7 @@ def test_riemann_sod():
 
             r_mid_hires = 0.5*(r_hires[NUM_GHOSTS] + r_hires[-NUM_GHOSTS-1])
             rho0 = np.where(r_hires < r_mid_hires, 10.0, 1.0)
-            p = np.where(r_hires < r_mid_hires, 40000.0/3.0, 1.0e-6)
+            p = np.where(r_hires < r_mid_hires, 40.0/3.0, 1.0e-6)
             v = np.zeros(N_hires)
 
             rho0, v, p = fill_ghosts_primitives(rho0, v, p)
@@ -425,7 +430,7 @@ def test_riemann_sod():
 
     # PLOTEO (same as original)
     rho0_init = np.where(r < r_mid, 10.0, 1.0)
-    p_init = np.where(r < r_mid, 40000.0/3.0, 1.0e-6)
+    p_init = np.where(r < r_mid, 40.0/3.0, 1.0e-6)
     v_init = np.zeros(N)
     rho0_init, v_init, p_init = fill_ghosts_primitives(rho0_init, v_init, p_init)
 
@@ -445,18 +450,16 @@ def test_riemann_sod():
         ax1.plot(results[method]['r'], results[method]['rho'],
                 color=colors[i], label=labels[i], linewidth=2, linestyle=linestyles[i])
     ax1.set_xlabel('r')
-    ax1.set_ylabel('Densidad ρ₀')
+    ax1.set_ylabel(' ρ₀')
     ax1.set_xlim(0, 1)
-    ax1.grid(True, alpha=0.3)
     ax1.legend()
-    ax1.set_title('Densidad - Dominio Completo')
 
     ax1_zoom.plot(rin_ref, rho0_init_in, 'k:', label='ρ inicial', alpha=0.7, linewidth=2)
     for i, method in enumerate(methods):
         ax1_zoom.plot(results[method]['r'], results[method]['rho'],
                      color=colors[i], label=labels[i], linewidth=2, linestyle=linestyles[i])
     ax1_zoom.set_xlabel('r')
-    ax1_zoom.set_ylabel('Densidad ρ₀')
+    ax1_zoom.set_ylabel(' ρ₀')
     ax1_zoom.set_xlim(0.6, 0.7)
     # Auto-compute ylim from data in zoom region
     rho_zoom_data = []
@@ -471,9 +474,7 @@ def test_riemann_sod():
         rho_min_plot = rho_min - 0.1 * rho_range
         rho_max_plot = rho_max + 0.1 * rho_range
         ax1_zoom.set_ylim(rho_min_plot, rho_max_plot)
-    ax1_zoom.grid(True, alpha=0.3)
     ax1_zoom.legend()
-    ax1_zoom.set_title('Densidad - Zoom Shock')
 
     fig1.suptitle(f"Sod: Densidad (t ≈ {avg_time:.3f})")
     plt.tight_layout()
@@ -487,19 +488,17 @@ def test_riemann_sod():
         ax2.plot(results[method]['r'], results[method]['p'],
                 color=colors[i], label=labels[i], linewidth=2, linestyle=linestyles[i])
     ax2.set_xlabel('r')
-    ax2.set_ylabel('Presión p')
+    ax2.set_ylabel(' p')
     ax2.set_xlim(0, 1)
     #ax2.set_yscale('log')
-    ax2.grid(True, alpha=0.3)
     ax2.legend()
-    ax2.set_title('Presión - Dominio Completo')
 
     ax2_zoom.plot(rin_ref, p_init_in, 'k:', label='p inicial', alpha=0.7, linewidth=2)
     for i, method in enumerate(methods):
         ax2_zoom.plot(results[method]['r'], results[method]['p'],
                      color=colors[i], label=labels[i], linewidth=2, linestyle=linestyles[i])
     ax2_zoom.set_xlabel('r')
-    ax2_zoom.set_ylabel('Presión p')
+    ax2_zoom.set_ylabel(' p')
     ax2_zoom.set_xlim(0.6, 0.7)
     # Auto-compute ylim from data in zoom region
     p_zoom_data = []
@@ -515,11 +514,8 @@ def test_riemann_sod():
         p_max_plot = p_max * (10 ** (0.2 * p_range))
         ax2_zoom.set_ylim(p_min_plot, p_max_plot)
     ax2_zoom.set_yscale('log')
-    ax2_zoom.grid(True, alpha=0.3)
     ax2_zoom.legend()
-    ax2_zoom.set_title('Presión - Zoom Shock')
 
-    fig2.suptitle(f"Sod: Presión (t ≈ {avg_time:.3f})")
     plt.tight_layout()
     plt.savefig("test2sod_pressure_comparison.png", dpi=150, bbox_inches="tight")
 
@@ -531,18 +527,16 @@ def test_riemann_sod():
         ax3.plot(results[method]['r'], results[method]['v'],
                 color=colors[i], label=labels[i], linewidth=2, linestyle=linestyles[i])
     ax3.set_xlabel('r')
-    ax3.set_ylabel('Velocidad v^r')
+    ax3.set_ylabel(' v^r')
     ax3.set_xlim(0, 1)
-    ax3.grid(True, alpha=0.3)
     ax3.legend()
-    ax3.set_title('Velocidad - Dominio Completo')
 
     ax3_zoom.plot(rin_ref, v_init_in, 'k:', label='v inicial', alpha=0.7, linewidth=2)
     for i, method in enumerate(methods):
         ax3_zoom.plot(results[method]['r'], results[method]['v'],
                      color=colors[i], label=labels[i], linewidth=2, linestyle=linestyles[i])
     ax3_zoom.set_xlabel('r')
-    ax3_zoom.set_ylabel('Velocidad v^r')
+    ax3_zoom.set_ylabel(' v^r')
     ax3_zoom.set_xlim(0.5, 0.7)
     # Auto-compute ylim from data in zoom region
     v_zoom_data = []
@@ -557,9 +551,7 @@ def test_riemann_sod():
         v_min_plot = v_min - 0.1 * v_range
         v_max_plot = v_max + 0.1 * v_range
         ax3_zoom.set_ylim(v_min_plot, v_max_plot)
-    ax3_zoom.grid(True, alpha=0.3)
     ax3_zoom.legend()
-    ax3_zoom.set_title('Velocidad - Zoom Shock')
 
     fig3.suptitle(f"Sod: Velocidad (t ≈ {avg_time:.3f})")
     plt.tight_layout()
@@ -595,7 +587,7 @@ def test_blast_wave_compare(case='weak'):
     print("="*60)
 
     # Configuración base
-    r, grid, Nin = build_grid(n_interior=100, r_min=1e-3, r_max=1.0)
+    r, grid, Nin = build_grid(n_interior=1000, r_min=1e-3, r_max=1.0)
     N = len(r)
     eos = IdealGasEOS(gamma=1.4)
     rsolve = HLLRiemannSolver()
@@ -617,10 +609,10 @@ def test_blast_wave_compare(case='weak'):
     v_base = np.zeros(N, dtype=float)
 
     # Métodos a comparar
-    methods = ["minmod", "mp5"]
-    colors = ["tab:red", "tab:blue"]
-    labels = ["MINMOD", "MP5"]
-    linestyles = ["-", "-"]
+    methods = ["mp5"]
+    colors = ["red"]
+    labels = ["MP5"]
+    linestyles = ["-"]
 
     # Resultados
     results = {}
@@ -664,70 +656,106 @@ def test_blast_wave_compare(case='weak'):
             t += dt
             steps += 1
 
+        # Compute additional quantities
+        rho_int = rho0[ng:-ng]
+        p_int = p[ng:-ng]
+        v_int = v[ng:-ng]
+
+        # Lorentz factor: W = 1/sqrt(1 - v²)
+        v_squared = v_int ** 2
+        W_int = 1.0 / np.sqrt(np.maximum(1.0 - v_squared, 1e-16))
+
+        # Specific internal energy: epsilon
+        eps_int = eos.eps_from_rho_p(rho_int, p_int)
+
+        # Speed of sound (ideal gas): c_s² = Γ P / (ρ h)
+        h_int = 1.0 + eps_int + p_int / np.maximum(rho_int, 1e-30)
+        cs2_int = eos.gamma * p_int / np.maximum(rho_int * h_int, 1e-30)
+        cs2_int = np.clip(cs2_int, 0.0, 1.0 - 1e-10)  # Keep 0 < c_s² < 1
+        cs_int = np.sqrt(cs2_int)
+
+        # Relativistic Mach number: M = (W v) / (W_s c_s)
+        # where W_s = 1/sqrt(1 - c_s²) is the sound Lorentz factor
+        W_s_int = 1.0 / np.sqrt(np.maximum(1.0 - cs2_int, 1e-16))
+        Mach_rel = (W_int * np.abs(v_int)) / np.maximum(W_s_int * cs_int, 1e-30)
+
         # Guardar
         rin = r_current[ng:-ng]
         results[method] = {
             'r': rin.copy(),
-            'rho': rho0[ng:-ng].copy(),
-            'p': p[ng:-ng].copy(),
-            'v': v[ng:-ng].copy(),
-            'E': (tau[ng:-ng] + D[ng:-ng]).copy(),
+            'rho': rho_int.copy(),
+            'p': p_int.copy(),
+            'v': v_int.copy(),
+            'W': W_int.copy(),
+            'eps': eps_int.copy(),
+            'Mach': Mach_rel.copy(),
             't': t,
             'steps': steps,
         }
         print(f"  {method}: t≈{t:.3f}, pasos={steps}")
 
-    # PLOTEO (same as original)
+    # PLOTEO: 3x2 layout con primitivas
     avg_time = np.mean([results[m]['t'] for m in methods])
-    fig, axes = plt.subplots(2, 2, figsize=(12, 10))
+    fig, axes = plt.subplots(3, 2, figsize=(10, 14))
     lw_main = 2.5
 
-    # Densidad
+    # Fila 1, Col 1: Densidad ρ₀
     ax = axes[0, 0]
     for i, method in enumerate(methods):
         ax.plot(results[method]['r'], results[method]['rho'], color=colors[i], label=labels[i], linewidth=lw_main, linestyle=linestyles[i])
-    ax.set_xlabel('r')
-    ax.set_ylabel('Densidad ρ₀')
+    ax.set_xlabel('r', fontsize=11)
+    ax.set_ylabel('Densidad ρ₀', fontsize=11)
     ax.set_xlim(0, 1)
-    ax.grid(True, alpha=0.3)
     ax.legend()
-    ax.set_title('ρ')
 
-    # Presión
+    # Fila 1, Col 2: Presión p
     ax = axes[0, 1]
     for i, method in enumerate(methods):
         ax.plot(results[method]['r'], results[method]['p'], color=colors[i], label=labels[i], linewidth=lw_main, linestyle=linestyles[i])
-    ax.set_xlabel('r')
-    ax.set_ylabel('Presión p')
+    ax.set_xlabel('r', fontsize=11)
+    ax.set_ylabel('Presión P', fontsize=11)
     ax.set_xlim(0, 1)
-    ax.set_yscale('linear')
-    ax.grid(True, alpha=0.3)
     ax.legend()
-    ax.set_title('p')
 
-    # Velocidad
+    # Fila 2, Col 1: Velocidad v^r
     ax = axes[1, 0]
     for i, method in enumerate(methods):
         ax.plot(results[method]['r'], results[method]['v'], color=colors[i], label=labels[i], linewidth=lw_main, linestyle=linestyles[i])
-    ax.set_xlabel('r')
-    ax.set_ylabel('Velocidad v^r')
+    ax.set_xlabel('r', fontsize=11)
+    ax.set_ylabel(r' $v^r$', fontsize=11)
     ax.set_xlim(0, 1)
-    ax.grid(True, alpha=0.3)
     ax.legend()
-    ax.set_title('v')
 
-    # Energía (densidad): tau + D
+    # Fila 2, Col 2: Factor de Lorentz W
     ax = axes[1, 1]
     for i, method in enumerate(methods):
-        ax.plot(results[method]['r'], results[method]['E'], color=colors[i], label=labels[i], linewidth=lw_main, linestyle=linestyles[i])
-    ax.set_xlabel('r')
-    ax.set_ylabel('Energía dens. (τ + D)')
+        ax.plot(results[method]['r'], results[method]['W'], color=colors[i], label=labels[i], linewidth=lw_main, linestyle=linestyles[i])
+    ax.set_xlabel('r', fontsize=11)
+    ax.set_ylabel(r' $W$', fontsize=11)
     ax.set_xlim(0, 1)
-    ax.grid(True, alpha=0.3)
     ax.legend()
-    ax.set_title('E')
 
-    fig.suptitle(f"Blast {case}: Comparación MINMOD vs MP5 (t ≈ {avg_time:.3f})")
+    # Fila 3, Col 1: Energía específica interna ε
+    ax = axes[2, 0]
+    for i, method in enumerate(methods):
+        ax.plot(results[method]['r'], results[method]['eps'], color=colors[i], label=labels[i], linewidth=lw_main, linestyle=linestyles[i])
+    ax.set_xlabel('r', fontsize=11)
+    ax.set_ylabel(r' $\varepsilon$', fontsize=11)
+    ax.set_xlim(0, 1)
+    ax.legend()
+
+    # Fila 3, Col 2: Número de Mach relativista
+    ax = axes[2, 1]
+    for i, method in enumerate(methods):
+        ax.plot(results[method]['r'], results[method]['Mach'], color=colors[i], label=labels[i], linewidth=lw_main, linestyle=linestyles[i])
+    # Add horizontal line at Mach = 1 (sonic line)
+    ax.axhline(y=1.0, color='black', linestyle='--', linewidth=1.5, alpha=0.5, label='Sónico (M=1)')
+    ax.set_xlabel('r', fontsize=11)
+    ax.set_ylabel(r'Mach $\mathcal{M}$', fontsize=11)
+    ax.set_xlim(0, 1)
+    ax.legend()
+
+    fig.suptitle(f"Blast {case}: Comparación MINMOD vs MP5 (t ≈ {avg_time:.3f})", fontsize=14, fontweight='bold')
     plt.tight_layout()
     plt.savefig(f"blast_{case}_comparison.png", dpi=150, bbox_inches="tight")
 
@@ -749,7 +777,7 @@ def test_conservation_short():
     print("\n" + "="*60)
     print("TEST 4: Conservación global (masa/energía)")
     print("="*60)
-    r, grid, Nin = build_grid(n_interior=100, r_min=1e-3, r_max=1.0)
+    r, grid, Nin = build_grid(n_interior=300, r_min=1e-3, r_max=1.0)
     N = len(r)
     eos = IdealGasEOS(gamma=4.0/3.0)
     recon = create_reconstruction("minmod")

@@ -109,7 +109,8 @@ def primitives_from_snapshot(state_1d: np.ndarray, grid: Grid):
     background = FlatSphericalBackground(grid.r)
     hydro.background = background
 
-    prim = hydro._get_primitives(bssn, grid.r)
+    rho0, vr, p, eps, W, h, success = hydro._get_primitives(bssn, grid.r)
+    prim = {'rho0': rho0, 'vr': vr, 'p': p, 'eps': eps, 'W': W, 'h': h, 'success': success}
     return prim, state, bssn
 
 

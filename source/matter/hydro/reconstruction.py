@@ -388,14 +388,6 @@ class Reconstruction:
         u = np.asarray(u, dtype=np.float64)
         N = u.size
 
-        # Handle small grids
-        if N < 3:
-            u_L = np.full(N+1, u[0] if N > 0 else 0.0, dtype=np.float64)
-            u_R = np.full(N+1, u[-1] if N > 0 else 0.0, dtype=np.float64)
-            if N == 2:
-                u_L[1] = u[0]
-                u_R[1] = u[1]
-            return u_L, u_R
 
         # Allocate output arrays
         u_L = np.empty(N + 1, dtype=np.float64)
@@ -449,38 +441,6 @@ class Reconstruction:
             pL, pR = self.reconstruct(pressure, dx=dx, x=x, boundary_type=boundary_type)
 
         return (rL, vL, pL), (rR, vR, pR)
-
-    def reconstruct_conservative_variables(self, D, Sr, tau, dx=None, x=None, boundary_type="outflow"):
-        """
-        Reconstruct conservative variables (D, S_r, tau) to interfaces.
-
-        Args:
-            D: Conserved density
-            Sr: Radial momentum density
-            tau: Conserved energy density
-            dx: Grid spacing
-            x: Coordinate array
-            boundary_type: Boundary condition type
-
-        Returns:
-            left:  (D_L, Sr_L, tau_L)
-            right: (D_R, Sr_R, tau_R)
-        """
-        if boundary_type == "reflecting":
-            DL, DR = self.reconstruct(D, dx=dx, x=x, boundary_type="outflow")
-            SL, SR = self.reconstruct(Sr, dx=dx, x=x, boundary_type="outflow")
-            TL, TR = self.reconstruct(tau, dx=dx, x=x, boundary_type="outflow")
-
-            # Parities at r≈0: D, tau even; Sr odd
-            DL[0], DR[0] = D[0], D[0]
-            SL[0], SR[0] = 0.0, 0.0
-            TL[0], TR[0] = tau[0], tau[0]
-        else:
-            DL, DR = self.reconstruct(D, dx=dx, x=x, boundary_type=boundary_type)
-            SL, SR = self.reconstruct(Sr, dx=dx, x=x, boundary_type=boundary_type)
-            TL, TR = self.reconstruct(tau, dx=dx, x=x, boundary_type=boundary_type)
-
-        return (DL, SL, TL), (DR, SR, TR)
 
     def apply_physical_limiters(self, left_tuple, right_tuple,
                                 atmosphere=None, gamma_rr=None,

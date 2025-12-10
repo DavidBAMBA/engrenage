@@ -6,10 +6,6 @@ This implementation uses the quadratic eigenvalue approach for computing
 characteristic speeds, providing more generality and robustness than the explicit
 Banyuls 1D formula.
 
-Based on:
-- NRPy: nrpy/equations/grhd/characteristic_speeds.py
-- NRPy: nrpy/equations/grhd/HLL_fluxes.py
-
 Key features:
 - Uses quadratic equation method for characteristic speeds (more general and robust)
 - Handles all spatial directions consistently
@@ -64,7 +60,7 @@ class HLLRiemannSolver:
 
     def solve(self, UL, UR, primL, primR, gamma_rr, alpha, beta_r, eos):
         """
-        Solve a single-interface Riemann problem with NRPy-style HLL.
+        Solve a single-interface Riemann problem HLL.
 
         Inputs (scalars):
           UL, UR      : (D, S_r, tau) for left/right conservative states
@@ -115,13 +111,13 @@ class HLLRiemannSolver:
         # Build 4-metric components at interface
         g4UU = self._ADM_to_g4UU(gamma_rr, beta_r, alpha)
 
-        # Compute characteristic speeds using NRPy quadratic method
+        # Compute characteristic speeds using quadratic method
         # Direction 0 corresponds to radial/x direction
         flux_dirn = 0
         cmL, cpL = self._find_cp_cm(flux_dirn, g4UU, u4U_L, cs2L)
         cmR, cpR = self._find_cp_cm(flux_dirn, g4UU, u4U_R, cs2R)
 
-        # Global wave speed bounds (NRPy style)
+        # Global wave speed bounds (style)
         cmax = max(0.0, max(cpL, cpR))
         cmin = -min(0.0, min(cmL, cmR))
 
@@ -368,9 +364,6 @@ class HLLRiemannSolver:
         self.superluminal_detections = 0
         self.negative_pressure_fixes = 0
 
-    # ----------------------------------------------------------------------
-    # NRPy-specific internal methods
-    # ----------------------------------------------------------------------
 
     def _compute_4velocity(self, vr, gamma_rr):
         """
@@ -469,9 +462,7 @@ class HLLRiemannSolver:
 
     def _find_cp_cm(self, flux_dirn, g4UU, u4U, cs2):
         """
-        Compute characteristic speeds c+ and c- using NRPy quadratic method.
-
-        This matches NRPy's characteristic_speeds.find_cp_cm() function.
+        Compute characteristic speeds c+ and c- using quadratic method.
 
         Args:
             flux_dirn: Direction index (0 for radial/x, 1 for theta/y, 2 for phi/z)
@@ -482,7 +473,7 @@ class HLLRiemannSolver:
         Returns:
             (c_minus, c_plus) tuple of characteristic speeds
         """
-        # Quadratic equation coefficients (NRPy Eq. 40-43)
+        # Quadratic equation coefficients (Eq. 40-43)
         v02 = cs2
         i = flux_dirn + 1  # Spatial index (1 for radial)
 
@@ -505,11 +496,11 @@ class HLLRiemannSolver:
             # Degenerate case: use simple estimate
             return -1.0, 1.0
 
-        # Two roots (NRPy Eq. 52-53)
+        # Two roots (Eq. 52-53)
         cplus_tmp = 0.5 * (-b / a + detm / a)
-        cminus_tmp = -0.5 * (b / a + detm / a)
+        cminus_tmp = 0.5 * (-b / a - detm / a)
 
-        # Ensure proper ordering (NRPy uses min/max_noif)
+        # Ensure proper ordering (uses min/max_noif)
         cminus = min(cplus_tmp, cminus_tmp)
         cplus = max(cplus_tmp, cminus_tmp)
 
@@ -524,7 +515,7 @@ class HLLRiemannSolver:
         D, Sr, tau = U
         _, vr, p = prim
 
-        vtil = vr - beta_r / alpha  # Transport velocity
+        vtil = vr #- beta_r / alpha  # Transport velocity
         fD = D * vtil
         fSr = Sr * vtil + p
         ftau = (tau + p) * vtil
@@ -614,7 +605,7 @@ class HLLRiemannSolver:
         vr = prim[:, 1]
         p = prim[:, 2]
 
-        vtil = vr - beta_r / alpha  # Transport velocity
+        vtil = vr 
         fD = D * vtil
         fSr = Sr * vtil + p
         ftau = (tau + p) * vtil

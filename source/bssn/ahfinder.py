@@ -67,7 +67,7 @@ def get_horizon_diagnostics(states_over_time, t, grid: Grid, background, matter)
         # End of: Calculate some useful quantities, now start diagnostic
         #################################################################
         
-        # Expansion given by eqn. (49) of NRPy+ https://arxiv.org/abs/1712.07658        
+        # Expansion given by eqn. (49) of  https://arxiv.org/abs/1712.07658        
         omega[i,:] = ((4.0 * bar_gamma_LL[:,i_t,i_t] * d1.phi[:,i_r] + d1_bargamma_tt_dr) / denominator 
                       - 2.0 * bar_Ktt / bar_gamma_LL[:,i_t,i_t])
         

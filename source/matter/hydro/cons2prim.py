@@ -245,14 +245,25 @@ class Cons2PrimSolver:
         """
         Convert conservative to primitive variables using vectorized approach.
 
+        IMPORTANT: This solver expects PHYSICAL (non-densitized) conservative variables:
+            D  = ρ₀ W
+            Sʳ = ρ₀ h W² vʳ γᵣᵣ
+            τ  = ρ₀ h W² - p - D
+
+        The densitization factor √γ = e^{6φ} from BSSN is a geometric quantity handled
+        externally in the evolution code. If your state vector stores densitized variables
+        D̃ = e^{6φ}D, you MUST de-densitify them (D = D̃/e^{6φ}) before calling this method.
+
         Args:
-            U: Conservative variables - dict {'D','Sr','tau'}, tuple (D,Sr,tau), or array
-            metric: Metric components - dict or tuple (alpha, beta_r, gamma_rr) (optional)
+            U: Conservative variables - tuple (D,Sr,tau) or array
+               MUST be physical (non-densitized) conservatives
+            metric: Metric components - tuple (alpha, beta_r, gamma_rr) (optional)
             p_guess: Pressure guess array from previous timestep (optional)
             apply_conservative_floors: Apply tau and S_i floors before solve (default: True)
+                                       Floors are applied to physical values
 
         Returns:
-            dict: {'rho0', 'vr', 'p', 'eps', 'W', 'h', 'success'}
+            tuple: (rho0, vr, p, eps, W, h, success) - Primitive variables and success mask
         """
         self.stats["total_calls"] += 1
 
@@ -274,11 +285,34 @@ class Cons2PrimSolver:
         rho0, vr, p, eps, W, h = (np.zeros(N) for _ in range(6))
         success = np.zeros(N, dtype=bool)
 
-        # Check input validity for all points
-        valid_mask = self._is_valid_input_vectorized(D, Sr, tau)
+        # ATMOSPHERE DETECTION: For cells with very low density, directly set atmosphere values
+        # This avoids numerical issues when solving with extremely small conservative variables
+        rho_threshold = 10.0 * self.params["rho_floor"]
+        atm_mask = D < rho_threshold
+
+        if np.any(atm_mask):
+            # Directly set atmosphere values (no numerical solve needed)
+            rho0[atm_mask] = self.params["rho_floor"]
+            vr[atm_mask] = 0.0  # No velocity in atmosphere
+            p[atm_mask] = self.params["p_floor"]
+            try:
+                eps[atm_mask] = self.eos.eps_from_rho_p(
+                    self.params["rho_floor"], self.params["p_floor"]
+                )
+            except:
+                eps[atm_mask] = 1e-10
+            W[atm_mask] = 1.0
+            h[atm_mask] = 1.0 + eps[atm_mask] + self.params["p_floor"] / self.params["rho_floor"]
+            success[atm_mask] = True
+            self.stats["atmosphere_fallbacks"] += np.sum(atm_mask)
+
+        # Check input validity for NON-atmosphere points only
+        # (atmosphere points already have correct values)
+        non_atm_mask = ~atm_mask
+        valid_mask = self._is_valid_input_vectorized(D, Sr, tau) & non_atm_mask
 
         if np.any(valid_mask):
-            # Solve for valid points using vectorized Newton-Raphson
+            # Solve for valid NON-atmosphere points using vectorized Newton-Raphson
             result = self._solve_vectorized_points(D[valid_mask], Sr[valid_mask],
                                                  tau[valid_mask], gamma_rr[valid_mask],
                                                  p_guess[valid_mask] if p_guess is not None else None)
@@ -334,10 +368,7 @@ class Cons2PrimSolver:
                     except Exception:
                         h[low_p_mask] = 1.0 + eps[low_p_mask] + p[low_p_mask] / np.maximum(rho0[low_p_mask], 1e-30)
 
-        return {
-            "rho0": rho0, "vr": vr, "p": p, "eps": eps,
-            "W": W, "h": h, "success": success
-        }
+        return rho0, vr, p, eps, W, h, success
 
     def get_statistics(self):
         """Get conversion statistics."""
@@ -847,12 +878,8 @@ class Cons2PrimSolver:
         }
 
     def _parse_conservative_variables(self, U):
-        """Parse conservative variables from various input formats."""
-        if isinstance(U, dict):
-            D = np.atleast_1d(np.asarray(U["D"], dtype=float))
-            Sr = np.atleast_1d(np.asarray(U["Sr"], dtype=float))
-            tau = np.atleast_1d(np.asarray(U["tau"], dtype=float))
-        elif isinstance(U, (tuple, list)) and len(U) == 3:
+        """Parse conservative variables from tuple or array formats."""
+        if isinstance(U, (tuple, list)) and len(U) == 3:
             D = np.atleast_1d(np.asarray(U[0], dtype=float))
             Sr = np.atleast_1d(np.asarray(U[1], dtype=float))
             tau = np.atleast_1d(np.asarray(U[2], dtype=float))
@@ -877,19 +904,14 @@ class Cons2PrimSolver:
         return D, Sr, tau
 
     def _ensure_metric_arrays(self, metric, N):
-        """Ensure metric components are proper arrays."""
+        """Ensure metric components are proper arrays from tuple format."""
         if metric is None:
             return np.ones(N), np.zeros(N), np.ones(N)
 
-        if isinstance(metric, dict):
-            alpha = np.broadcast_to(metric.get("alpha", 1.0), N).astype(float)
-            beta_r = np.broadcast_to(metric.get("beta_r", 0.0), N).astype(float)
-            gamma_rr = np.broadcast_to(metric.get("gamma_rr", 1.0), N).astype(float)
-        else:
-            alpha, beta_r, gamma_rr = metric
-            alpha = np.broadcast_to(alpha, N).astype(float)
-            beta_r = np.broadcast_to(beta_r, N).astype(float)
-            gamma_rr = np.broadcast_to(gamma_rr, N).astype(float)
+        alpha, beta_r, gamma_rr = metric
+        alpha = np.broadcast_to(alpha, N).astype(float)
+        beta_r = np.broadcast_to(beta_r, N).astype(float)
+        gamma_rr = np.broadcast_to(gamma_rr, N).astype(float)
 
         return alpha, beta_r, gamma_rr
 
@@ -944,9 +966,21 @@ class Cons2PrimSolver:
 # PRIMITIVE TO CONSERVATIVE CONVERSION
 # ============================================================================
 
-def prim_to_cons(rho0, vr, pressure, gamma_rr, eos):
+def prim_to_cons(rho0, vr, pressure, gamma_rr, eos, e6phi=None, alpha=None):
     """
     Convert primitive to conservative variables.
+
+    Following Valencia formulation:
+        Non-densitized (e6phi=None):
+            D  = W ρ₀
+            Sr = W² ρ₀ h vr γrr
+            τ  = ρ₀ h W² - P - D
+
+        Densitized (e6phi provided):
+            D̃  = e^{6φ} W ρ₀
+            S̃r = e^{6φ} W² ρ₀ h vr γrr
+            τ̃  = e^{6φ} (α² T^{00} - W ρ₀)
+            where T^{00} = W² ρ₀ h - P
 
     Args:
         rho0: Rest mass density
@@ -954,9 +988,11 @@ def prim_to_cons(rho0, vr, pressure, gamma_rr, eos):
         pressure: Pressure
         gamma_rr: Radial metric component
         eos: Equation of state
+        e6phi: Densitization factor e^{6φ} (optional, default=None for non-densitized)
+        alpha: Lapse (optional, default=1.0)
 
     Returns:
-        tuple: (D, Sr, tau) conservative variables
+        tuple: (D, Sr, tau) conservative variables (densitized if e6phi provided)
     """
     # Convert inputs to arrays for unified handling
     rho0 = np.asarray(rho0)
@@ -966,6 +1002,18 @@ def prim_to_cons(rho0, vr, pressure, gamma_rr, eos):
 
     # Broadcast to same shape
     rho0, vr, pressure, gamma_rr = np.broadcast_arrays(rho0, vr, pressure, gamma_rr)
+
+    # Densitization factor (default = 1.0 for non-densitized)
+    if e6phi is None:
+        e6phi = np.ones_like(rho0)
+    else:
+        e6phi = np.broadcast_to(np.asarray(e6phi), rho0.shape)
+
+    # Lapse (default = 1.0)
+    if alpha is None:
+        alpha = np.ones_like(rho0)
+    else:
+        alpha = np.broadcast_to(np.asarray(alpha), rho0.shape)
 
     # Compute derived quantities
     g = np.maximum(gamma_rr, 1e-30)
@@ -985,10 +1033,13 @@ def prim_to_cons(rho0, vr, pressure, gamma_rr, eos):
         except Exception:
             h = 1.0 + eps + pressure / np.maximum(rho0, 1e-30)
 
-    # Conservative variables
-    D = rho0 * W
-    Sr = rho0 * h * W * W * vr * g
-    tau = rho0 * h * W * W - pressure - D
+    # Conservative variables with densitization
+    # T^{00} = ρ₀ h W² - P (energy-momentum tensor component)
+    T00 = rho0 * h * W * W - pressure
+
+    D = e6phi * rho0 * W
+    Sr = e6phi * rho0 * h * W * W * vr * g
+    tau = e6phi * (alpha * alpha * T00 - rho0 * W)
 
     return D, Sr, tau
 
@@ -1000,15 +1051,14 @@ def prim_to_cons(rho0, vr, pressure, gamma_rr, eos):
 def _solve_pressure(D, Sr, tau, gamma_rr, eos, p_guess=None):
     """Legacy function for backward compatibility."""
     solver = Cons2PrimSolver(eos)
-    U = {'D': np.array([D]), 'Sr': np.array([Sr]), 'tau': np.array([tau])}
-    metric = {'gamma_rr': np.array([gamma_rr])}
+    U = (np.array([D]), np.array([Sr]), np.array([tau]))
+    metric = (np.ones(1), np.zeros(1), np.array([gamma_rr]))  # (alpha, beta_r, gamma_rr)
     p_guess_array = np.array([p_guess]) if p_guess is not None else None
 
-    result = solver.convert(U, metric=metric, p_guess=p_guess_array)
+    rho0, vr, p, eps, W, h, success = solver.convert(U, metric=metric, p_guess=p_guess_array)
 
-    if result['success'][0]:
-        return True, (result['rho0'][0], result['vr'][0], result['p'][0],
-                     result['eps'][0], result['W'][0], result['h'][0])
+    if success[0]:
+        return True, (rho0[0], vr[0], p[0], eps[0], W[0], h[0])
     else:
         return False, None
 
@@ -1045,7 +1095,7 @@ def cons_to_prim(U, eos, params=None, metric=None, p_guess=None):
         p_guess: Pressure guess array (optional)
 
     Returns:
-        dict: Primitive variables and success flags
+        tuple: (rho0, vr, p, eps, W, h, success) - Primitive variables and success mask
     """
     solver_params = params or {}
     solver = Cons2PrimSolver(eos, **solver_params)
