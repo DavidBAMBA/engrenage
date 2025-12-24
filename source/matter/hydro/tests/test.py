@@ -36,8 +36,8 @@ from source.bssn.bssnstatevariables import NUM_BSSN_VARS, idx_phi, idx_hrr, idx_
 from source.matter.hydro.perfect_fluid import PerfectFluid
 from source.matter.hydro.eos import IdealGasEOS
 from source.matter.hydro.reconstruction import create_reconstruction
-from source.matter.hydro.riemann import HLLRiemannSolver
-from source.matter.hydro.cons2prim import cons_to_prim, prim_to_cons
+from source.matter.hydro.riemann import HLLRiemannSolver,HLLCRiemannSolver
+from source.matter.hydro.cons2prim import Cons2PrimSolver, prim_to_cons
 from source.matter.hydro.atmosphere import AtmosphereParams
 
 
@@ -111,16 +111,11 @@ def to_conserved(rho0, v, p, eos):
 
 
 def to_primitives(D, Sr, tau, eos, p_guess=None):
-    """Convert conservatives to primitives using cons_to_prim."""
-    # cons_to_prim expects:
-    #   U: tuple (D, Sr, tau)
-    #   metric: tuple (alpha, beta_r, gamma_rr)
-    # Returns: (rho0, vr, p, eps, W, h, success)
-    rho0, vr, p, eps, W, h, success = cons_to_prim(
-        (D, Sr, tau),
-        eos,
-        metric=(np.ones_like(D), np.zeros_like(D), np.ones_like(D)),  # (alpha, beta_r, gamma_rr)
-        p_guess=p_guess,
+    """Convert conservatives to primitives using Cons2PrimSolver."""
+    solver = Cons2PrimSolver(eos)
+    gamma_rr = np.ones_like(D)
+    rho0, vr, p, eps, W, h, success = solver.convert(
+        D, Sr, tau, gamma_rr, p_guess=p_guess
     )
     return rho0, vr, p
 
@@ -342,16 +337,16 @@ def test_riemann_sod():
     print("="*60)
 
     # Configuración base
-    r, grid, Nin = build_grid(n_interior=1000, r_min=1e-3, r_max=1.0)
+    r, grid, Nin = build_grid(n_interior=100, r_min=1e-3, r_max=1.0)
     N = len(r)
-    gamma =1.4
+    gamma =5.0/3.0
     eos = IdealGasEOS(gamma=gamma)
-    rsolve = HLLRiemannSolver()
+    rsolve = HLLCRiemannSolver()
 
     # Discontinuidad en el punto medio del dominio interior
     r_mid = 0.5*(r[NUM_GHOSTS] + r[-NUM_GHOSTS-1])
     rho0_base = np.where(r < r_mid, 10.0, 1.0)
-    p_base = np.where(r < r_mid, 40.0/3.0, 1.0e-6)
+    p_base = np.where(r < r_mid, 4000.0/3.0, 1.0e-6)
     v_base = np.zeros(N)
 
     # Lista de métodos de reconstrucción a probar
@@ -373,7 +368,7 @@ def test_riemann_sod():
 
             r_mid_hires = 0.5*(r_hires[NUM_GHOSTS] + r_hires[-NUM_GHOSTS-1])
             rho0 = np.where(r_hires < r_mid_hires, 10.0, 1.0)
-            p = np.where(r_hires < r_mid_hires, 40.0/3.0, 1.0e-6)
+            p = np.where(r_hires < r_mid_hires, 4000.0/3.0, 1.0e-6)
             v = np.zeros(N_hires)
 
             rho0, v, p = fill_ghosts_primitives(rho0, v, p)
@@ -430,7 +425,7 @@ def test_riemann_sod():
 
     # PLOTEO (same as original)
     rho0_init = np.where(r < r_mid, 10.0, 1.0)
-    p_init = np.where(r < r_mid, 40.0/3.0, 1.0e-6)
+    p_init = np.where(r < r_mid, 4000.0/3.0, 1.0e-6)
     v_init = np.zeros(N)
     rho0_init, v_init, p_init = fill_ghosts_primitives(rho0_init, v_init, p_init)
 

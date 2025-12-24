@@ -26,10 +26,7 @@ import traceback
 sys.path.insert(0, '/home/yo/repositories/engrenage')
 
 from source.matter.hydro.eos import IdealGasEOS
-from source.matter.hydro.cons2prim import (
-    cons_to_prim, Cons2PrimSolver, prim_to_cons,
-    _solve_pressure, _bracket_pressure, _state_from_p
-)
+from source.matter.hydro.cons2prim import Cons2PrimSolver, prim_to_cons
 
 # ============================================================================
 # TEST DATA GENERATION
@@ -150,15 +147,11 @@ def benchmark_performance():
         # Convert to conservative
         D, Sr, tau = prim_to_cons(rho0, vr, p, gamma_rr, eos)
 
-        # Use tuples (efficient) instead of dicts
-        U = (D, Sr, tau)
-        alpha = np.ones_like(D)
-        beta_r = np.zeros_like(D)
-        metric = (alpha, beta_r, gamma_rr)
-
-        # Time conversion - unpack tuple result
+        # Time conversion
         start_time = time.time()
-        rho0_result, vr_result, p_result, eps_result, W_result, h_result, success = solver.convert(U, metric=metric)
+        rho0_result, vr_result, p_result, eps_result, W_result, h_result, success = solver.convert(
+            D, Sr, tau, gamma_rr
+        )
         elapsed_time = time.time() - start_time
 
         success_rate = np.mean(success)
@@ -211,12 +204,10 @@ def test_correctness():
         # Convert to conservative
         D, Sr, tau = prim_to_cons(rho0, vr, p, gamma_rr, eos)
 
-        # Convert back using tuples - unpack result
-        U = (D, Sr, tau)
-        alpha = np.ones_like(D)
-        beta_r = np.zeros_like(D)
-        metric = (alpha, beta_r, gamma_rr)
-        rho0_rec, vr_rec, p_rec, eps_rec, W_rec, h_rec, success = solver.convert(U, metric=metric)
+        # Convert back
+        rho0_rec, vr_rec, p_rec, eps_rec, W_rec, h_rec, success = solver.convert(
+            D, Sr, tau, gamma_rr
+        )
 
         print(f"  Success: {success}")
         print(f"  Original rho0: {rho0}")
@@ -266,15 +257,10 @@ def analyze_failures():
         D, Sr, tau = prim_to_cons(np.array([rho0]), np.array([vr]),
                                  np.array([p]), np.array([gamma_rr]), eos)
 
-        # Try conversion using tuples
-        U = (D, Sr, tau)
-        alpha = np.ones_like(D)
-        beta_r = np.zeros_like(D)
-        metric = (alpha, beta_r, np.array([gamma_rr]))
-
         try:
-            # Unpack tuple result
-            rho0_result, vr_result, p_result, eps_result, W_result, h_result, success = solver.convert(U, metric=metric)
+            rho0_result, vr_result, p_result, eps_result, W_result, h_result, success = solver.convert(
+                D, Sr, tau, np.array([gamma_rr])
+            )
 
             if success[0]:
                 successes.append((rho0, vr, p, description))
@@ -322,15 +308,8 @@ def compare_vectorized_vs_legacy():
     print("Testing vectorized solver...")
     solver = Cons2PrimSolver(eos)
 
-    # Use tuples for efficiency
-    U = (D, Sr, tau)
-    alpha = np.ones(N)
-    beta_r = np.zeros(N)
-    metric = (alpha, beta_r, gamma_rr)
-
     start_time = time.time()
-    # Unpack tuple result
-    rho0_vec, vr_vec, p_vec, eps_vec, W_vec, h_vec, success_vec = solver.convert(U, metric=metric)
+    rho0_vec, vr_vec, p_vec, eps_vec, W_vec, h_vec, success_vec = solver.convert(D, Sr, tau, gamma_rr)
     time_vec = time.time() - start_time
 
     # Test legacy approach (point by point)
@@ -342,14 +321,11 @@ def compare_vectorized_vs_legacy():
     p_legacy = np.zeros(N)
     success_legacy = np.zeros(N, dtype=bool)
 
+    solver_legacy = Cons2PrimSolver(eos)
     for i in range(N):
         try:
-            # Use tuple format
-            U_single = (D[i:i+1], Sr[i:i+1], tau[i:i+1])
-            metric_single = (np.ones(1), np.zeros(1), gamma_rr[i:i+1])
-            # cons_to_prim returns: (rho0, vr, p, eps, W, h, success)
-            rho0_single, vr_single, p_single, eps_single, W_single, h_single, success_single = cons_to_prim(
-                U_single, eos, metric=metric_single
+            rho0_single, vr_single, p_single, eps_single, W_single, h_single, success_single = solver_legacy.convert(
+                D[i:i+1], Sr[i:i+1], tau[i:i+1], gamma_rr[i:i+1]
             )
 
             if success_single[0]:
@@ -419,15 +395,10 @@ def analyze_solver_statistics():
         gamma_rr = np.ones(N)
         D, Sr, tau = prim_to_cons(rho0, vr, p, gamma_rr, eos)
 
-        # Use tuples for efficiency
-        U = (D, Sr, tau)
-        alpha = np.ones(N)
-        beta_r = np.zeros(N)
-        metric = (alpha, beta_r, gamma_rr)
-
         start_time = time.time()
-        # Unpack tuple result
-        rho0_result, vr_result, p_result, eps_result, W_result, h_result, success = solver.convert(U, metric=metric)
+        rho0_result, vr_result, p_result, eps_result, W_result, h_result, success = solver.convert(
+            D, Sr, tau, gamma_rr
+        )
         elapsed = time.time() - start_time
 
         stats = solver.get_statistics()
@@ -435,7 +406,6 @@ def analyze_solver_statistics():
         print(f"  Time: {elapsed:.4f} s")
         print(f"  Success rate: {stats['success_rate']:.3f}")
         print(f"  Newton success rate: {stats['newton_rate']:.3f}")
-        print(f"  Bisection fallback rate: {stats['bisection_rate']:.3f}")
         print(f"  Total calls: {stats['total_calls']}")
 
         solver.reset_statistics()

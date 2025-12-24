@@ -18,7 +18,7 @@ from source.core.spacing import NUM_GHOSTS
 from source.matter.hydro.eos import IdealGasEOS
 from source.matter.hydro.reconstruction import Reconstruction, create_reconstruction
 from source.matter.hydro.riemann import HLLRiemannSolver
-from source.matter.hydro.cons2prim import cons_to_prim
+from source.matter.hydro.cons2prim import Cons2PrimSolver
 from source.matter.hydro.valencia_reference_metric import ValenciaReferenceMetric
 
 # ── Global parameters ───────────────────────────────────────────────────
@@ -109,13 +109,13 @@ def to_conserved(rho0, v, p, eos):
     return D, Sr, tau
 
 def to_primitives(D, Sr, tau, eos, p_guess=None):
-    """Convert conservatives to primitives using cons2prim, with optional pressure guess."""
-    res = cons_to_prim(
-        (D, Sr, tau), eos,
-        metric=(np.ones_like(D), np.zeros_like(D), np.ones_like(D)),
-        p_guess=p_guess,
+    """Convert conservatives to primitives using Cons2PrimSolver."""
+    solver = Cons2PrimSolver(eos)
+    gamma_rr = np.ones_like(D)
+    rho0, vr, p, eps, W, h, success = solver.convert(
+        D, Sr, tau, gamma_rr, p_guess=p_guess
     )
-    return res['rho0'], res['vr'], res['p']
+    return rho0, vr, p
 
 def max_signal_speed(rho0, v, p, eos, cfl_guard=1e-6):
     """Calculate maximum signal speed for CFL condition."""

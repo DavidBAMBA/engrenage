@@ -68,8 +68,8 @@ class PerfectFluid:
         self.cons2prim_solver = Cons2PrimSolver(
             self.eos,
             atmosphere=self.atmosphere,
-            tol=1e-10,
-            max_iter=100
+            tol=1e-12,
+            max_iter=200
         )
 
         # Numerical methods for Valencia evolution
@@ -198,13 +198,10 @@ class PerfectFluid:
         p_guess = self.pressure_cache
 
         # Call cons2prim solver with PHYSICAL (non-densitized) conservatives
-        # Solver expects: D = ρ₀W, Sʳ = ρ₀hW²vʳγᵣᵣ, τ = ρ₀hW² - p - D
-        # Returns: (rho0, vr, p, eps, W, h, success)
         rho0, vr, p, eps, W, h, success = self.cons2prim_solver.convert(
-            U=(D_phys, Sr_phys, tau_phys),
-            metric=(alpha, beta_r, gamma_rr),
+            D_phys, Sr_phys, tau_phys, gamma_rr,
             p_guess=p_guess,
-            apply_conservative_floors=True  # Apply tau and S_i floors to physical values
+            apply_conservative_floors=True
         )
 
         # Update pressure cache for next timestep

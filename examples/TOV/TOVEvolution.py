@@ -24,17 +24,17 @@ from source.bssn.tensoralgebra import get_bar_gamma_LL
 from source.matter.hydro.perfect_fluid import PerfectFluid
 from source.matter.hydro.eos import IdealGasEOS
 from source.matter.hydro.reconstruction import create_reconstruction
-from source.matter.hydro.riemann import HLLRiemannSolver
+from source.matter.hydro.riemann import HLLRiemannSolver#, HLLCRiemannSolver
 from source.matter.hydro.cons2prim import prim_to_cons
 from source.matter.hydro.atmosphere import AtmosphereParams
 
 # Local TOV modules
 # Schwarzschild coordinates
-from examples.TOV.tov_solver import TOVSolver, load_or_solve_tov
+from examples.TOV.tov_solver import load_or_solve_tov
 import examples.TOV.tov_initial_data_interpolated as tov_id_schw
 
 # Isotropic coordinates
-from examples.TOV.tov_solver_iso import TOVSolverIso
+from examples.TOV.tov_solver_iso import load_or_solve_tov_iso
 import examples.TOV.tov_initial_data_interpolated_iso as tov_id_iso
 
 # TOV utilities and plotting
@@ -43,111 +43,11 @@ from examples.TOV.utils_TOVEvolution import SimulationDataManager
 from examples.TOV.plot_TOVEvolution import compute_qnm_spectrum, extract_decay_rate
 
 
-class AtmosphereAwareReconstructor:
+
+def get_rhs_cowling(t, y, grid, background, hydro, bssn_fixed, bssn_d1_fixed):
     """
-    Wrapper for reconstruction that handles star-atmosphere interfaces.
-
-    Key insight: At the stellar surface, hydrostatic equilibrium requires that
-    the pressure flux matches the gravitational source term. However, for cells
-    at the star-atmosphere interface:
-    - The flux sees stellar pressure on one side
-    - The source term uses atmosphere density (≈0)
-
-    This creates an imbalance that drives spurious velocities. The fix is to
-    force ZERO net momentum flux at star-atmosphere interfaces by setting
-    both left and right pressures to atmosphere values.
-    """
-    def __init__(self, base_reconstructor, atmosphere, safety_factor=1000.0):
-        self.base = base_reconstructor
-        self.atmosphere = atmosphere
-        # Threshold: cells below this density are considered atmosphere
-        self.rho_thresh = atmosphere.rho_floor * safety_factor
-        self.name = f"AtmosphereAware({base_reconstructor.name})"
-
-    def reconstruct_primitive_variables(self, rho0, vr, p, dx=None, x=None, boundary_type="outflow"):
-        # 1. Run base reconstruction
-        left_tuple, right_tuple = self.base.reconstruct_primitive_variables(
-            rho0, vr, p, dx=dx, x=x, boundary_type=boundary_type
-        )
-
-        rhoL, vL, pL = left_tuple
-        rhoR, vR, pR = right_tuple
-
-        N_cells = len(rho0)
-
-        # 2. Vectorized atmosphere detection
-        is_atm = rho0 < self.rho_thresh
-
-        # 3. Identify interfaces at star-atmosphere boundary
-        # Interface 'i' connects cell 'i-1' (LEFT) with cell 'i' (RIGHT)
-        force_pcm_mask = np.zeros(len(rhoL), dtype=bool)
-
-        # If LEFT is atm OR RIGHT is atm -> Dangerous interface
-        force_pcm_mask[1:N_cells] = is_atm[0:N_cells-1] | is_atm[1:N_cells]
-
-        # Safety at domain boundaries
-        force_pcm_mask[0] = True
-        force_pcm_mask[-1] = True
-
-        # 4. Apply correction (PCM + Velocity Clamp + Pressure Balance)
-        if np.any(force_pcm_mask):
-            idx = np.where(force_pcm_mask)[0]
-            # Filter valid indices
-            idx = idx[(idx > 0) & (idx < N_cells)]
-
-            # A. Degrade to First Order (PCM) for density
-            rhoL[idx] = rho0[idx - 1]
-            rhoR[idx] = rho0[idx]
-
-            # B. VELOCITY CLAMP: Force zero velocity at atmosphere interfaces
-            vL[idx] = 0.0
-            vR[idx] = 0.0
-
-            # C. PRESSURE BALANCE (CRITICAL FOR WELL-BALANCING)
-            # At star-atmosphere interfaces, we must ensure zero net pressure flux.
-            # The momentum flux is F_Sr = S_r * v + p. With v=0, F_Sr = p.
-            # If pL != pR, the Riemann solver produces a non-zero average flux
-            # that drives spurious velocities.
-
-            p_atm = self.atmosphere.p_floor
-            rho_atm = self.atmosphere.rho_floor
-
-            # Check if right cell is atmosphere
-            is_atm_right = is_atm[idx]
-            atm_idx = idx[is_atm_right]
-
-            # At interfaces where right cell is atmosphere, force both sides
-            # to atmosphere values. This ensures zero net flux into atmosphere.
-            pL[atm_idx] = p_atm
-            pR[atm_idx] = p_atm
-            rhoL[atm_idx] = rho_atm
-            rhoR[atm_idx] = rho_atm
-
-            # For star-star interfaces, use PCM
-            star_idx = idx[~is_atm_right]
-            pL[star_idx] = p[star_idx - 1]
-            pR[star_idx] = p[star_idx]
-
-        return (rhoL, vL, pL), (rhoR, vR, pR)
-
-    def apply_physical_limiters(self, *args, **kwargs):
-        if hasattr(self.base, "apply_physical_limiters"):
-            return self.base.apply_physical_limiters(*args, **kwargs)
-        return args[0], args[1]
-
-
-
-def get_rhs_cowling(t, y, grid, background, hydro, bssn_fixed, bssn_d1_fixed,
-                    equilibrium_rhs=None):
-    """
-    RHS for Cowling evolution (fixed spacetime) with atmosphere freezing.
-
-    Atmosphere cells (low density) have RHS = 0 to prevent spurious evolution.
-    Only cells with real fluid are evolved.
-
-    Well-balanced scheme: If equilibrium_rhs is provided, subtract it from the
-    computed RHS. This ensures the initial equilibrium state has RHS=0 exactly,
-    eliminating discretization errors that would otherwise accumulate.
+    RHS for Cowling evolution (fixed spacetime) of hydro variables only.
+    
     """
     state = y.reshape((grid.NUM_VARS, grid.N))
     grid.fill_boundaries(state)
@@ -159,64 +59,32 @@ def get_rhs_cowling(t, y, grid, background, hydro, bssn_fixed, bssn_d1_fixed,
     # Compute hydro RHS
     hydro_rhs = hydro.get_matter_rhs(grid.r, bssn_vars, bssn_d1_fixed, background)
 
-    # Freeze atmosphere: identify low-density cells and zero their RHS
-    # This prevents spurious evolution in atmosphere where there's no real fluid
-    D = state[NUM_BSSN_VARS + 0, :]
-    rho_threshold = 100.0 * hydro.atmosphere.rho_floor
-    atm_mask = D < rho_threshold
-
-    if np.any(atm_mask):
-        # Force RHS = 0 in atmosphere (no evolution)
-        hydro_rhs[:, atm_mask] = 0.0
-
     # Full RHS (BSSN frozen, only hydro evolves)
     rhs = np.zeros_like(state)
     rhs[NUM_BSSN_VARS:, :] = hydro_rhs
-
-    # Well-balanced correction: subtract initial equilibrium residual
-    #if equilibrium_rhs is not None:
-     #   rhs = rhs - equilibrium_rhs.reshape(rhs.shape)
 
     return rhs.flatten()
 
 
 def _apply_atmosphere_reset(state_2d, grid, hydro, atmosphere, rho_threshold=None):
     """
-    Aplica floors y, CRUCIALMENTE, elimina la velocidad en la zona de transición
-    atmósfera-estrella para prevenir que la gravedad acelere el 'polvo' atmosférico.
+    Aplica floors atmosféricos y correcciones a variables conservativas.
     """
     from source.matter.hydro.atmosphere import FloorApplicator
 
-    # 1. Definir umbrales
-    # Hard floor: donde reseteamos todo a valores mínimos de atmósfera
+    # Definir umbral para reset atmosférico
     if rho_threshold is None:
-        rho_hard_floor = 100.0 * atmosphere.rho_floor
-    else:
-        rho_hard_floor = rho_threshold
-    
-    # Damping Zone (Zona de Amortiguación):
-    # Definimos una zona más amplia (ej. 1000 veces el piso) donde permitimos
-    # que exista densidad, pero MATAMOS la velocidad. Esto estabiliza la cola de la estrella.
-    rho_damping_zone = 1000.0 * atmosphere.rho_floor
+        rho_hard_floor = 10.0 * atmosphere.rho_floor
 
     # Indices de variables conservativas
     idx_D = NUM_BSSN_VARS + 0
     idx_Sr = NUM_BSSN_VARS + 1
     idx_tau = NUM_BSSN_VARS + 2
 
-    # Extraer vistas para lectura (no modificar estas variables locales, modificar state_2d)
+    # Extraer vistas para lectura
     D = state_2d[idx_D, :]
 
-    # --- FASE 1: VELOCITY DAMPING (CRÍTICO) ---
-    # En cualquier lugar con densidad baja, forzamos el momento a cero.
-    # Esto evita que los errores de fuente (gravedad) aceleren el gas tenue.
-    damp_mask = D < rho_damping_zone
-    
-    if np.any(damp_mask):
-        # Forzar momento cero -> Velocidad cero
-        state_2d[idx_Sr, damp_mask] = 0.0
-
-    # --- FASE 2: HARD ATMOSPHERE RESET ---
+    # --- HARD ATMOSPHERE RESET ---
     # Resetear valores muy bajos al piso absoluto
     atm_mask = D < rho_hard_floor
 
@@ -232,7 +100,7 @@ def _apply_atmosphere_reset(state_2d, grid, hydro, atmosphere, rho_threshold=Non
     if np.all(atm_mask):
         return state_2d
 
-    # --- FASE 3: STANDARD FLOORS (Illinois Strategy) ---
+    # --- STANDARD FLOORS (Illinois Strategy) ---
     # Solo para el interior de la estrella donde la densidad es alta
     non_atm_mask = ~atm_mask
 
@@ -300,47 +168,40 @@ def _apply_atmosphere_reset(state_2d, grid, hydro, atmosphere, rho_threshold=Non
 
 
 def rk4_step(state_flat, dt, grid, background, hydro, bssn_fixed, bssn_d1_fixed,
-             atmosphere, equilibrium_rhs=None):
+             atmosphere):
     """
     Single RK4 timestep with atmosphere reset applied at EACH substage.
     Crucial for stability in GRHD.
-
-    Well-balanced scheme: If equilibrium_rhs is provided, it's subtracted from
-    the RHS at each stage, ensuring the initial equilibrium has RHS=0 exactly.
     """
     # --- Stage 1 ---
-    k1 = get_rhs_cowling(0, state_flat, grid, background, hydro, bssn_fixed, bssn_d1_fixed,
-                         equilibrium_rhs=equilibrium_rhs)
+    k1 = get_rhs_cowling(0, state_flat, grid, background, hydro, bssn_fixed, bssn_d1_fixed)
 
     # --- Stage 2 ---
     state_2 = state_flat + 0.5 * dt * k1
     s2 = state_2.reshape((grid.NUM_VARS, grid.N))
     # APLICAR FLOOR AQUI
-    s2 = _apply_atmosphere_reset(s2, grid, hydro, atmosphere)
+    #s2 = _apply_atmosphere_reset(s2, grid, hydro, atmosphere)
     state_2 = s2.flatten()
 
-    k2 = get_rhs_cowling(0, state_2, grid, background, hydro, bssn_fixed, bssn_d1_fixed,
-                         equilibrium_rhs=equilibrium_rhs)
+    k2 = get_rhs_cowling(0, state_2, grid, background, hydro, bssn_fixed, bssn_d1_fixed)
 
     # --- Stage 3 ---
     state_3 = state_flat + 0.5 * dt * k2
     s3 = state_3.reshape((grid.NUM_VARS, grid.N))
     # APLICAR FLOOR AQUI
-    s3 = _apply_atmosphere_reset(s3, grid, hydro, atmosphere)
+    #s3 = _apply_atmosphere_reset(s3, grid, hydro, atmosphere)
     state_3 = s3.flatten()
 
-    k3 = get_rhs_cowling(0, state_3, grid, background, hydro, bssn_fixed, bssn_d1_fixed,
-                         equilibrium_rhs=equilibrium_rhs)
+    k3 = get_rhs_cowling(0, state_3, grid, background, hydro, bssn_fixed, bssn_d1_fixed)
 
     # --- Stage 4 ---
     state_4 = state_flat + dt * k3
     s4 = state_4.reshape((grid.NUM_VARS, grid.N))
     # APLICAR FLOOR AQUI
-    s4 = _apply_atmosphere_reset(s4, grid, hydro, atmosphere)
+    #s4 = _apply_atmosphere_reset(s4, grid, hydro, atmosphere)
     state_4 = s4.flatten()
 
-    k4 = get_rhs_cowling(0, state_4, grid, background, hydro, bssn_fixed, bssn_d1_fixed,
-                         equilibrium_rhs=equilibrium_rhs)
+    k4 = get_rhs_cowling(0, state_4, grid, background, hydro, bssn_fixed, bssn_d1_fixed)
 
     # --- Combine ---
     state_new = state_flat + (dt / 6.0) * (k1 + 2*k2 + 2*k3 + k4)
@@ -407,20 +268,6 @@ def evolve_fixed_timestep(state_initial, dt, num_steps, grid, background, hydro,
     rho_c0 = rho0_initial[NUM_GHOSTS]
     rho_c_series = [rho_c0]
 
-    # =====================================================================
-    # WELL-BALANCED SCHEME: Compute initial equilibrium residual
-    # =====================================================================
-    # The initial state should be in hydrostatic equilibrium (RHS = 0),
-    # but discretization errors create a small residual. We subtract this
-    # residual from all subsequent RHS calculations to ensure exact balance.
-    equilibrium_rhs = get_rhs_cowling(0, state_flat, grid, background, hydro,
-                                      bssn_fixed, bssn_d1_fixed, equilibrium_rhs=None)
-
-    # Report maximum residual before correction
-    eq_rhs_2d = equilibrium_rhs.reshape((grid.NUM_VARS, grid.N))
-    max_Sr_residual = np.max(np.abs(eq_rhs_2d[NUM_BSSN_VARS + 1, :]))
-    print(f"\nWell-balanced correction: max|S_r residual| = {max_Sr_residual:.6e}")
-    print(f"  (This will be subtracted from RHS at each timestep)")
 
     print("\n===== Evolution diagnostics (per step) =====")
     print("Columns: step | t | ρ_central | max_Δρ/ρ@r | max_vʳ@r | max_D@r | max_Sʳ@r | c2p_fails")
@@ -430,8 +277,7 @@ def evolve_fixed_timestep(state_initial, dt, num_steps, grid, background, hydro,
     for step in range(num_steps):
         # Advance one RK4 step (with well-balanced correction)
         state_flat_next = rk4_step(state_flat, dt, grid, background, hydro,
-                                   bssn_fixed, bssn_d1_fixed, atmosphere,
-                                   equilibrium_rhs=equilibrium_rhs)
+                                   bssn_fixed, bssn_d1_fixed, atmosphere)
 
         # Compute primitives BEFORE and AFTER to measure change
         rho0_next, vr_next, p_next, eps_next, W_next, h_next, success_next, s_next = primitives_from_state(state_flat_next)
@@ -484,8 +330,8 @@ def evolve_fixed_timestep(state_initial, dt, num_steps, grid, background, hydro,
         t_curr = t_start + (step + 1) * dt
         step_num = step_offset + step + 1
         if step_num % 200 == 0:
-            print(f"step {step_num:4d}  t={t_curr:.6e}:  ρ_c={rho_central:.6e}  max_Δρ/ρ={max_rel_rho_err:.3e}@r={r_max_rho_err:.3f}  "
-              f"max_vʳ={max_abs_v:.3e}@r={r_max_v:.3f}  max_D={max_D:.3e}@r={r_max_D:.3f}  max_Sʳ={max_Sr:.3e}@r={r_max_Sr:.3f}  "
+            print(f"step {step_num:4d}  t={t_curr:.2e}:  ρ_c={rho_central:.6e}  max_Δρ/ρ={max_rel_rho_err:.2e}@r={r_max_rho_err:.2f}  "
+              f"max_vʳ={max_abs_v:.3e}@r={r_max_v:.2f}  max_D={max_D:.2e}@r={r_max_D:.2f}  max_Sʳ={max_Sr:.2e}@r={r_max_Sr:.2f}  "
               f"c2p_fail={c2p_fail_count}")
 
         # Save data if requested
@@ -590,7 +436,7 @@ def main():
     K = 100.0
     Gamma = 2.0
     rho_central = 1.28e-3
-    num_steps_total = 100000
+    num_steps_total = 10000
 
     # ==================================================================
     # COORDINATE SYSTEM SELECTION
@@ -638,7 +484,7 @@ def main():
         p_floor=K*(1.0e-10)**Gamma,     # Pressure floor
         v_max=0.999,           # Maximum velocity
         W_max=100.0,            # Maximum Lorentz factor
-        conservative_floor_safety=0.999999  # Safety factor for S^2 constraint
+        conservative_floor_safety=0.999  # Safety factor for S^2 constraint
     )
 
     print("=" * 70)
@@ -663,15 +509,12 @@ def main():
     # 1. RECONSTRUCTOR BASE (Usa WENO-Z, es más preciso que minmod para el interior)
     base_recon = create_reconstruction("wenoz")
     
-    # 2. INSTANCIAR EL WRAPPER
-    safe_recon = AtmosphereAwareReconstructor(base_recon, ATMOSPHERE, safety_factor=1000.0)
-
-    # 3. PASAR EL WRAPPER (safe_recon) AL FLUIDO
+    # 3. PASAR EL WRAPPER 
     hydro = PerfectFluid(
         eos=eos,
         spacetime_mode="dynamic",
         atmosphere=ATMOSPHERE,
-        reconstructor=base_recon,#safe_recon,
+        reconstructor=base_recon,
         riemann_solver=HLLRiemannSolver()
     )
 
@@ -689,9 +532,11 @@ def main():
     print("Solving TOV equations...")
 
     if COORDINATE_SYSTEM == "isotropic":
-        # Isotropic coordinates: use TOVSolverIso
-        solver = TOVSolverIso(K=K, Gamma=Gamma)
-        tov_solution = solver.solve(rho_central, r_max_iso=r_max, accuracy="high")
+        # Isotropic coordinates: use cached solver
+        tov_solution = load_or_solve_tov_iso(
+            K=K, Gamma=Gamma, rho_central=rho_central,
+            r_max=r_max, accuracy="high"
+        )
         print(f"TOV Solution (ISO): M={tov_solution.M_star:.6f}, R_iso={tov_solution.R_iso:.3f}, R_schw={tov_solution.R_schw:.3f}, C={tov_solution.C:.4f}\n")
     else:
         # Schwarzschild coordinates: use cached solver
