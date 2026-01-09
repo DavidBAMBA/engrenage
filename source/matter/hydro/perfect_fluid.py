@@ -9,7 +9,7 @@ from source.backgrounds.sphericalbackground import i_r
 from .valencia_reference_metric import ValenciaReferenceMetric
 from .cons2prim import Cons2PrimSolver
 from .eos import IdealGasEOS
-from .atmosphere import AtmosphereParams, create_default_atmosphere
+from .atmosphere import AtmosphereParams
 
 
 class PerfectFluid:
@@ -31,7 +31,7 @@ class PerfectFluid:
         Args:
             eos: Equation of state (default: IdealGasEOS)
             spacetime_mode: "dynamic" or "fixed" (default: "dynamic")
-            atmosphere: AtmosphereParams object or float (rho_floor). If None, uses default.
+            atmosphere: AtmosphereParams object (required for evolution)
             reconstructor: Reconstruction method (optional)
             riemann_solver: Riemann solver (optional)
         """
@@ -53,16 +53,7 @@ class PerfectFluid:
         self.eos = eos if eos is not None else IdealGasEOS()
         self.spacetime_mode = spacetime_mode
 
-        # Atmosphere configuration (centralized)
-        if atmosphere is None:
-            self.atmosphere = AtmosphereParams()  # Default
-        elif isinstance(atmosphere, (int, float)):
-            # Convenience: just specify rho_floor
-            self.atmosphere = create_default_atmosphere(rho_floor=float(atmosphere))
-        elif isinstance(atmosphere, AtmosphereParams):
-            self.atmosphere = atmosphere
-        else:
-            raise TypeError(f"atmosphere must be AtmosphereParams, float, or None, got {type(atmosphere)}")
+        self.atmosphere = atmosphere
 
         # Create cons2prim solver with centralized atmosphere
         self.cons2prim_solver = Cons2PrimSolver(
@@ -73,10 +64,7 @@ class PerfectFluid:
         )
 
         # Numerical methods for Valencia evolution
-        # Note: Boundary conditions now handled by Grid.fill_boundaries()
-        self.valencia = ValenciaReferenceMetric(
-            atmosphere=self.atmosphere  # Pass centralized atmosphere
-        )
+        self.valencia = ValenciaReferenceMetric(atmosphere=self.atmosphere)
         self.reconstructor = reconstructor
         self.riemann_solver = riemann_solver
 
@@ -85,13 +73,13 @@ class PerfectFluid:
         self.grid = None
         self.background = None
 
-        # Cache for pressure guesses (improves cons2prim performance)
+        # Cache for pressure guesses in cons2prim
         self.pressure_cache = None
 
-        # Conservative variables
-        self.D = None      # Rest mass density
-        self.Sr = None     # Radial momentum density
-        self.tau = None    # Energy density minus rest mass
+        # Conservative variables densitized
+        self.D = None      
+        self.Sr = None    
+        self.tau = None    
 
     def set_matter_vars(self, state_vector, bssn_vars: BSSNVars, grid: Grid):
         """Extract matter variables from state vector (engrenage interface)."""
@@ -131,8 +119,7 @@ class PerfectFluid:
         # Momentum abajo y tensores de esfuerzo abajo
         pref = (rho0 * h * W * W)
         emtensor.Si  = pref[:, None] * vD  # S_i with proper broadcasting
-        emtensor.Sij = pref[:, None, None] * np.einsum('xi,xj->xij', vD, vD) \
-                       + p[:, None, None] * gamma_LL  # S_ij
+        emtensor.Sij = pref[:, None, None] * np.einsum('xi,xj->xij', vD, vD) + p[:, None, None] * gamma_LL  # S_ij
 
         # Traza S = γ^{ij} S_{ij}
         emtensor.S   = np.einsum('xij,xij->x', gamma_UU, emtensor.Sij)
@@ -153,8 +140,7 @@ class PerfectFluid:
         # Valencia evolution equations
         dDdt, dSrdt, dtaudt = self.valencia.compute_rhs(
             self.D, self.Sr, self.tau,
-            rho0, vr, p,
-            W, h,
+            rho0, vr, p, W, h,
             r, bssn_vars, bssn_d1, background,
             self.spacetime_mode, self.eos, self.grid,
             self.reconstructor, self.riemann_solver
@@ -162,7 +148,7 @@ class PerfectFluid:
 
         return np.array([dDdt, dSrdt, dtaudt])
 
-    def _get_primitives(self, bssn_vars, r, grid=None):
+    def _get_primitives(self, bssn_vars, r):
         """Convert conservative to primitive variables using cons2prim module.
 
         IMPORTANT: State vector stores DENSITIZED conservatives (D̃, S̃ʳ, τ̃) where
@@ -176,11 +162,11 @@ class PerfectFluid:
 
         # Build metric for cons2prim
         # Use geometry from valencia (eliminate duplication)
-        self.valencia._extract_geometry(r, bssn_vars, self.spacetime_mode, self.background, grid)
+        self.valencia._extract_geometry(r, bssn_vars, self.spacetime_mode, self.background, self.grid)
         # Map general 3D geometry to 1D radial metric expected by cons2prim
         alpha = self.valencia.alpha
+        beta_r = self.valencia.beta_U[:, 0]  # Radial shift component
         # Get spatial components from valencia
-        beta_r = self.valencia.beta_U[:, 0]
         gamma_rr = self.valencia.gamma_LL[:, 0, 0]
 
         # Extract densitization factor: √γ = e^{6φ}
@@ -198,16 +184,24 @@ class PerfectFluid:
         p_guess = self.pressure_cache
 
         # Call cons2prim solver with PHYSICAL (non-densitized) conservatives
-        rho0, vr, p, eps, W, h, success = self.cons2prim_solver.convert(
+        # Pass e6phi, alpha, and beta_r so cons2prim returns properly densitized conservatives
+        result = self.cons2prim_solver.convert(
             D_phys, Sr_phys, tau_phys, gamma_rr,
             p_guess=p_guess,
-            apply_conservative_floors=True
+            apply_conservative_floors=True,
+            e6phi=e6phi,
+            alpha=alpha,
+            beta_r=beta_r
         )
+        rho0, vr, p, eps, W, h, success, D_new, Sr_new, tau_new = result
 
         # Update pressure cache for next timestep
         self.pressure_cache = p.copy()
 
-        # Note: Failed points are already handled by cons2prim_solver with atmosphere fallback
-        # No need for additional manual handling here
+        # Update state vector with conservatives from cons2prim
+        # (already densitized, and consistent with primitives for atmosphere points)
+        self.D[:] = D_new
+        self.Sr[:] = Sr_new
+        self.tau[:] = tau_new
 
         return rho0, vr, p, eps, W, h, success

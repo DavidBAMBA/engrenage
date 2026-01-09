@@ -50,10 +50,10 @@ class AtmosphereParams:
 
     # Primary floors
     rho_floor: float = 1e-10
-    p_floor: float = 100*(rho_floor)**2
+    p_floor: float = 100*(1e-10)**2
 
     # Velocity and Lorentz factor limits
-    v_max: float = 0.999999
+    v_max: float = 0.999
     W_max: float = 1.0e2
 
     # Conservative variable floor parameters

@@ -137,11 +137,16 @@ def plot_density_evolution(snapshots, metadata=None):
     ax.set_title('Evolución del Perfil de Densidad - TOV', fontsize=14, fontweight='bold')
     ax.grid(True, alpha=0.3, which='both')
     ax.legend(loc='best', fontsize=10, framealpha=0.9)
+    #ax.set_yscale('log')
 
     # Agregar información de parámetros si está disponible
     if metadata:
         info_text = f"K={metadata.get('K', '?')}, Γ={metadata.get('Gamma', '?')}, "
-        info_text += f"ρ_c={metadata.get('rho_central', '?'):.6f}"
+        rho_c = metadata.get('rho_central', '?')
+        if isinstance(rho_c, (int, float)):
+            info_text += f"ρ_c={rho_c:.6f}"
+        else:
+            info_text += f"ρ_c={rho_c}"
         ax.text(0.02, 0.02, info_text, transform=ax.transAxes,
                fontsize=9, verticalalignment='bottom',
                bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
@@ -189,6 +194,7 @@ def plot_latest_density(snapshots):
                 fontsize=14, fontweight='bold')
     ax.grid(True, alpha=0.3, which='both')
     ax.legend(loc='best', fontsize=11)
+    #ax.set_yscale('log')
 
     plt.tight_layout()
 
@@ -288,6 +294,8 @@ def create_density_video(snapshots, metadata=None, fps=10, max_frames=None):
     ax.set_xlabel('Radio r [M]', fontsize=14, fontweight='bold')
     ax.set_ylabel('Densidad bariónica ρ₀ [M⁻²]', fontsize=14, fontweight='bold')
     ax.grid(True, alpha=0.3, which='both')
+    
+    #ax.set_yscale('log')
 
     # Solo mostrar leyenda si hay R_star
     if R_star:

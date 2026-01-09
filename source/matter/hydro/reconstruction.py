@@ -443,33 +443,19 @@ class Reconstruction:
         return (rL, vL, pL), (rR, vR, pR)
 
     def apply_physical_limiters(self, left_tuple, right_tuple,
-                                atmosphere=None, gamma_rr=None,
-                                atmosphere_rho=None, p_floor=None, v_max=None):
+                                atmosphere, gamma_rr=None):
         """
         Apply physical floors and limits to reconstructed states.
 
         Args:
             left_tuple: (rho0_L, vr_L, p_L)
             right_tuple: (rho0_R, vr_R, p_R)
-            atmosphere: AtmosphereParams object (preferred)
+            atmosphere: AtmosphereParams object
             gamma_rr: Metric component for velocity limiting
-            atmosphere_rho, p_floor, v_max: Deprecated
 
         Returns:
             (left_limited, right_limited)
         """
-        # Handle backward compatibility
-        if atmosphere is None:
-            from source.matter.hydro.atmosphere import AtmosphereParams
-            if atmosphere_rho is not None or p_floor is not None or v_max is not None:
-                atmosphere = AtmosphereParams(
-                    rho_floor=atmosphere_rho if atmosphere_rho is not None else 1e-13,
-                    p_floor=p_floor if p_floor is not None else 1e-15,
-                    v_max=v_max if v_max is not None else 0.999
-                )
-            else:
-                atmosphere = AtmosphereParams()
-
         rho0_L, vr_L, p_L = left_tuple
         rho0_R, vr_R, p_R = right_tuple
 

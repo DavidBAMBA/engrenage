@@ -19,10 +19,9 @@ from datetime import datetime
 # Import required BSSN and Hydro components
 from source.bssn.bssnvars import BSSNVars
 from source.bssn.bssnstatevariables import (NUM_BSSN_VARS, idx_phi, idx_hrr, idx_htt, idx_hpp,
-                                             idx_K, idx_arr, idx_att, idx_app, idx_lapse)
+                                             idx_K, idx_arr, idx_att, idx_app,
+                                             idx_lambdar, idx_shiftr, idx_br, idx_lapse)
 from source.core.spacing import NUM_GHOSTS
-from source.bssn.tensoralgebra import get_bar_gamma_LL
-from source.matter.hydro.cons2prim import prim_to_cons
 
 # Get the directory where this script is located
 script_dir = os.path.dirname(os.path.abspath(__file__))
@@ -309,6 +308,233 @@ def diagnose_t0_residuals(state_2d, grid, background, hydro):
             print(f"    i={ii:5d}, r={grid.r[ii]:8.5f}, dS_r/dt={rhs_Sr[ii]: .3e}")
     else:
         print("  WARNING: could not locate interior points above threshold.")
+
+
+# =============================================================================
+# EVOLUTION FUNCTIONS
+# =============================================================================
+
+def evolve_fixed_timestep(state_initial, dt, num_steps, grid, background, hydro,
+                          bssn_fixed, bssn_d1_fixed, atmosphere, rk4_step_func,
+                          method='rk4', t_start=0.0,
+                          reference_state=None, step_offset=0, data_manager=None,
+                          snapshot_interval=None, evolution_interval=None):
+    """Evolve with fixed timestep using RK4.
+
+    Args:
+        state_initial: Initial state array
+        dt: Timestep
+        num_steps: Number of steps to evolve
+        grid: Grid object
+        background: Background spacetime
+        hydro: Hydro object
+        bssn_fixed: Fixed BSSN variables (Cowling approximation)
+        bssn_d1_fixed: Fixed BSSN derivatives
+        atmosphere: AtmosphereParams object
+        rk4_step_func: RK4 step function (callable)
+        method: Integration method (default: 'rk4')
+        t_start: Starting time for this evolution segment (default: 0.0)
+        reference_state: Reference state for error calculation (default: state_initial)
+                        Use this to maintain consistent error measurement across multiple segments
+        step_offset: Offset for step numbering in output (default: 0)
+        data_manager: SimulationDataManager object for data saving (optional)
+        snapshot_interval: Save full domain snapshot every N steps (optional)
+        evolution_interval: Save evolution data every N steps (optional)
+
+    Returns:
+        tuple: (final_state, actual_steps, actual_time, series_dict)
+    """
+    state_flat = state_initial.flatten()
+
+    # Prebuild BSSN container for primitives computation (Cowling)
+    bssn_vars_fixed = BSSNVars(grid.N)
+    bssn_vars_fixed.set_bssn_vars(bssn_fixed)
+
+    def primitives_from_state(state_flattened):
+        """Extract primitive variables from state vector.
+
+        Returns:
+            tuple: (rho0, vr, p, eps, W, h, success, state_2d)
+        """
+        s2d = state_flattened.reshape((grid.NUM_VARS, grid.N))
+        hydro.set_matter_vars(s2d, bssn_vars_fixed, grid)
+        rho0, vr, p, eps, W, h, success = hydro._get_primitives(bssn_vars_fixed, grid.r)
+        return rho0, vr, p, eps, W, h, success, s2d
+
+    # Diagnostics at start
+    rho0_prev, vr_prev, p_prev, eps_prev, W_prev, h_prev, success_prev, s_prev = primitives_from_state(state_flat)
+
+    # Store reference state for error calculation (use provided reference or current initial)
+    if reference_state is None:
+        reference_state = state_initial
+    rho0_initial, vr_initial, p_initial, eps_initial, W_initial, h_initial, success_initial, s_initial = primitives_from_state(reference_state.flatten())
+
+    # Save initial snapshot if data manager provided
+    if data_manager and data_manager.enable_saving:
+        data_manager.save_snapshot(step_offset, t_start, state_initial, rho0_initial, vr_initial, p_initial, eps_initial, W_initial, h_initial)
+        data_manager.add_evolution_point(step_offset, t_start, state_initial,
+                                        rho0_initial, vr_initial, p_initial, eps_initial, W_initial, h_initial, success_initial,
+                                        rho0_initial, vr_initial, p_initial, eps_initial, W_initial, h_initial, success_initial)
+
+    # Timeseries for mass and central density
+    times_series = [t_start]
+    Mb0 = compute_baryon_mass(grid, s_initial, rho0_initial, vr_initial, p_initial, eps_initial, W_initial, h_initial)
+    Mb_series = [Mb0]
+    rho_c0 = rho0_initial[NUM_GHOSTS]
+    rho_c_series = [rho_c0]
+
+
+    print("\n===== Evolution diagnostics (per step) =====")
+    print("Columns: step | t | ρ_central | max_Δρ/ρ@r | max_vʳ@r | max_Sʳ@r | c2p_fails")
+    print("  (@r indicates the radial position where the maximum occurs)")
+    print("-" * 140)
+
+    for step in range(num_steps):
+        # Advance one RK4 step (with well-balanced correction)
+        state_flat_next = rk4_step_func(state_flat, dt, grid, background, hydro,
+                                   bssn_fixed, bssn_d1_fixed, atmosphere)
+
+        # Compute primitives BEFORE and AFTER to measure change
+        rho0_next, vr_next, p_next, eps_next, W_next, h_next, success_next, s_next = primitives_from_state(state_flat_next)
+
+        # Interior slice (exclude ghosts)
+        interior = slice(NUM_GHOSTS, -NUM_GHOSTS)
+
+        rho_next_int = rho0_next[interior]
+        rho_init_int = rho0_initial[interior]
+        p_next_int = p_next[interior]
+        v_next_int = vr_next[interior]
+
+        D_next = s_next[NUM_BSSN_VARS + 0, interior]
+        Sr_next = s_next[NUM_BSSN_VARS + 1, interior]
+        tau_next = s_next[NUM_BSSN_VARS + 2, interior]
+
+        # Compute more informative stats
+        rho_central = float(rho0_next[NUM_GHOSTS])  # Central density
+
+        # Grid radii (interior only, matching slicing above)
+        r_interior = grid.r[interior]
+
+        # Maximum relative density error vs initial state
+        rel_rho_err = np.abs(rho_next_int - rho_init_int) / (np.abs(rho_init_int) + 1e-20)
+        idx_max_rho_err = np.argmax(rel_rho_err)
+        max_rel_rho_err = float(rel_rho_err[idx_max_rho_err])
+        r_max_rho_err = float(r_interior[idx_max_rho_err])
+
+        # Maximum velocity
+        idx_max_v = np.argmax(np.abs(v_next_int))
+        max_abs_v = float(v_next_int[idx_max_v])
+        r_max_v = float(r_interior[idx_max_v])
+
+        # Maximum conserved variables (more useful than minimum)
+        idx_max_D = np.argmax(D_next)
+        max_D = float(D_next[idx_max_D])
+        r_max_D = float(r_interior[idx_max_D])
+
+        idx_max_Sr = np.argmax(np.abs(Sr_next))
+        max_Sr = float(np.abs(Sr_next[idx_max_Sr]))
+        r_max_Sr = float(r_interior[idx_max_Sr])
+
+        idx_max_tau = np.argmax(np.abs(tau_next))
+        max_tau = float(np.abs(tau_next[idx_max_tau]))
+        r_max_tau = float(r_interior[idx_max_tau])
+
+        # Cons2prim failures
+        c2p_fail_count = int(np.sum(~success_next))
+
+        t_curr = t_start + (step + 1) * dt
+        step_num = step_offset + step + 1
+        if step_num % 200 == 0:
+            print(f"step {step_num:4d}  t={t_curr:.2e}:  ρ_c={rho_central:.6e}  max_Δρ/ρ={max_rel_rho_err:.2e}@r={r_max_rho_err:.2f}  "
+              f"max_vʳ={max_abs_v:.3e}@r={r_max_v:.2f}  max_Sʳ={max_Sr:.2e}@r={r_max_Sr:.2f}  "
+              f"c2p_fail={c2p_fail_count}")
+
+        # Save data if requested
+        if data_manager and data_manager.enable_saving:
+            # Save evolution data at specified interval
+            if evolution_interval and step_num % evolution_interval == 0:
+                data_manager.add_evolution_point(step_num, t_curr, s_next,
+                                                rho0_next, vr_next, p_next, eps_next, W_next, h_next, success_next,
+                                                rho0_initial, vr_initial, p_initial, eps_initial, W_initial, h_initial, success_initial)
+
+                # Periodic buffer flush
+                if step_num % (evolution_interval * 10) == 0:
+                    data_manager.flush_evolution_buffer()
+
+            # Save full snapshot at specified interval
+            if snapshot_interval and step_num % snapshot_interval == 0:
+                data_manager.save_snapshot(step_num, t_curr, s_next, rho0_next, vr_next, p_next, eps_next, W_next, h_next)
+
+        # Append to time series (mass and central density)
+        Mb_next = compute_baryon_mass(grid, s_next, rho0_next, vr_next, p_next, eps_next, W_next, h_next)
+        times_series.append(t_curr)
+        Mb_series.append(Mb_next)
+        rho_c_series.append(float(rho0_next[NUM_GHOSTS]))
+
+        # Detect first signs of instability / non-physical values
+        issues = []
+        if not np.all(np.isfinite(rho0_next)) or not np.all(np.isfinite(p_next)):
+            issues.append("NaN/Inf in primitives")
+        if np.any(rho0_next < 0):
+            issues.append("negative rho0")
+        if np.any(p_next < 0):
+            issues.append("negative pressure")
+        if np.any(np.abs(vr_next) >= 1.0):
+            issues.append("superluminal v")
+        if np.any(D_next < 0):
+            issues.append("negative D")
+        if np.any((tau_next + D_next) < 0):
+            issues.append("tau + D < 0")
+
+        # If problems detected, print focused context (location and local values)
+        if issues:
+            print("  -> Detected issues:", ", ".join(issues))
+            # Locate worst offenders
+            try:
+                idx_v = NUM_GHOSTS + int(np.argmax(np.abs(vr_next[interior])))
+            except Exception:
+                idx_v = NUM_GHOSTS
+            try:
+                idx_rho_min = NUM_GHOSTS + int(np.argmin(rho0_next[interior]))
+            except Exception:
+                idx_rho_min = NUM_GHOSTS
+            try:
+                idx_tauD_min = NUM_GHOSTS + int(np.argmin((s_next[NUM_BSSN_VARS+2, interior] + s_next[NUM_BSSN_VARS+0, interior])))
+            except Exception:
+                idx_tauD_min = NUM_GHOSTS
+
+            idxs = sorted(set([idx_v, idx_rho_min, idx_tauD_min]))
+            for ii in idxs:
+                rloc = grid.r[ii]
+                print(f"     at r={rloc:.6f} (i={ii}): "
+                      f"rho0={rho0_next[ii]:.6e}, P={p_next[ii]:.6e}, vr={vr_next[ii]:.6e}, "
+                      f"D={s_next[NUM_BSSN_VARS+0, ii]:.6e}, Sr={s_next[NUM_BSSN_VARS+1, ii]:.6e}, tau={s_next[NUM_BSSN_VARS+2, ii]:.6e}")
+
+            # Stop early so we can inspect before blow-up cascades
+            print("  -> Halting evolution early due to detected instability.")
+            state_flat = state_flat_next  # return the last state
+            actual_steps = step + 1
+            actual_time = t_start + actual_steps * dt
+            return state_flat.reshape((grid.NUM_VARS, grid.N)), actual_steps, actual_time, {
+                't': np.array(times_series),
+                'Mb': np.array(Mb_series),
+                'rho_c': np.array(rho_c_series),
+            }
+
+        # Prepare next step
+        state_flat = state_flat_next
+
+
+    # Final flush of buffers if data manager is provided
+    if data_manager and data_manager.enable_saving:
+        data_manager.flush_evolution_buffer()
+
+    actual_time = t_start + num_steps * dt
+    return state_flat.reshape((grid.NUM_VARS, grid.N)), num_steps, actual_time, {
+        't': np.array(times_series),
+        'Mb': np.array(Mb_series),
+        'rho_c': np.array(rho_c_series),
+    }
 
 
 # =============================================================================
@@ -684,59 +910,68 @@ def plot_surface_zoom(tov_solution, state_t0, state_t1, grid, hydro, primitives_
 
 
 def plot_bssn_evolution(state_t0, state_tfinal, grid, t_0=0.0, t_final=1.0, suffix=""):
-    """Plot BSSN variables at t=0 vs t=final to verify Cowling approximation."""
+    """Plot BSSN variables at t=0 vs t=final to verify Cowling approximation.
+
+    Uses proper BSSN variable indices:
+    - idx_phi = 0: conformal factor
+    - idx_hrr = 1: metric deviation h_rr
+    - idx_K = 4: mean curvature
+    - idx_shiftr = 9: shift beta^r
+    - idx_br = 10: B^r auxiliary
+    - idx_lapse = 11: lapse alpha
+    """
     r = grid.r
 
     fig, axes = plt.subplots(2, 3, figsize=(16, 10))
 
-    # phi
-    axes[0, 0].plot(r, state_t0[0, :], 'b-', label='t=0', linewidth=1.5)
-    axes[0, 0].plot(r, state_tfinal[0, :], 'r--', label=f't={t_final}', linewidth=1.5)
+    # phi (conformal factor)
+    axes[0, 0].plot(r, state_t0[idx_phi, :], 'b-', label='t=0', linewidth=1.5)
+    axes[0, 0].plot(r, state_tfinal[idx_phi, :], 'r--', label=f't={t_final}', linewidth=1.5)
     axes[0, 0].set_xlabel('r')
     axes[0, 0].set_ylabel(r'$\phi$')
     axes[0, 0].set_title('Conformal Factor φ')
     axes[0, 0].legend()
     axes[0, 0].grid(True, alpha=0.3)
 
-    # a
-    axes[0, 1].plot(r, state_t0[1, :], 'b-', label='t=0', linewidth=1.5)
-    axes[0, 1].plot(r, state_tfinal[1, :], 'r--', label=f't={t_final}', linewidth=1.5)
+    # h_rr (metric deviation)
+    axes[0, 1].plot(r, state_t0[idx_hrr, :], 'b-', label='t=0', linewidth=1.5)
+    axes[0, 1].plot(r, state_tfinal[idx_hrr, :], 'r--', label=f't={t_final}', linewidth=1.5)
     axes[0, 1].set_xlabel('r')
-    axes[0, 1].set_ylabel('a')
-    axes[0, 1].set_title('Metric Function a')
+    axes[0, 1].set_ylabel(r'$h_{rr}$')
+    axes[0, 1].set_title('Metric Deviation h_rr')
     axes[0, 1].legend()
     axes[0, 1].grid(True, alpha=0.3)
 
-    # alpha
-    axes[0, 2].plot(r, state_t0[2, :], 'b-', label='t=0', linewidth=1.5)
-    axes[0, 2].plot(r, state_tfinal[2, :], 'r--', label=f't={t_final}', linewidth=1.5)
+    # alpha (lapse) - CORRECTED: use idx_lapse
+    axes[0, 2].plot(r, state_t0[idx_lapse, :], 'b-', label='t=0', linewidth=1.5)
+    axes[0, 2].plot(r, state_tfinal[idx_lapse, :], 'r--', label=f't={t_final}', linewidth=1.5)
     axes[0, 2].set_xlabel('r')
     axes[0, 2].set_ylabel(r'$\alpha$')
     axes[0, 2].set_title('Lapse α')
     axes[0, 2].legend()
     axes[0, 2].grid(True, alpha=0.3)
 
-    # betaR
-    axes[1, 0].plot(r, state_t0[3, :], 'b-', label='t=0', linewidth=1.5)
-    axes[1, 0].plot(r, state_tfinal[3, :], 'r--', label=f't={t_final}', linewidth=1.5)
+    # beta^r (shift) - CORRECTED: use idx_shiftr
+    axes[1, 0].plot(r, state_t0[idx_shiftr, :], 'b-', label='t=0', linewidth=1.5)
+    axes[1, 0].plot(r, state_tfinal[idx_shiftr, :], 'r--', label=f't={t_final}', linewidth=1.5)
     axes[1, 0].set_xlabel('r')
     axes[1, 0].set_ylabel(r'$\beta^r$')
     axes[1, 0].set_title('Shift βʳ')
     axes[1, 0].legend()
     axes[1, 0].grid(True, alpha=0.3)
 
-    # Br
-    axes[1, 1].plot(r, state_t0[4, :], 'b-', label='t=0', linewidth=1.5)
-    axes[1, 1].plot(r, state_tfinal[4, :], 'r--', label=f't={t_final}', linewidth=1.5)
+    # B^r (shift auxiliary) - CORRECTED: use idx_br
+    axes[1, 1].plot(r, state_t0[idx_br, :], 'b-', label='t=0', linewidth=1.5)
+    axes[1, 1].plot(r, state_tfinal[idx_br, :], 'r--', label=f't={t_final}', linewidth=1.5)
     axes[1, 1].set_xlabel('r')
     axes[1, 1].set_ylabel(r'$B^r$')
     axes[1, 1].set_title('Shift Auxiliary Bʳ')
     axes[1, 1].legend()
     axes[1, 1].grid(True, alpha=0.3)
 
-    # K
-    axes[1, 2].plot(r, state_t0[5, :], 'b-', label='t=0', linewidth=1.5)
-    axes[1, 2].plot(r, state_tfinal[5, :], 'r--', label=f't={t_final}', linewidth=1.5)
+    # K (mean curvature) - CORRECTED: use idx_K
+    axes[1, 2].plot(r, state_t0[idx_K, :], 'b-', label='t=0', linewidth=1.5)
+    axes[1, 2].plot(r, state_tfinal[idx_K, :], 'r--', label=f't={t_final}', linewidth=1.5)
     axes[1, 2].set_xlabel('r')
     axes[1, 2].set_ylabel('K')
     axes[1, 2].set_title('Extrinsic Curvature K')
@@ -785,7 +1020,7 @@ def plot_mass_and_central_density(times, Mb_series, rho_c_series, suffix=""):
 
 
 def plot_evolution(states, times, grid, hydro, rho_ref, p_ref,
-                   Mb_series=None, rho_c_series=None, suffix=""):
+                   Mb_series=None, rho_c_series=None, suffix="", R_star=None):
     """Plot evolution at multiple checkpoints with 3-checkpoint structure.
 
     Args:
@@ -798,6 +1033,7 @@ def plot_evolution(states, times, grid, hydro, rho_ref, p_ref,
         Mb_series: Optional time series of baryon mass
         rho_c_series: Optional time series of central density
         suffix: Suffix for output filename
+        R_star: Optional stellar radius for vertical line marker
     """
     n_states = len(states)
     r = grid.r
@@ -821,9 +1057,12 @@ def plot_evolution(states, times, grid, hydro, rho_ref, p_ref,
     for i, (prim, t) in enumerate(zip(primitives, times)):
         ax1.plot(r[interior], prim[0][interior], color=colors[i],
                 label=f't={t:.2f}', linewidth=1.5)
+    if R_star is not None:
+        ax1.axvline(R_star, color='gray', linestyle=':', alpha=0.7, label=f'R={R_star:.2f}')
     ax1.set_xlabel('r')
     ax1.set_ylabel(r'$\rho_0$')
     ax1.set_title('Baryon Density Evolution')
+    ax1.set_yscale('log')
     ax1.legend(loc='upper right')
     ax1.grid(True, alpha=0.3)
 
@@ -832,9 +1071,12 @@ def plot_evolution(states, times, grid, hydro, rho_ref, p_ref,
     for i, (prim, t) in enumerate(zip(primitives, times)):
         ax2.plot(r[interior], prim[2][interior], color=colors[i],
                 label=f't={t:.2f}', linewidth=1.5)
+    if R_star is not None:
+        ax2.axvline(R_star, color='gray', linestyle=':', alpha=0.7, label=f'R={R_star:.2f}')
     ax2.set_xlabel('r')
     ax2.set_ylabel('P')
     ax2.set_title('Pressure Evolution')
+    ax2.set_yscale('log')
     ax2.legend(loc='upper right')
     ax2.grid(True, alpha=0.3)
 
@@ -843,6 +1085,8 @@ def plot_evolution(states, times, grid, hydro, rho_ref, p_ref,
     for i, (prim, t) in enumerate(zip(primitives, times)):
         ax3.plot(r[interior], prim[1][interior], color=colors[i],
                 label=f't={t:.2f}', linewidth=1.5)
+    if R_star is not None:
+        ax3.axvline(R_star, color='gray', linestyle=':', alpha=0.7, label=f'R={R_star:.2f}')
     ax3.set_xlabel('r')
     ax3.set_ylabel(r'$v^r$')
     ax3.set_title('Radial Velocity Evolution')
@@ -858,6 +1102,8 @@ def plot_evolution(states, times, grid, hydro, rho_ref, p_ref,
         rel_error = delta_rho / (np.abs(rho_ref[interior]) + 1e-20)
         ax4.semilogy(r[interior], rel_error + 1e-20, color=colors[i],
                     label=f't={t:.2f}', linewidth=1.5)
+    if R_star is not None:
+        ax4.axvline(R_star, color='gray', linestyle=':', alpha=0.7, label=f'R={R_star:.2f}')
     ax4.set_xlabel('r')
     ax4.set_ylabel(r'$|\Delta\rho|/\rho_0$')
     ax4.set_title('Relative Density Error')
@@ -893,7 +1139,8 @@ def plot_evolution(states, times, grid, hydro, rho_ref, p_ref,
     plt.tight_layout()
     out_path = os.path.join(plots_dir, f'tov_evolution{suffix}.png')
     plt.savefig(out_path, dpi=150, bbox_inches='tight')
-    plt.close(fig)
+    #plt.close(fig)
+    plt.show()
     print(f"Saved: {out_path}")
 
 
@@ -1028,3 +1275,128 @@ def plot_tov_vs_initial_data_zoom(tov_solution, initial_state_2d, grid, primitiv
     plt.savefig(out_path, dpi=150, bbox_inches='tight')
     plt.close(fig)
     print(f"Saved: {out_path}")
+
+
+def create_center_zoom_video(snapshot_file, output_path=None, window=0.5, fps=10, suffix=""):
+    """Create a video/gif of the center zoom evolution from HDF5 snapshots.
+
+    This function reads snapshots from an HDF5 file and creates an animated
+    visualization showing the evolution of primitives and conservatives near
+    the center (including ghost cells).
+
+    Args:
+        snapshot_file: Path to HDF5 snapshot file
+        output_path: Output path for the video. If None, uses default in plots_dir
+        window: Maximum radius to show (default 0.5)
+        fps: Frames per second for the video (default 10)
+        suffix: Suffix for output filename
+    """
+    import matplotlib.animation as animation
+
+    with h5py.File(snapshot_file, 'r') as f:
+        r = f['grid/r'][:]
+        snapshots = sorted(f['snapshots'].keys())
+        n_frames = len(snapshots)
+
+        if n_frames < 2:
+            print("Not enough snapshots to create video")
+            return
+
+        # Read initial state (t=0) for reference
+        snap0 = f['snapshots'][snapshots[0]]
+        rho0_ref = snap0['primitives/rho0'][:]
+        p_ref = snap0['primitives/p'][:]
+        vr_ref = snap0['primitives/vr'][:]
+        D_ref = snap0['conservatives/D'][:]
+        Sr_ref = snap0['conservatives/Sr'][:]
+        tau_ref = snap0['conservatives/tau'][:]
+
+        # Pre-load all data
+        times, steps = [], []
+        rho0_all, p_all, vr_all = [], [], []
+        D_all, Sr_all, tau_all = [], [], []
+
+        for snap_name in snapshots:
+            snap = f['snapshots'][snap_name]
+            times.append(snap.attrs['time'])
+            steps.append(snap.attrs['step'])
+            rho0_all.append(snap['primitives/rho0'][:])
+            p_all.append(snap['primitives/p'][:])
+            vr_all.append(snap['primitives/vr'][:])
+            D_all.append(snap['conservatives/D'][:])
+            Sr_all.append(snap['conservatives/Sr'][:])
+            tau_all.append(snap['conservatives/tau'][:])
+
+    # Mask for window (including ghost cells)
+    mask = r <= window
+
+    # Set up figure
+    fig, axes = plt.subplots(2, 3, figsize=(16, 10))
+    lines_curr = []
+
+    # Row 1: Primitives
+    axes[0, 0].plot(r[mask], rho0_ref[mask], 'b-', label='t=0', linewidth=1.5)
+    l, = axes[0, 0].plot(r[mask], rho0_ref[mask], 'r--', label='t=?', linewidth=1.5)
+    axes[0, 0].set_xlabel('r'); axes[0, 0].set_ylabel(r'$\rho_0$')
+    axes[0, 0].set_title('Baryon Density (center)'); axes[0, 0].legend(); axes[0, 0].grid(True, alpha=0.3)
+    lines_curr.append(l)
+
+    axes[0, 1].plot(r[mask], p_ref[mask], 'b-', label='t=0', linewidth=1.5)
+    l, = axes[0, 1].plot(r[mask], p_ref[mask], 'r--', label='t=?', linewidth=1.5)
+    axes[0, 1].set_xlabel('r'); axes[0, 1].set_ylabel('P')
+    axes[0, 1].set_title('Pressure (center)'); axes[0, 1].legend(); axes[0, 1].grid(True, alpha=0.3)
+    lines_curr.append(l)
+
+    axes[0, 2].plot(r[mask], vr_ref[mask], 'b-', label='t=0', linewidth=1.5)
+    l, = axes[0, 2].plot(r[mask], vr_ref[mask], 'r--', label='t=?', linewidth=1.5)
+    axes[0, 2].set_xlabel('r'); axes[0, 2].set_ylabel(r'$v^r$')
+    axes[0, 2].set_title('Radial Velocity (center)'); axes[0, 2].legend(); axes[0, 2].grid(True, alpha=0.3)
+    lines_curr.append(l)
+
+    # Row 2: Conservatives
+    axes[1, 0].plot(r[mask], D_ref[mask], 'b-', label='t=0', linewidth=1.5)
+    l, = axes[1, 0].plot(r[mask], D_ref[mask], 'r--', label='t=?', linewidth=1.5)
+    axes[1, 0].set_xlabel('r'); axes[1, 0].set_ylabel('D')
+    axes[1, 0].set_title('Conserved D (center)'); axes[1, 0].legend(); axes[1, 0].grid(True, alpha=0.3)
+    lines_curr.append(l)
+
+    axes[1, 1].plot(r[mask], Sr_ref[mask], 'b-', label='t=0', linewidth=1.5)
+    l, = axes[1, 1].plot(r[mask], Sr_ref[mask], 'r--', label='t=?', linewidth=1.5)
+    axes[1, 1].set_xlabel('r'); axes[1, 1].set_ylabel(r'$S_r$')
+    axes[1, 1].set_title('Conserved Sr (center)'); axes[1, 1].legend(); axes[1, 1].grid(True, alpha=0.3)
+    lines_curr.append(l)
+
+    axes[1, 2].plot(r[mask], tau_ref[mask], 'b-', label='t=0', linewidth=1.5)
+    l, = axes[1, 2].plot(r[mask], tau_ref[mask], 'r--', label='t=?', linewidth=1.5)
+    axes[1, 2].set_xlabel('r'); axes[1, 2].set_ylabel(r'$\tau$')
+    axes[1, 2].set_title('Conserved tau (center)'); axes[1, 2].legend(); axes[1, 2].grid(True, alpha=0.3)
+    lines_curr.append(l)
+
+    title = fig.suptitle(f'Center Zoom: r ∈ [0, {window}]  |  t=0.00, step=0', fontsize=14)
+    plt.tight_layout()
+
+    def animate(frame):
+        t, step = times[frame], steps[frame]
+        data = [rho0_all[frame], p_all[frame], vr_all[frame],
+                D_all[frame], Sr_all[frame], tau_all[frame]]
+        for i, line in enumerate(lines_curr):
+            line.set_ydata(data[i][mask])
+            line.set_label(f't={t:.2f}')
+        for ax in axes.flatten():
+            ax.legend()
+            ax.relim()
+            ax.autoscale_view()
+        title.set_text(f'Center Zoom: r ∈ [0, {window}]  |  t={t:.2f}, step={step}')
+        return lines_curr
+
+    anim = animation.FuncAnimation(fig, animate, frames=n_frames, interval=1000//fps, blit=False)
+
+    if output_path is None:
+        output_path = os.path.join(plots_dir, f'tov_center_zoom_evolution{suffix}.gif')
+
+    print(f"Creating animation with {n_frames} frames...")
+    writer = 'pillow' if output_path.endswith('.gif') else 'ffmpeg'
+    anim.save(output_path, writer=writer, fps=fps)
+    plt.close(fig)
+    print(f"Saved: {output_path}")
+    return output_path

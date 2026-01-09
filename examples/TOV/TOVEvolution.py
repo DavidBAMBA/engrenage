@@ -19,6 +19,10 @@ from source.backgrounds.sphericalbackground import FlatSphericalBackground
 from source.bssn.bssnvars import BSSNVars
 from source.bssn.bssnstatevariables import NUM_BSSN_VARS
 from source.bssn.tensoralgebra import get_bar_gamma_LL
+from source.bssn.constraintsdiagnostic import get_constraints_diagnostic
+
+# Full BSSN+Hydro RHS (for dynamic mode)
+from source.core.rhsevolution import get_rhs
 
 # Hydro
 from source.matter.hydro.perfect_fluid import PerfectFluid
@@ -39,7 +43,7 @@ import examples.TOV.tov_initial_data_interpolated_iso as tov_id_iso
 
 # TOV utilities and plotting
 import examples.TOV.utils_TOVEvolution as utils
-from examples.TOV.utils_TOVEvolution import SimulationDataManager
+from examples.TOV.utils_TOVEvolution import SimulationDataManager, evolve_fixed_timestep
 from examples.TOV.plot_TOVEvolution import compute_qnm_spectrum, extract_decay_rate
 
 
@@ -66,6 +70,17 @@ def get_rhs_cowling(t, y, grid, background, hydro, bssn_fixed, bssn_d1_fixed):
     return rhs.flatten()
 
 
+def get_rhs_dynamic(t, y, grid, background, hydro, progress_bar=None, time_state=None):
+    """
+    RHS for full BSSN + hydro evolution (no Cowling approximation).
+
+    Both spacetime (BSSN) and matter (hydro) variables evolve together.
+    Uses 1+log slicing for lapse and gamma-driver for shift.
+    """
+    # Call the full RHS from rhsevolution.py
+    return get_rhs(t, y, grid, background, hydro, progress_bar, time_state)
+
+
 def _apply_atmosphere_reset(state_2d, grid, hydro, atmosphere, rho_threshold=None):
     """
     Aplica floors atmosféricos y correcciones a variables conservativas.
@@ -74,6 +89,7 @@ def _apply_atmosphere_reset(state_2d, grid, hydro, atmosphere, rho_threshold=Non
 
     # Definir umbral para reset atmosférico
     if rho_threshold is None:
+        #print("Warning: Using default hard floor factor of 10.0 for atmosphere reset.")
         rho_hard_floor = 10.0 * atmosphere.rho_floor
 
     # Indices de variables conservativas
@@ -100,7 +116,7 @@ def _apply_atmosphere_reset(state_2d, grid, hydro, atmosphere, rho_threshold=Non
     if np.all(atm_mask):
         return state_2d
 
-    # --- STANDARD FLOORS (Illinois Strategy) ---
+    # --- STANDARD FLOORS  ---
     # Solo para el interior de la estrella donde la densidad es alta
     non_atm_mask = ~atm_mask
 
@@ -151,7 +167,7 @@ def _apply_atmosphere_reset(state_2d, grid, hydro, atmosphere, rho_threshold=Non
     if np.any(needs_recompute):
         D_new, Sr_new, tau_new = prim_to_cons(
             rho0_floor, vr_floor, p_floor, gamma_rr, hydro.eos, 
-            e6phi=np.exp(6.0*phi), alpha=bssn_vars.lapse
+            e6phi=np.exp(6.0*phi), alpha=bssn_vars.lapse, beta_r=bssn_vars.shift_r
         )
         state_2d[idx_D, needs_recompute] = D_new[needs_recompute]
         state_2d[idx_Sr, needs_recompute] = Sr_new[needs_recompute]
@@ -179,7 +195,6 @@ def rk4_step(state_flat, dt, grid, background, hydro, bssn_fixed, bssn_d1_fixed,
     # --- Stage 2 ---
     state_2 = state_flat + 0.5 * dt * k1
     s2 = state_2.reshape((grid.NUM_VARS, grid.N))
-    # APLICAR FLOOR AQUI
     #s2 = _apply_atmosphere_reset(s2, grid, hydro, atmosphere)
     state_2 = s2.flatten()
 
@@ -188,8 +203,6 @@ def rk4_step(state_flat, dt, grid, background, hydro, bssn_fixed, bssn_d1_fixed,
     # --- Stage 3 ---
     state_3 = state_flat + 0.5 * dt * k2
     s3 = state_3.reshape((grid.NUM_VARS, grid.N))
-    # APLICAR FLOOR AQUI
-    #s3 = _apply_atmosphere_reset(s3, grid, hydro, atmosphere)
     state_3 = s3.flatten()
 
     k3 = get_rhs_cowling(0, state_3, grid, background, hydro, bssn_fixed, bssn_d1_fixed)
@@ -197,8 +210,6 @@ def rk4_step(state_flat, dt, grid, background, hydro, bssn_fixed, bssn_d1_fixed,
     # --- Stage 4 ---
     state_4 = state_flat + dt * k3
     s4 = state_4.reshape((grid.NUM_VARS, grid.N))
-    # APLICAR FLOOR AQUI
-    #s4 = _apply_atmosphere_reset(s4, grid, hydro, atmosphere)
     state_4 = s4.flatten()
 
     k4 = get_rhs_cowling(0, state_4, grid, background, hydro, bssn_fixed, bssn_d1_fixed)
@@ -213,230 +224,49 @@ def rk4_step(state_flat, dt, grid, background, hydro, bssn_fixed, bssn_d1_fixed,
     return snew_reset.flatten()
 
 
-def evolve_fixed_timestep(state_initial, dt, num_steps, grid, background, hydro,
-                          bssn_fixed, bssn_d1_fixed, atmosphere, method='rk4', t_start=0.0,
-                          reference_state=None, step_offset=0, data_manager=None,
-                          snapshot_interval=None, evolution_interval=None):
-    """Evolve with fixed timestep using RK4.
-
-    Args:
-        atmosphere: AtmosphereParams object
-        t_start: Starting time for this evolution segment (default: 0.0)
-        reference_state: Reference state for error calculation (default: state_initial)
-                        Use this to maintain consistent error measurement across multiple segments
-        step_offset: Offset for step numbering in output (default: 0)
-        data_manager: SimulationDataManager object for data saving (optional)
-        snapshot_interval: Save full domain snapshot every N steps (optional)
-        evolution_interval: Save evolution data every N steps (optional)
+def rk4_step_dynamic(state_flat, dt, grid, background, hydro, atmosphere,
+                     progress_bar=None, time_state=None):
     """
-    state_flat = state_initial.flatten()
+    Single RK4 timestep for full BSSN + hydro evolution.
+    Atmosphere reset applied after full step.
+    """
+    # --- Stage 1 ---
+    k1 = get_rhs_dynamic(0, state_flat, grid, background, hydro, progress_bar, time_state)
 
-    # Prebuild BSSN container for primitives computation (Cowling)
-    bssn_vars_fixed = BSSNVars(grid.N)
-    bssn_vars_fixed.set_bssn_vars(bssn_fixed)
+    # --- Stage 2 ---
+    state_2 = state_flat + 0.5 * dt * k1
+    k2 = get_rhs_dynamic(0, state_2, grid, background, hydro, progress_bar, time_state)
 
-    def primitives_from_state(state_flattened):
-        """Extract primitive variables from state vector.
+    # --- Stage 3 ---
+    state_3 = state_flat + 0.5 * dt * k2
+    k3 = get_rhs_dynamic(0, state_3, grid, background, hydro, progress_bar, time_state)
 
-        Returns:
-            tuple: (rho0, vr, p, eps, W, h, success, state_2d)
-        """
-        s2d = state_flattened.reshape((grid.NUM_VARS, grid.N))
-        hydro.set_matter_vars(s2d, bssn_vars_fixed, grid)
-        rho0, vr, p, eps, W, h, success = hydro._get_primitives(bssn_vars_fixed, grid.r)
-        return rho0, vr, p, eps, W, h, success, s2d
+    # --- Stage 4 ---
+    state_4 = state_flat + dt * k3
+    k4 = get_rhs_dynamic(0, state_4, grid, background, hydro, progress_bar, time_state)
 
-    # Diagnostics at start
-    rho0_prev, vr_prev, p_prev, eps_prev, W_prev, h_prev, success_prev, s_prev = primitives_from_state(state_flat)
+    # --- Combine ---
+    state_new = state_flat + (dt / 6.0) * (k1 + 2*k2 + 2*k3 + k4)
+    snew = state_new.reshape((grid.NUM_VARS, grid.N))
 
-    # Store reference state for error calculation (use provided reference or current initial)
-    if reference_state is None:
-        reference_state = state_initial
-    rho0_initial, vr_initial, p_initial, eps_initial, W_initial, h_initial, success_initial, s_initial = primitives_from_state(reference_state.flatten())
+    # Apply atmosphere reset after full step
+    snew_reset = _apply_atmosphere_reset(snew, grid, hydro, atmosphere)
 
-    # Save initial snapshot if data manager provided
-    if data_manager and data_manager.enable_saving:
-        data_manager.save_snapshot(step_offset, t_start, state_initial, rho0_initial, vr_initial, p_initial, eps_initial, W_initial, h_initial)
-        data_manager.add_evolution_point(step_offset, t_start, state_initial,
-                                        rho0_initial, vr_initial, p_initial, eps_initial, W_initial, h_initial, success_initial,
-                                        rho0_initial, vr_initial, p_initial, eps_initial, W_initial, h_initial, success_initial)
-
-    # Timeseries for mass and central density
-    times_series = [t_start]
-    Mb0 = utils.compute_baryon_mass(grid, s_initial, rho0_initial, vr_initial, p_initial, eps_initial, W_initial, h_initial)
-    Mb_series = [Mb0]
-    rho_c0 = rho0_initial[NUM_GHOSTS]
-    rho_c_series = [rho_c0]
-
-
-    print("\n===== Evolution diagnostics (per step) =====")
-    print("Columns: step | t | ρ_central | max_Δρ/ρ@r | max_vʳ@r | max_D@r | max_Sʳ@r | c2p_fails")
-    print("  (@r indicates the radial position where the maximum occurs)")
-    print("-" * 140)
-
-    for step in range(num_steps):
-        # Advance one RK4 step (with well-balanced correction)
-        state_flat_next = rk4_step(state_flat, dt, grid, background, hydro,
-                                   bssn_fixed, bssn_d1_fixed, atmosphere)
-
-        # Compute primitives BEFORE and AFTER to measure change
-        rho0_next, vr_next, p_next, eps_next, W_next, h_next, success_next, s_next = primitives_from_state(state_flat_next)
-
-        # Interior slice (exclude ghosts)
-        interior = slice(NUM_GHOSTS, -NUM_GHOSTS)
-
-        rho_next_int = rho0_next[interior]
-        rho_init_int = rho0_initial[interior]
-        p_next_int = p_next[interior]
-        v_next_int = vr_next[interior]
-
-        D_next = s_next[NUM_BSSN_VARS + 0, interior]
-        Sr_next = s_next[NUM_BSSN_VARS + 1, interior]
-        tau_next = s_next[NUM_BSSN_VARS + 2, interior]
-
-        # Compute more informative stats
-        rho_central = float(rho0_next[NUM_GHOSTS])  # Central density
-
-        # Grid radii (interior only, matching slicing above)
-        r_interior = grid.r[interior]
-
-        # Maximum relative density error vs initial state
-        rel_rho_err = np.abs(rho_next_int - rho_init_int) / (np.abs(rho_init_int) + 1e-20)
-        idx_max_rho_err = np.argmax(rel_rho_err)
-        max_rel_rho_err = float(rel_rho_err[idx_max_rho_err])
-        r_max_rho_err = float(r_interior[idx_max_rho_err])
-
-        # Maximum velocity
-        idx_max_v = np.argmax(np.abs(v_next_int))
-        max_abs_v = float(np.abs(v_next_int[idx_max_v]))
-        r_max_v = float(r_interior[idx_max_v])
-
-        # Maximum conserved variables (more useful than minimum)
-        idx_max_D = np.argmax(D_next)
-        max_D = float(D_next[idx_max_D])
-        r_max_D = float(r_interior[idx_max_D])
-
-        idx_max_Sr = np.argmax(np.abs(Sr_next))
-        max_Sr = float(np.abs(Sr_next[idx_max_Sr]))
-        r_max_Sr = float(r_interior[idx_max_Sr])
-
-        idx_max_tau = np.argmax(np.abs(tau_next))
-        max_tau = float(np.abs(tau_next[idx_max_tau]))
-        r_max_tau = float(r_interior[idx_max_tau])
-
-        # Cons2prim failures
-        c2p_fail_count = int(np.sum(~success_next))
-
-        t_curr = t_start + (step + 1) * dt
-        step_num = step_offset + step + 1
-        if step_num % 200 == 0:
-            print(f"step {step_num:4d}  t={t_curr:.2e}:  ρ_c={rho_central:.6e}  max_Δρ/ρ={max_rel_rho_err:.2e}@r={r_max_rho_err:.2f}  "
-              f"max_vʳ={max_abs_v:.3e}@r={r_max_v:.2f}  max_D={max_D:.2e}@r={r_max_D:.2f}  max_Sʳ={max_Sr:.2e}@r={r_max_Sr:.2f}  "
-              f"c2p_fail={c2p_fail_count}")
-
-        # Save data if requested
-        if data_manager and data_manager.enable_saving:
-            # Save evolution data at specified interval
-            if evolution_interval and step_num % evolution_interval == 0:
-                data_manager.add_evolution_point(step_num, t_curr, s_next,
-                                                rho0_next, vr_next, p_next, eps_next, W_next, h_next, success_next,
-                                                rho0_initial, vr_initial, p_initial, eps_initial, W_initial, h_initial, success_initial)
-
-                # Periodic buffer flush
-                if step_num % (evolution_interval * 10) == 0:
-                    data_manager.flush_evolution_buffer()
-
-            # Save full snapshot at specified interval
-            if snapshot_interval and step_num % snapshot_interval == 0:
-                data_manager.save_snapshot(step_num, t_curr, s_next, rho0_next, vr_next, p_next, eps_next, W_next, h_next)
-
-        # Append to time series (mass and central density)
-        Mb_next = utils.compute_baryon_mass(grid, s_next, rho0_next, vr_next, p_next, eps_next, W_next, h_next)
-        times_series.append(t_curr)
-        Mb_series.append(Mb_next)
-        rho_c_series.append(float(rho0_next[NUM_GHOSTS]))
-
-        # Detect first signs of instability / non-physical values
-        issues = []
-        if not np.all(np.isfinite(rho0_next)) or not np.all(np.isfinite(p_next)):
-            issues.append("NaN/Inf in primitives")
-        if np.any(rho0_next < 0):
-            issues.append("negative rho0")
-        if np.any(p_next < 0):
-            issues.append("negative pressure")
-        if np.any(np.abs(vr_next) >= 1.0):
-            issues.append("superluminal v")
-        if np.any(D_next < 0):
-            issues.append("negative D")
-        if np.any((tau_next + D_next) < 0):
-            issues.append("tau + D < 0")
-
-        # If problems detected, print focused context (location and local values)
-        if issues:
-            print("  -> Detected issues:", ", ".join(issues))
-            # Locate worst offenders
-            try:
-                idx_v = NUM_GHOSTS + int(np.argmax(np.abs(vr_next[interior])))
-            except Exception:
-                idx_v = NUM_GHOSTS
-            try:
-                idx_rho_min = NUM_GHOSTS + int(np.argmin(rho0_next[interior]))
-            except Exception:
-                idx_rho_min = NUM_GHOSTS
-            try:
-                idx_tauD_min = NUM_GHOSTS + int(np.argmin((s_next[NUM_BSSN_VARS+2, interior] + s_next[NUM_BSSN_VARS+0, interior])))
-            except Exception:
-                idx_tauD_min = NUM_GHOSTS
-
-            idxs = sorted(set([idx_v, idx_rho_min, idx_tauD_min]))
-            for ii in idxs:
-                rloc = grid.r[ii]
-                print(f"     at r={rloc:.6f} (i={ii}): "
-                      f"rho0={rho0_next[ii]:.6e}, P={p_next[ii]:.6e}, vr={vr_next[ii]:.6e}, "
-                      f"D={s_next[NUM_BSSN_VARS+0, ii]:.6e}, Sr={s_next[NUM_BSSN_VARS+1, ii]:.6e}, tau={s_next[NUM_BSSN_VARS+2, ii]:.6e}")
-
-            # Stop early so we can inspect before blow-up cascades
-            print("  -> Halting evolution early due to detected instability.")
-            state_flat = state_flat_next  # return the last state
-            actual_steps = step + 1
-            actual_time = t_start + actual_steps * dt
-            return state_flat.reshape((grid.NUM_VARS, grid.N)), actual_steps, actual_time, {
-                't': np.array(times_series),
-                'Mb': np.array(Mb_series),
-                'rho_c': np.array(rho_c_series),
-            }
-
-        # Prepare next step
-        state_flat = state_flat_next
-
-
-    # Final flush of buffers if data manager is provided
-    if data_manager and data_manager.enable_saving:
-        data_manager.flush_evolution_buffer()
-
-    actual_time = t_start + num_steps * dt
-    return state_flat.reshape((grid.NUM_VARS, grid.N)), num_steps, actual_time, {
-        't': np.array(times_series),
-        'Mb': np.array(Mb_series),
-        'rho_c': np.array(rho_c_series),
-    }
+    return snew_reset.flatten()
 
 
 def main():
     """Main execution."""
-    print("="*70)
-    print("TOV Star Evolution - Cowling Approximation")
-    print("="*70)
 
     # ==================================================================
     # CONFIGURATION
     # ==================================================================
     r_max = 16.0
-    num_points = 300
+    num_points = 500
     K = 100.0
     Gamma = 2.0
     rho_central = 1.28e-3
-    num_steps_total = 10000
+    num_steps_total = 1000000
 
     # ==================================================================
     # COORDINATE SYSTEM SELECTION
@@ -446,6 +276,25 @@ def main():
     #                  conformally flat: γ_ij = e^{4φ} ĝ_ij, h_ij = 0
     #   - "schwarzschild": Uses Schwarzschild-like coordinates (standard TOV)
     COORDINATE_SYSTEM = "isotropic"  # Change to "schwarzschild" for Schwarzschild coords
+
+    # ==================================================================
+    # EVOLUTION MODE SELECTION
+    # ==================================================================
+    # Options: "cowling" or "dynamic"
+    #   - "cowling": Fixed spacetime (BSSN variables frozen at t=0)
+    #                Only hydro variables evolve. Faster, good for testing.
+    #   - "dynamic": Full BSSN + hydro evolution. Metric responds to matter,
+    #                allows gravitational wave generation. Uses 1+log slicing
+    #                and gamma-driver shift conditions.
+    EVOLUTION_MODE = "cowling"  # Change to "dynamic" for full BSSN evolution
+
+    # Print header based on evolution mode
+    print("="*70)
+    if EVOLUTION_MODE == "dynamic":
+        print("TOV Star Evolution - Full BSSN + Hydro (Dynamic Spacetime)")
+    else:
+        print("TOV Star Evolution - Cowling Approximation (Fixed Spacetime)")
+    print("="*70)
 
     # Select appropriate modules based on coordinate system
     if COORDINATE_SYSTEM == "isotropic":
@@ -515,7 +364,7 @@ def main():
         spacetime_mode="dynamic",
         atmosphere=ATMOSPHERE,
         reconstructor=base_recon,
-        riemann_solver=HLLRiemannSolver()
+        riemann_solver=HLLRiemannSolver(atmosphere=ATMOSPHERE)
     )
 
     state_vector = StateVector(hydro)
@@ -588,26 +437,56 @@ def main():
     # ==================================================================
     # EVOLUTION
     # ==================================================================
-    bssn_fixed = initial_state_2d[:NUM_BSSN_VARS, :].copy()
-    bssn_d1_fixed = grid.get_d1_metric_quantities(initial_state_2d)
+    # Setup depends on evolution mode
+    if EVOLUTION_MODE == "dynamic":
+        print("\n" + "="*70)
+        print("EVOLUTION MODE: DYNAMIC (Full BSSN + Hydro)")
+        print("  - Spacetime evolves with matter")
+        print("  - 1+log slicing for lapse")
+        print("  - Gamma-driver for shift")
+        print("="*70)
+
+        # For dynamic mode, we still compute these for compatibility but they won't be used
+        # to freeze the metric - they're just passed through to evolve_fixed_timestep
+        bssn_fixed = initial_state_2d[:NUM_BSSN_VARS, :].copy()  # Not actually used to freeze
+        bssn_d1_fixed = grid.get_d1_metric_quantities(initial_state_2d)
+
+        # Wrapper for dynamic RK4 step (ignores bssn_fixed, bssn_d1_fixed)
+        def rk4_step_wrapper(state_flat, dt, grid, background, hydro,
+                            bssn_fixed_unused, bssn_d1_fixed_unused, atmosphere):
+            return rk4_step_dynamic(state_flat, dt, grid, background, hydro, atmosphere)
+
+        selected_rk4_step = rk4_step_wrapper
+        cfl_factor = 0.05  # More conservative for full BSSN evolution
+
+    else:  # cowling mode
+        print("\n" + "="*70)
+        print("EVOLUTION MODE: COWLING (Fixed Spacetime)")
+        print("  - BSSN variables frozen at t=0")
+        print("  - Only hydro evolves")
+        print("="*70)
+
+        bssn_fixed = initial_state_2d[:NUM_BSSN_VARS, :].copy()
+        bssn_d1_fixed = grid.get_d1_metric_quantities(initial_state_2d)
+        selected_rk4_step = rk4_step
+        cfl_factor = 0.1  # Standard CFL for Cowling
 
     # Initialize data manager for saving
     data_manager = SimulationDataManager(OUTPUT_DIR, grid, hydro,
                                         enable_saving=ENABLE_DATA_SAVING,
                                         suffix=coord_suffix)
 
-
     if integration_method == 'fixed':
-        dt = 0.1 * grid.min_dr  # CFL condition
-        print(f"\nEvolving with fixed dt={dt:.6f} (CFL=0.1) for {num_steps_total} steps using RK4")
+        dt = cfl_factor * grid.min_dr  # CFL condition
+        print(f"\nEvolving with fixed dt={dt:.6f} (CFL={cfl_factor}) for {num_steps_total} steps using RK4")
 
         # Save metadata now that we have dt
         if ENABLE_DATA_SAVING:
             data_manager.save_metadata(tov_solution, ATMOSPHERE, dt, integration_method, K=K, Gamma=Gamma, rho_central=rho_central)
 
         # Single step for comparison
-        state_t1 = rk4_step(initial_state_2d.flatten(), dt, grid, background, hydro,
-                           bssn_fixed, bssn_d1_fixed, ATMOSPHERE).reshape((grid.NUM_VARS, grid.N))
+        state_t1 = selected_rk4_step(initial_state_2d.flatten(), dt, grid, background, hydro,
+                                     bssn_fixed, bssn_d1_fixed, ATMOSPHERE).reshape((grid.NUM_VARS, grid.N))
         t_1 = dt
 
         # Plot only the first step changes
@@ -640,8 +519,8 @@ def main():
         print(f"Evolving to checkpoint 1 (step {checkpoint_1})...")
         state_cp1, steps_cp1, t_cp1, series_1 = evolve_fixed_timestep(
             initial_state_2d, dt, checkpoint_1, grid, background,
-            hydro, bssn_fixed, bssn_d1_fixed, ATMOSPHERE, method='rk4',
-            reference_state=initial_state_2d,
+            hydro, bssn_fixed, bssn_d1_fixed, ATMOSPHERE, selected_rk4_step,
+            method='rk4', reference_state=initial_state_2d,
             data_manager=data_manager,
             snapshot_interval=SNAPSHOT_INTERVAL,
             evolution_interval=EVOLUTION_INTERVAL)
@@ -656,8 +535,8 @@ def main():
             print(f"\nEvolving to checkpoint 2 (step {checkpoint_2})...")
             state_cp2, steps_cp2, t_cp2, series_2 = evolve_fixed_timestep(
                 state_cp1, dt, remaining_steps, grid, background,
-                hydro, bssn_fixed, bssn_d1_fixed, ATMOSPHERE, method='rk4',
-                t_start=t_cp1, reference_state=initial_state_2d,
+                hydro, bssn_fixed, bssn_d1_fixed, ATMOSPHERE, selected_rk4_step,
+                method='rk4', t_start=t_cp1, reference_state=initial_state_2d,
                 step_offset=checkpoint_1,
                 data_manager=data_manager,
                 snapshot_interval=SNAPSHOT_INTERVAL,
@@ -679,8 +558,8 @@ def main():
             print(f"\nEvolving to checkpoint 3 (step {checkpoint_3}, final)...")
             state_cp3, steps_cp3, t_cp3, series_3 = evolve_fixed_timestep(
                 state_cp2, dt, remaining_steps, grid, background,
-                hydro, bssn_fixed, bssn_d1_fixed, ATMOSPHERE, method='rk4',
-                t_start=t_cp2, reference_state=initial_state_2d,
+                hydro, bssn_fixed, bssn_d1_fixed, ATMOSPHERE, selected_rk4_step,
+                method='rk4', t_start=t_cp2, reference_state=initial_state_2d,
                 step_offset=checkpoint_2,
                 data_manager=data_manager,
                 snapshot_interval=SNAPSHOT_INTERVAL,
@@ -745,22 +624,63 @@ def main():
     states = [initial_state_2d, checkpoint_states[1], checkpoint_states[2], checkpoint_states[3]]
     times = [0.0, checkpoint_times[1], checkpoint_times[2], checkpoint_times[3]]
 
+    # Get stellar radius for plot markers
+    if COORDINATE_SYSTEM == "isotropic":
+        R_star = tov_solution.R_iso
+    else:
+        R_star = tov_solution.R
+
     try:
         if 'times_full' in locals() and len(times_full) > 0:
             utils.plot_evolution(states, times, grid, hydro, rho_ref, p_ref,
                                  Mb_series=Mb_full, rho_c_series=rho_c_full,
-                                 suffix=coord_suffix)
+                                 suffix=coord_suffix, R_star=R_star)
         else:
             utils.plot_evolution(states, times, grid, hydro, rho_ref, p_ref,
-                                suffix=coord_suffix)
+                                suffix=coord_suffix, R_star=R_star)
     except Exception:
         utils.plot_evolution(states, times, grid, hydro, rho_ref, p_ref,
-                            suffix=coord_suffix)
+                            suffix=coord_suffix, R_star=R_star)
 
-    # Plot BSSN variables evolution to verify Cowling approximation
+    # Plot BSSN variables evolution
+    # In Cowling mode: should be constant (verification)
+    # In Dynamic mode: should show metric evolution
     utils.plot_bssn_evolution(initial_state_2d, checkpoint_states[3], grid,
                              t_0=0.0, t_final=checkpoint_times[3],
                              suffix=coord_suffix)
+
+    # ==================================================================
+    # CONSTRAINT DIAGNOSTICS (Dynamic mode only)
+    # ==================================================================
+    if EVOLUTION_MODE == "dynamic":
+        print("\n" + "="*70)
+        print("CONSTRAINT VIOLATION DIAGNOSTICS")
+        print("="*70)
+
+        interior = slice(NUM_GHOSTS, -NUM_GHOSTS)
+
+        # Compute constraints at initial and final states
+        Ham_0, Mom_0 = get_constraints_diagnostic(
+            initial_state_2d.flatten(), 0.0, grid, background, hydro)
+        Ham_f, Mom_f = get_constraints_diagnostic(
+            checkpoint_states[3].flatten(), checkpoint_times[3], grid, background, hydro)
+
+        # Extract max violations (interior only)
+        max_H_0 = np.max(np.abs(Ham_0[0, interior]))
+        max_M_0 = np.max(np.abs(Mom_0[0, interior, 0]))  # Radial component
+        max_H_f = np.max(np.abs(Ham_f[0, interior]))
+        max_M_f = np.max(np.abs(Mom_f[0, interior, 0]))
+
+        print(f"Hamiltonian constraint |H|:")
+        print(f"  t=0:     max|H| = {max_H_0:.3e}")
+        print(f"  t=final: max|H| = {max_H_f:.3e}")
+        print(f"  Growth factor: {max_H_f/max_H_0:.2f}x" if max_H_0 > 1e-20 else "  (initial ~0)")
+
+        print(f"\nMomentum constraint |M_r|:")
+        print(f"  t=0:     max|M_r| = {max_M_0:.3e}")
+        print(f"  t=final: max|M_r| = {max_M_f:.3e}")
+        print(f"  Growth factor: {max_M_f/max_M_0:.2f}x" if max_M_0 > 1e-20 else "  (initial ~0)")
+        print("="*70)
 
     # Print detailed statistics - extract primitives for each state
     bssn_0 = BSSNVars(grid.N)
@@ -873,6 +793,13 @@ def main():
     if ENABLE_DATA_SAVING:
         data_manager.finalize()
 
+        # Create center zoom evolution video from saved snapshots
+        print("\nCreating center zoom evolution video...")
+        utils.create_center_zoom_video(
+            data_manager.snapshot_file,
+            window=0.5, fps=5, suffix=coord_suffix
+        )
+
     # ==================================================================
     # QUASI-NORMAL MODE ANALYSIS
     # ==================================================================
@@ -925,7 +852,10 @@ def main():
     print("  2. tov_initial_data_comparison.png - TOV vs Initial data at t=0")
     print(f"  3. tov_evolution.png               - Hydro evolution at checkpoints:")
     print(f"                                       t=0 → t={t_cp1:.3e} (1/3) → t={t_cp2:.3e} (2/3) → t={t_cp3:.3e} (final)")
-    print(f"  4. tov_bssn_evolution.png          - BSSN variables: t=0 → t={t_cp3:.3e} (Cowling check)")
+    if EVOLUTION_MODE == "dynamic":
+        print(f"  4. tov_bssn_evolution.png          - BSSN variables: t=0 → t={t_cp3:.3e} (metric evolution)")
+    else:
+        print(f"  4. tov_bssn_evolution.png          - BSSN variables: t=0 → t={t_cp3:.3e} (Cowling check - should be constant)")
     print("  5. tov_qnm_spectrum.png            - QNM frequency spectrum (F-mode, overtones)")
     print("  6. tov_qnm_decay.png               - F-mode decay rate analysis")
     print("="*70)

@@ -752,6 +752,7 @@ if __name__ == "__main__":
     from source.core.statevector import StateVector
     from source.matter.hydro.perfect_fluid import PerfectFluid
     from source.matter.hydro.eos import IdealGasEOS
+    from source.matter.hydro.atmosphere import AtmosphereParams
     from source.backgrounds.sphericalbackground import FlatSphericalBackground
     from examples.TOV.tov_solver import TOVSolver, plot_tov_diagnostics
 
@@ -776,8 +777,9 @@ if __name__ == "__main__":
 
     # Grid & background
     spacing = LinearSpacing(args.num_points, args.r_max)
+    ATMOSPHERE = AtmosphereParams(rho_floor=args.atmosphere_rho)
     dummy_hydro = PerfectFluid(eos=IdealGasEOS(gamma=args.Gamma), spacetime_mode="dynamic",
-                               atmosphere=args.atmosphere_rho)
+                               atmosphere=ATMOSPHERE)
     state_vector = StateVector(dummy_hydro)
     grid = Grid(spacing, state_vector)
     background = FlatSphericalBackground(grid.r)
@@ -793,7 +795,7 @@ if __name__ == "__main__":
 
     # Build initial data
     hydro = PerfectFluid(eos=IdealGasEOS(gamma=args.Gamma), spacetime_mode="dynamic",
-                         atmosphere=args.atmosphere_rho)
+                         atmosphere=ATMOSPHERE)
     hydro.background = background
     initial_state_2d, primitives = create_initial_data_interpolated(
         tov_solution, grid, background, hydro.eos,

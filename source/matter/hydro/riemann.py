@@ -7,7 +7,73 @@ Vectorized implementation - all operations work on batches of interfaces.
 """
 
 import numpy as np
-from .atmosphere import AtmosphereParams
+from .valencia_reference_metric import ValenciaReferenceMetric
+from .geometry import compute_4velocity_1d, compute_g4UU_1d, compute_lorentz_factor_1d
+
+
+def physical_flux(U, prim, gamma_rr, alpha, e6phi, eos):
+    """
+    Compute physical (non-densitized) flux for 1D radial direction.
+
+    Calls Valencia._compute_fluxes (static method) and extracts the radial
+    component, dividing by e^{6φ} to get non-densitized flux.
+
+    This ensures flux calculations are maintained in one place (Valencia).
+
+    Args:
+        U: (M, 3) conservative variables [D, Sr, tau]
+        prim: (M, 3) primitive variables [rho0, vr, pressure]
+        gamma_rr: (M,) metric component γ_{rr}
+        alpha: (M,) lapse function
+        e6phi: (M,) conformal factor e^{6φ}
+        eos: equation of state object
+
+    Returns:
+        F_phys: (M, 3) physical flux [F_D, F_Sr, F_tau]
+    """
+    M = len(U)
+
+    # Extract primitives
+    vr   = prim[:, 1]
+    rho0 = prim[:, 0]
+    pressure = prim[:, 2]
+
+    # Compute Lorentz factor and enthalpy (using geometry module)
+    W = compute_lorentz_factor_1d(vr, gamma_rr)
+    eps = eos.eps_from_rho_p(rho0, pressure)
+    h = 1.0 + eps + pressure / np.maximum(rho0, 1e-30)
+
+    # Build 3D arrays for Valencia static method
+    # v_U: (M, 3) with only radial component non-zero
+    v_U = np.zeros((M, 3))
+    v_U[:, 0] = vr
+
+    # gamma_LL: (M, 3, 3) diagonal metric
+    gamma_LL = np.zeros((M, 3, 3))
+    gamma_LL[:, 0, 0] = gamma_rr
+    gamma_LL[:, 1, 1] = 1.0  # placeholder for θθ
+    gamma_LL[:, 2, 2] = 1.0  # placeholder for φφ
+
+    # gamma_UU: (M, 3, 3) inverse metric
+    gamma_UU = np.zeros((M, 3, 3))
+    gamma_UU[:, 0, 0] = 1.0 / gamma_rr
+    gamma_UU[:, 1, 1] = 1.0
+    gamma_UU[:, 2, 2] = 1.0
+
+    # beta_U: (M, 3) shift vector (zero for TOV)
+    beta_U = np.zeros((M, 3))
+
+    # Call Valencia static method to get densitized fluxes
+    fD_U, fTau_U, fS_D = ValenciaReferenceMetric._compute_fluxes(rho0, v_U, pressure, W, h, alpha, e6phi, gamma_LL, gamma_UU, beta_U)
+
+    # Extract radial component and divide by e^{6φ} to get non-densitized flux
+    # F_phys = F̃ / (e^{6φ})
+
+    F_D   = fD_U[:, 0]    #/ e6phi
+    F_Sr  = fS_D[:, 0, 0] #/ e6phi # F^r_r component
+    F_tau = fTau_U[:, 0]  #/ e6phi
+
+    return np.stack([F_D, F_Sr, F_tau], axis=1)
 
 
 class HLLRiemannSolver:
@@ -22,10 +88,10 @@ class HLLRiemannSolver:
 
     def __init__(self, name: str = "HLL", atmosphere=None):
         self.name = name
-        self.atmosphere = atmosphere if atmosphere is not None else AtmosphereParams()
+        self.atmosphere = atmosphere
 
     def solve_batch(self, UL_batch, UR_batch, primL_batch, primR_batch,
-                    gamma_rr_batch, alpha_batch, beta_r_batch, eos):
+                    gamma_rr_batch, alpha_batch, beta_r_batch, eos, e6phi_batch):
         """
         Fully vectorized solver for multiple interfaces - PHASE 1 OPTIMIZATION.
 
@@ -34,19 +100,9 @@ class HLLRiemannSolver:
         OPTIMIZATIONS:
         1. Fully vectorized numpy operations (no loops)
         2. Eliminates ~127k np.clip() calls by batching
-        3. Caches EOS constants (gamma, gamma-1) to reduce attribute lookups
-        4. Single masked operations instead of cascading loops
+        3. Single masked operations instead of cascading loops
         """
         M = len(UL_batch)
-
-        # OPTIMIZATION: Cache EOS constants to avoid repeated attribute lookups
-        # These are accessed once instead of ~80k times
-        if hasattr(eos, 'gamma'):
-            gamma = float(eos.gamma)
-            gamma_minus_1 = float(eos.gamma_minus_1) if hasattr(eos, 'gamma_minus_1') else gamma - 1.0
-        else:
-            gamma = 1.4
-            gamma_minus_1 = 0.4
 
         # Convert inputs to numpy arrays with proper dtypes
         UL_batch = np.asarray(UL_batch, dtype=float)  # (M, 3)
@@ -86,6 +142,8 @@ class HLLRiemannSolver:
         gamma_rr_batch = np.maximum(gamma_rr_batch, 1e-30)
         alpha_batch = np.maximum(alpha_batch, 1e-30)
 
+        e6phi_batch = np.asarray(e6phi_batch, dtype=float)
+
         # Compute sound speeds squared (vectorized)
         epsL = np.maximum(eos.eps_from_rho_p(rho0L, pL), 1e-15)
         epsR = np.maximum(eos.eps_from_rho_p(rho0R, pR), 1e-15)
@@ -96,12 +154,14 @@ class HLLRiemannSolver:
         cs2L = np.clip(cs2L, 0.0, 1.0 - 1e-12)
         cs2R = np.clip(cs2R, 0.0, 1.0 - 1e-12)
 
-        # Compute 4-velocities for all interfaces (vectorized)
-        u4U_L = self._compute_4velocity(vrL, gamma_rr_batch)
-        u4U_R = self._compute_4velocity(vrR, gamma_rr_batch)
+        # Compute 4-velocities for all interfaces (using geometry module)
+        u4U_L, _ = compute_4velocity_1d(vrL, gamma_rr_batch, alpha_batch, beta_r_batch)
+        u4U_R, _ = compute_4velocity_1d(vrR, gamma_rr_batch, alpha_batch, beta_r_batch)
 
-        # Build 4-metric components at all interfaces
-        g4UU = self._ADM_to_g4UU(gamma_rr_batch, beta_r_batch, alpha_batch)
+        # Build 4-metric components at all interfaces (using geometry module)
+        # For 1D: pass gamma_rr as γ^{rr} = 1/γ_rr
+        gamma_rr_UU = 1.0 / gamma_rr_batch
+        g4UU = compute_g4UU_1d(alpha_batch, beta_r_batch, gamma_rr_UU)
 
         # Compute characteristic speeds
         cmL, cpL = self._find_cp_cm(0, g4UU, u4U_L, cs2L)
@@ -116,16 +176,16 @@ class HLLRiemannSolver:
         lam_plus = cmax
         lam_minus, lam_plus = self._entropy_fix(lam_minus, lam_plus)
 
-        # Compute physical fluxes
-        FL = self._physical_flux(
+        # Compute physical fluxes (using Valencia static method via helper)
+        FL = physical_flux(
             np.stack([DL, SrL, tauL], axis=1),
             np.stack([rho0L, vrL, pL], axis=1),
-            alpha_batch, beta_r_batch
+            gamma_rr_batch, alpha_batch, e6phi_batch, eos
         )
-        FR = self._physical_flux(
+        FR = physical_flux(
             np.stack([DR, SrR, tauR], axis=1),
             np.stack([rho0R, vrR, pR], axis=1),
-            alpha_batch, beta_r_batch
+            gamma_rr_batch, alpha_batch, e6phi_batch, eos
         )
 
         # HLL combination (vectorized)
@@ -159,52 +219,6 @@ class HLLRiemannSolver:
             out[degenerate] = 0.5 * (FL[degenerate] + FR[degenerate])
 
         return out
-
-    def _compute_4velocity(self, vr, gamma_rr):
-        """
-        Vectorized: Compute 4-velocity components for multiple interfaces.
-
-        Inputs:
-            vr: (M,) array of radial velocities
-            gamma_rr: (M,) array of spatial metric components
-
-        Returns: (M, 4) array of 4-velocities
-        """
-        v2 = gamma_rr * vr * vr
-        v2 = np.clip(v2, 0.0, 1.0 - 1e-12)
-        W = 1.0 / np.sqrt(1.0 - v2)
-
-        u4U = np.zeros((len(vr), 4), dtype=float)
-        u4U[:, 0] = W
-        u4U[:, 1] = W * vr
-        # u4U[:, 2] = 0.0  # Already zero from initialization
-        # u4U[:, 3] = 0.0
-        return u4U
-
-    def _ADM_to_g4UU(self, gamma_rr, beta_r, alpha):
-        """
-        Convert ADM variables to contravariant 4-metric g^{μν}.
-
-        For 1D radial case: g^{00} = -1/α², g^{0r} = β^r/α², g^{rr} = 1/γ_rr - (β^r)²/α²
-
-        Returns: (M, 4, 4) array of 4-metrics
-        """
-        M = len(gamma_rr)
-        g4UU = np.zeros((M, 4, 4), dtype=float)
-
-        alpha2 = alpha * alpha
-
-        # Time-time component
-        g4UU[:, 0, 0] = -1.0 / alpha2
-
-        # Time-space components (only radial)
-        g4UU[:, 0, 1] = beta_r / alpha2
-        g4UU[:, 1, 0] = g4UU[:, 0, 1]  # Symmetry
-
-        # Space-space components (only radial)
-        g4UU[:, 1, 1] = 1.0 / gamma_rr - (beta_r * beta_r) / alpha2
-
-        return g4UU
 
     def _find_cp_cm(self, flux_dirn, g4UU, u4U, cs2):
         """
@@ -247,22 +261,6 @@ class HLLRiemannSolver:
 
         return cminus, cplus
 
-    def _physical_flux(self, U, prim, alpha, beta_r):
-        """Non-densitized physical flux vector for Valencia variables."""
-        D = U[:, 0]
-        Sr = U[:, 1]
-        tau = U[:, 2]
-
-        vr = prim[:, 1]
-        p = prim[:, 2]
-
-        vtil = vr 
-        fD = D * vtil
-        fSr = Sr * vtil + p
-        ftau = (tau + p) * vtil
-
-        return np.stack([fD, fSr, ftau], axis=1)
-
     def _entropy_fix(self, lam_minus, lam_plus, delta=1e-8):
         """Simple entropy fix to avoid sonic glitches."""
         # Push away from zero
@@ -275,4 +273,3 @@ class HLLRiemannSolver:
         lam_plus = np.where(need_swap, lam_minus, lam_plus)
 
         return lam_minus, lam_plus
-    

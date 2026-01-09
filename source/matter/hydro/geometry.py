@@ -1,0 +1,249 @@
+# geometry.py
+"""
+Geometry utilities for GRHD calculations.
+
+Provides functions for computing:
+- 4-metric g^{μν} from ADM variables (α, β^i, γ^{ij})
+- 4-velocity u^μ from 3-velocity v^i
+- Lorentz factor W
+
+Both 3D (full tensor) and 1D (radial only) versions are provided.
+"""
+
+import numpy as np
+
+SPACEDIM = 3
+
+
+# =============================================================================
+# Lorentz Factor
+# =============================================================================
+
+def compute_lorentz_factor(v_U, gamma_LL):
+    """
+    Compute Lorentz factor W = 1/√(1 - v²) where v² = γ_{ij} v^i v^j.
+
+    Args:
+        v_U: (N, 3) contravariant velocity components
+        gamma_LL: (N, 3, 3) covariant metric
+
+    Returns:
+        W: (N,) Lorentz factor
+    """
+    v_squared = np.einsum('xij,xi,xj->x', gamma_LL, v_U, v_U)
+    W = 1.0 / np.sqrt(np.maximum(1.0 - v_squared, 1e-16))
+    return W
+
+
+def compute_lorentz_factor_1d(vr, gamma_rr):
+    """
+    Compute Lorentz factor for 1D radial flow.
+
+    Args:
+        vr: (M,) radial velocity v^r
+        gamma_rr: (M,) metric component γ_{rr}
+
+    Returns:
+        W: (M,) Lorentz factor
+    """
+    v_squared = gamma_rr * vr ** 2
+    W = 1.0 / np.sqrt(np.maximum(1.0 - v_squared, 1e-16))
+    return W
+
+
+# =============================================================================
+# 4-Velocity
+# =============================================================================
+
+def compute_4velocity(v_U, W, alpha, beta_U):
+    """
+    Compute 4-velocity u^μ from 3-velocity.
+
+    u^0 = W/α (timelike component)
+    u^i = W (v^i-beta/alpha) (spatial components)
+
+    Args:
+        v_U: (N, 3) contravariant velocity components
+        W: (N,) Lorentz factor
+        alpha: (N,) lapse function
+
+    Returns:
+        u4U: (N, 4) four-velocity [u^t, u^x, u^y, u^z]
+    """
+    N = len(W)
+    u4U = np.zeros((N, 4))
+    u4U[:, 0] = W / alpha
+    u4U[:, 1:] = W[:, None] * (v_U - beta_U / alpha[:, None])
+    return u4U
+
+
+def compute_4velocity_1d(vr, gamma_rr, alpha, beta_r):
+    """
+    Compute 4-velocity for 1D radial flow.
+
+    u^0 = W/α (timelike component)
+    u^r = W(v^r - β^r/α) (radial component)
+
+    Args:
+        vr: (M,) radial velocity v^r
+        gamma_rr: (M,) metric component γ_{rr}
+        alpha: (M,) lapse function
+        beta_r: (M,) radial shift β^r
+
+    Returns:
+        u4U: (M, 4) four-velocity [u^t, u^r, 0, 0]
+        W: (M,) Lorentz factor
+    """
+    M = len(vr)
+    W = compute_lorentz_factor_1d(vr, gamma_rr)
+
+    u4U = np.zeros((M, 4))
+    u4U[:, 0] = W / alpha
+    u4U[:, 1] = W * (vr - beta_r / alpha)
+
+    return u4U, W
+
+
+def compute_vU_from_u4U(u4U):
+    """
+    Compute fluid three-velocity from four-velocity: v^i = u^i/u^0.
+
+    Args:
+        u4U: (N, 4) array with four-velocity components [u^t, u^x, u^y, u^z]
+
+    Returns:
+        v_U: (N, 3) array with spatial velocity components [v^x, v^y, v^z]
+    """
+    return u4U[:, 1:] / u4U[:, 0:1]
+
+
+# =============================================================================
+# Contravariant 4-Metric g^{μν}
+# =============================================================================
+
+def compute_g4UU(alpha, beta_U, gamma_UU):
+    """
+    Compute contravariant 4-metric g^{μν} from ADM variables.
+
+    g^{tt} = -1/α²
+    g^{ti} = β^i/α²
+    g^{ij} = γ^{ij} - β^i β^j/α²
+
+    Args:
+        alpha: (N,) lapse function
+        beta_U: (N, 3) contravariant shift vector
+        gamma_UU: (N, 3, 3) contravariant spatial metric
+
+    Returns:
+        g4UU: (N, 4, 4) contravariant 4-metric
+    """
+    N = len(alpha)
+    g4UU = np.zeros((N, 4, 4))
+
+    alpha_sq = alpha ** 2 + 1e-30
+
+    # g^{tt} = -1/α²
+    g4UU[:, 0, 0] = -1.0 / alpha_sq
+
+    # g^{ti} = g^{it} = β^i/α²
+    g4UU[:, 0, 1:] = beta_U / alpha_sq[:, None]
+    g4UU[:, 1:, 0] = g4UU[:, 0, 1:]
+
+    # g^{ij} = γ^{ij} - β^i β^j/α²
+    g4UU[:, 1:, 1:] = gamma_UU - np.einsum('xi,xj->xij', beta_U, beta_U) / alpha_sq[:, None, None]
+
+    return g4UU
+
+
+def compute_g4UU_1d(alpha, beta_r, gamma_rr_UU):
+    """
+    Compute contravariant 4-metric for 1D radial case.
+
+    Args:
+        alpha: (M,) lapse function
+        beta_r: (M,) radial shift component β^r
+        gamma_rr_UU: (M,) contravariant metric γ^{rr} = 1/γ_{rr}
+
+    Returns:
+        g4UU: (M, 4, 4) contravariant 4-metric
+    """
+    M = len(alpha)
+    g4UU = np.zeros((M, 4, 4))
+
+    alpha_sq = alpha ** 2 + 1e-30
+
+    # g^{tt} = -1/α²
+    g4UU[:, 0, 0] = -1.0 / alpha_sq
+
+    # g^{tr} = g^{rt} = β^r/α²
+    g4UU[:, 0, 1] = beta_r / alpha_sq
+    g4UU[:, 1, 0] = g4UU[:, 0, 1]
+
+    # g^{rr} = γ^{rr} - (β^r)²/α²
+    g4UU[:, 1, 1] = gamma_rr_UU - beta_r ** 2 / alpha_sq
+
+    return g4UU
+
+
+# =============================================================================
+# Covariant 4-Metric g_{μν}
+# =============================================================================
+
+def compute_g4DD(alpha, beta_U, gamma_LL):
+    """
+    Compute covariant 4-metric g_{μν} from ADM variables.
+
+    g_{tt} = -α² + β_k β^k
+    g_{ti} = β_i (lowered with γ)
+    g_{ij} = γ_{ij}
+
+    Args:
+        alpha: (N,) lapse function
+        beta_U: (N, 3) contravariant shift vector
+        gamma_LL: (N, 3, 3) covariant spatial metric
+
+    Returns:
+        g4DD: (N, 4, 4) covariant 4-metric
+    """
+    N = len(alpha)
+    g4DD = np.zeros((N, 4, 4))
+
+    # Lower shift: β_i = γ_{ij} β^j
+    beta_lower = np.einsum('xij,xj->xi', gamma_LL, beta_U)
+    beta_squared = np.einsum('xi,xi->x', beta_U, beta_lower)
+
+    # g_{tt} = -α² + β_k β^k
+    g4DD[:, 0, 0] = -alpha ** 2 + beta_squared
+
+    # g_{ti} = g_{it} = β_i
+    g4DD[:, 0, 1:] = beta_lower
+    g4DD[:, 1:, 0] = beta_lower
+
+    # g_{ij} = γ_{ij}
+    g4DD[:, 1:, 1:] = gamma_LL
+
+    return g4DD
+
+
+# =============================================================================
+# Metric component extraction (for 1D from 3D)
+# =============================================================================
+
+def extract_radial_metric(gamma_LL, gamma_UU, beta_U):
+    """
+    Extract radial components from 3D metric tensors.
+
+    Args:
+        gamma_LL: (N, 3, 3) covariant metric
+        gamma_UU: (N, 3, 3) contravariant metric
+        beta_U: (N, 3) shift vector
+
+    Returns:
+        gamma_rr: (N,) γ_{rr}
+        gamma_rr_UU: (N,) γ^{rr}
+        beta_r: (N,) β^r
+    """
+    gamma_rr = gamma_LL[:, 0, 0]
+    gamma_rr_UU = gamma_UU[:, 0, 0]
+    beta_r = beta_U[:, 0]
+    return gamma_rr, gamma_rr_UU, beta_r

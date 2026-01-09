@@ -704,7 +704,7 @@ def compute_qnm_spectrum(times_series, rho_c_series, output_dir='plots', suffix=
     print(f"Time span: {times_series[0]:.3e} to {times_series[-1]:.3e} (M_sun)")
 
     # 2. Apply window to reduce spectral leakage (Blackman window)
-    window = signal.blackman(len(rho_c_detrended))
+    window = signal.windows.blackman(len(rho_c_detrended))
     rho_c_windowed = rho_c_detrended * window
 
     # 3. Compute FFT

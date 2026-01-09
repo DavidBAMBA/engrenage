@@ -186,14 +186,6 @@ def create_initial_data_iso(tov_solution, grid, background, eos,
         state_2d: (NUM_VARS, N) initial data array with BSSN + hydro
         primitives: Tuple (rho0, vr, p, eps)
     """
-    from source.matter.hydro.atmosphere import AtmosphereParams
-
-    # Handle atmosphere
-    if atmosphere is None:
-        atmosphere = AtmosphereParams()
-    elif not isinstance(atmosphere, AtmosphereParams):
-        raise TypeError("atmosphere must be AtmosphereParams")
-
     atmosphere_rho = atmosphere.rho_floor
     p_atm = atmosphere.p_floor
 
@@ -271,12 +263,13 @@ def create_initial_data_iso(tov_solution, grid, background, eos,
     phi_bssn = 0.25 * np.log(np.maximum(exp4phi_arr, 1e-30))
     state_2d[idx_phi, :] = phi_bssn
 
-    # Diagnostic: Check values at origin
-    print(f"  Values at origin (r=0, i=0):")
-    print(f"    exp4phi[0] = {exp4phi_arr[0]:.10e}  (should be 1.0)")
-    print(f"    phi_bssn[0] = {phi_bssn[0]:.10e}  (should be 0.0)")
-    print(f"    alpha[0] = {alpha_arr[0]:.10e}")
-    print(f"    rho[0] = {rho_arr[0]:.10e}")
+    # Diagnostic: Check values at origin (find point closest to r=0)
+    idx_origin = np.argmin(np.abs(grid.r))
+    print(f"  Values near origin (r={grid.r[idx_origin]:.6f}, i={idx_origin}):")
+    print(f"    exp4phi = {exp4phi_arr[idx_origin]:.10e}  (should be ~1.0)")
+    print(f"    phi_bssn = {phi_bssn[idx_origin]:.10e}  (should be ~0.0)")
+    print(f"    alpha = {alpha_arr[idx_origin]:.10e}")
+    print(f"    rho = {rho_arr[idx_origin]:.10e}")
 
     # h_ij = 0 because γ̄_ij = ĝ_ij in isotropic coordinates
     state_2d[idx_hrr, :] = 0.0
@@ -580,6 +573,7 @@ if __name__ == "__main__":
     from source.core.statevector import StateVector
     from source.matter.hydro.perfect_fluid import PerfectFluid
     from source.matter.hydro.eos import IdealGasEOS
+    from source.matter.hydro.atmosphere import AtmosphereParams
     from source.backgrounds.sphericalbackground import FlatSphericalBackground
     from examples.TOV.tov_solver_iso import TOVSolverIso, plot_tov_iso_diagnostics
 
@@ -604,8 +598,9 @@ if __name__ == "__main__":
 
     # Grid & background
     spacing = LinearSpacing(args.num_points, args.r_max)
+    ATMOSPHERE = AtmosphereParams(rho_floor=args.atmosphere_rho)
     dummy_hydro = PerfectFluid(eos=IdealGasEOS(gamma=args.Gamma), spacetime_mode="dynamic",
-                               atmosphere=args.atmosphere_rho)
+                               atmosphere=ATMOSPHERE)
     state_vector = StateVector(dummy_hydro)
     grid = Grid(spacing, state_vector)
     background = FlatSphericalBackground(grid.r)
@@ -627,7 +622,7 @@ if __name__ == "__main__":
 
     # Build initial data
     hydro = PerfectFluid(eos=IdealGasEOS(gamma=args.Gamma), spacetime_mode="dynamic",
-                         atmosphere=args.atmosphere_rho)
+                         atmosphere=ATMOSPHERE)
     hydro.background = background
 
     initial_state_2d, primitives = create_initial_data_iso(

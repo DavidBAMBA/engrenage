@@ -129,5 +129,10 @@ dmypy.json
 # Pyre type checker
 .pyre/
 
-# Claude Code files
+# Claude Code
 CLAUDE.md
+.claude/
+
+# Large data files
+examples/TOV/tov_evolution_data/
+examples/TOV/tov_iso_cache/

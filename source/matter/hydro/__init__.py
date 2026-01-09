@@ -22,8 +22,7 @@ __all__ = [
     'EOS_TYPES',
     'RECONSTRUCTION_TYPES',
     'RIEMANN_SOLVERS',
-    'AtmosphereParams',  # New: centralized floor management
-    'create_default_atmosphere',
+    'AtmosphereParams',
 ]
 
 # -------- Lazy attribute loading (PEP 562) --------
@@ -46,8 +45,6 @@ def __getattr__(name):
         return getattr(mod, 'ConservativeToPrimitive', None)
     if name == 'AtmosphereParams':
         return import_module('.atmosphere', __name__).AtmosphereParams
-    if name == 'create_default_atmosphere':
-        return import_module('.atmosphere', __name__).create_default_atmosphere
     if name == 'EOS_TYPES':
         eos = import_module('.eos', __name__)
         return {'ideal': eos.IdealGasEOS, 'polytropic': eos.PolytropicEOS}
@@ -60,7 +57,7 @@ def __getattr__(name):
     if name == 'create_perfect_fluid':
         # Devuelve la factory como función cerrada para que los imports sean internos
         def _factory(gamma=1.4, spacetime_mode="fixed_minkowski",
-                    atmosphere_rho=1e-13, atmosphere=None, reconstruction="minmod",
+                    atmosphere=None, reconstruction="minmod",
                     riemann_solver="hlle"):
             """
             Create PerfectFluid with default configuration.
@@ -68,8 +65,7 @@ def __getattr__(name):
             Args:
                 gamma: Adiabatic index (default: 1.4)
                 spacetime_mode: "fixed_minkowski" or "dynamic" (default: "fixed_minkowski")
-                atmosphere_rho: Atmosphere density (backward compat, use atmosphere instead)
-                atmosphere: AtmosphereParams object (preferred over atmosphere_rho)
+                atmosphere: AtmosphereParams object (required for evolution)
                 reconstruction: Reconstruction method (default: "minmod")
                 riemann_solver: Riemann solver (default: "hlle")
             """
@@ -78,7 +74,6 @@ def __getattr__(name):
             rie_mod  = import_module('.riemann', __name__)
             pf_mod   = import_module('.perfect_fluid', __name__)
 
-            # EOS
             if reconstruction != "minmod":
                 raise ValueError(f"Unknown reconstruction method: {reconstruction}")
             if riemann_solver != "hlle":
@@ -87,10 +82,6 @@ def __getattr__(name):
             eos = eos_mod.IdealGasEOS(gamma)
             reconstructor = rec_mod.MinmodReconstruction()
             riemann = rie_mod.HLLERiemannSolver()
-
-            # Atmosphere: prefer explicit AtmosphereParams, fallback to atmosphere_rho
-            if atmosphere is None and atmosphere_rho is not None:
-                atmosphere = atmosphere_rho  # PerfectFluid handles float conversion
 
             fluid = pf_mod.PerfectFluid(
                 eos=eos,

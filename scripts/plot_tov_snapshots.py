@@ -42,6 +42,7 @@ from source.bssn.bssnvars import BSSNVars
 from source.bssn.bssnstatevariables import NUM_BSSN_VARS
 from source.matter.hydro.perfect_fluid import PerfectFluid
 from source.matter.hydro.eos import IdealGasEOS
+from source.matter.hydro.atmosphere import AtmosphereParams
 from source.matter.hydro.reconstruction import create_reconstruction
 from source.matter.hydro.riemann import HLLRiemannSolver
 
@@ -69,6 +70,7 @@ def build_grid_for_snapshot(N: int, r_max: float, spacing: str = 'linear') -> Gr
     hydro = PerfectFluid(
         eos=IdealGasEOS(gamma=2.0),
         spacetime_mode='dynamic',
+        atmosphere=AtmosphereParams(),
         reconstructor=create_reconstruction('mp5'),
         riemann_solver=HLLRiemannSolver(),
     )
@@ -102,7 +104,8 @@ def primitives_from_snapshot(state_1d: np.ndarray, grid: Grid):
     # Hydro helper (EOS gamma matches TOVEvolution_corrected main)
     hydro = PerfectFluid(
         eos=IdealGasEOS(gamma=2.0),
-        spacetime_mode='dynamic'
+        spacetime_mode='dynamic',
+        atmosphere=AtmosphereParams(),
     )
     hydro.set_matter_vars(state, bssn, grid)
 
@@ -200,7 +203,7 @@ def main():
     # Pre-infer N from first snapshot
     first_state = np.load(pairs[0][1])
     # Build a temporary hydro to get NUM_VARS
-    tmp_hydro = PerfectFluid(IdealGasEOS(gamma=2.0))
+    tmp_hydro = PerfectFluid(IdealGasEOS(gamma=2.0), atmosphere=AtmosphereParams())
     num_vars = StateVector(tmp_hydro).NUM_VARS
     if first_state.size % num_vars != 0:
         print(f"[ERROR] Snapshot size {first_state.size} not divisible by NUM_VARS={num_vars}")
