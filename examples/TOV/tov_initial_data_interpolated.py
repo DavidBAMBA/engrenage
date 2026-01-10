@@ -1,20 +1,20 @@
 """
-TOV Initial Data with High-Order Interpolation + Rigorous ADM→BSSN Conversion.
+TOV Initial Data in Isotropic Coordinates for BSSN Evolution.
 
-This module combines the best of both worlds:
-1. High-order Lagrange interpolation with Gibbs phenomenon protection 
-2. Rigorous ADM→BSSN conversion enforcing det(γ̄) = det(ĝ) constraint
+This module creates initial data for BSSN evolution from a TOV solution
+computed in isotropic coordinates.
 
-Key features:
-- TOV solved on fine, independent grid → interpolated to evolution grid
-- Interpolation stencil NEVER crosses stellar surface (avoids Gibbs phenomenon)
-- Proper ADM→BSSN conversion: TOV → ADM → BSSN (not direct TOV→BSSN)
-- Enforces BSSN constraint: det(γ̄) = det(ĝ)
-- Correctly computes φ from determinants (not ad-hoc formulas)
+Key simplification in isotropic coordinates:
+- The spatial metric is conformally flat: γ_ij = e^{4φ} ĝ_ij
+- Therefore γ̄_ij = ĝ_ij exactly (conformal metric = reference metric)
+- This means h_ij = 0 for all components!
+- All geometric information is contained in φ alone
 
+The grid coordinate r represents r_iso (isotropic radial coordinate).
 """
 
-import os, sys
+import os
+import sys
 import numpy as np
 import matplotlib.pyplot as plt
 
@@ -24,7 +24,6 @@ if REPO_ROOT not in sys.path:
     sys.path.insert(0, REPO_ROOT)
 
 from source.core.spacing import NUM_GHOSTS
-from source.bssn.bssnvars import BSSNVars
 from source.bssn.bssnstatevariables import (
     NUM_BSSN_VARS,
     idx_phi, idx_hrr, idx_htt, idx_hpp,
@@ -32,717 +31,558 @@ from source.bssn.bssnstatevariables import (
     idx_lambdar, idx_shiftr, idx_br,
 )
 from source.backgrounds.sphericalbackground import i_r, i_t, i_p
-from source.matter.hydro.cons2prim import prim_to_cons
-from source.bssn.tensoralgebra import get_tensor_connections, get_bar_gamma_LL, get_bar_gamma_UU
 
 
-def interpolate_tov_avoiding_surface(r_target, tov_solution, field_name,
-                                      interp_order=11, atmosphere_value=None):
+def interpolate_tov_iso_avoiding_surface(r_target, tov_solution, field_name,
+                                          interp_order=11, atmosphere_value=None):
     """
-    Interpolate TOV solution field, ensuring stencil doesn't cross surface.
-    This prevents Gibbs phenomenon at stellar surface discontinuity.
+    Interpolate TOV solution field using r_iso as coordinate.
+    Ensures stencil doesn't cross surface to prevent Gibbs phenomenon.
 
     Args:
-        r_target: Radius where to interpolate
-        tov_solution: Dict with TOV solution (must have 'r', 'R', 'M_star', and field_name)
-        field_name: Name of field to interpolate ('rho_baryon', 'P', 'exp4phi', 'alpha', etc.)
-        interp_order: Interpolation order 11
-        atmosphere_value: Value to return if r_target is outside star (deprecated, will use Schwarzschild)
+        r_target: Radius where to interpolate (in isotropic coordinates)
+        tov_solution: TOVSolutionIso object
+        field_name: Name of field to interpolate ('rho_baryon', 'P', 'exp4phi', 'alpha')
+        interp_order: Interpolation order (default 11)
+        atmosphere_value: Value to return if outside star for matter quantities
 
     Returns:
         Interpolated value at r_target
-
-    Implementation details:
-    - Uses Lagrange polynomial interpolation
-    - Finds stellar surface index (Rbar_idx)
-    - If r_target < R_star: stencil stays INSIDE star (idx_max ≤ surf_idx+1)
-    - If r_target ≥ R_star:
-        * For metric quantities (exp4phi, alpha): uses Schwarzschild solution
-        * For matter quantities (rho_baryon, P): uses atmosphere_value or zero
-    - This prevents interpolation across discontinuity → no Gibbs phenomenon
     """
-    r_tov = tov_solution.r
+    r_iso = tov_solution.r_iso
     field_tov = getattr(tov_solution, field_name)
-    R_star = tov_solution.R
+    R_iso = tov_solution.R_iso
     M_star = tov_solution.M_star
 
-    # Handle negative radii (spherical symmetry: f(r) = f(-r))
+    # Handle negative radii (spherical symmetry)
     r_use = abs(r_target)
 
-    # If outside star, use exact Schwarzschild solution for metric quantities
-    # or atmosphere values for matter quantities
-    if r_use > R_star:
+    # If outside star, use exact Schwarzschild solution in isotropic coords
+    if r_use > R_iso:
         if field_name == 'exp4phi':
-            # Schwarzschild: exp4phi = (1 - 2M/r)^(-1)
-            one_minus = max(1.0 - 2.0 * M_star / max(r_use, 0.1), 1e-10)
-            return 1.0 / one_minus
+            # Schwarzschild in isotropic: exp4phi = (1 + M/(2r_iso))^4
+            return (1.0 + M_star / (2.0 * max(r_use, 0.1)))**4
         elif field_name == 'alpha':
-            # Schwarzschild: alpha = sqrt(1 - 2M/r)
-            one_minus = max(1.0 - 2.0 * M_star / max(r_use, 0.1), 1e-10)
-            return np.sqrt(one_minus)
-        elif field_name in ['rho_baryon', 'P', 'rho', 'epsilon']:
-            # Matter quantities: use atmosphere or zero
-            if atmosphere_value is not None:
-                return atmosphere_value
-            else:
-                return 0.0
+            # Schwarzschild in isotropic: alpha = (1 - M/(2r_iso)) / (1 + M/(2r_iso))
+            return (1.0 - M_star / (2.0 * max(r_use, 0.1))) / (1.0 + M_star / (2.0 * max(r_use, 0.1)))
+        elif field_name in ['rho_baryon', 'P']:
+            return atmosphere_value if atmosphere_value is not None else 0.0
         else:
-            # Unknown field: fallback to atmosphere_value or zero
-            if atmosphere_value is not None:
-                return atmosphere_value
-            else:
-                return 0.0
+            return atmosphere_value if atmosphere_value is not None else 0.0
 
     # Clamp to data range
-    r_use = max(r_use, r_tov[0])
-    r_use = min(r_use, r_tov[-1])
+    # For exp4phi, skip the first point (index 0) which has artifact exp4phi=1.0
+    # The first point at r~1e-10 has exp4phi=1.0 which is not physical
+    skip_origin = 1 if (field_name == 'exp4phi' and len(r_iso) > interp_order + 1) else 0
+    r_use = max(r_use, r_iso[skip_origin])
+    r_use = min(r_use, r_iso[-1])
 
-    # Find stellar surface index in TOV data
-    surf_idx = np.argmin(np.abs(r_tov - R_star))
+    # Find stellar surface index
+    surf_idx = np.argmin(np.abs(r_iso - R_iso))
 
-    # Find target index using bisection (more robust than searchsorted for irregular grids)
-    idx = np.searchsorted(r_tov, r_use)
-    idx = max(0, min(idx, len(r_tov)-1))
+    # Find target index
+    idx = np.searchsorted(r_iso, r_use)
+    idx = max(skip_origin, min(idx, len(r_iso) - 1))
 
-    # Determine stencil bounds centered around idx
+    # Determine stencil bounds
     half_stencil = interp_order // 2
-    idx_min = max(0, idx - half_stencil)
-    idx_max = min(len(r_tov), idx_min + interp_order)
+    idx_min = max(skip_origin, idx - half_stencil)
+    idx_max = min(len(r_iso), idx_min + interp_order)
 
-    # CRITICAL: Don't allow stencil to cross stellar surface
-    # This is the key difference from standard interpolation!
-    if r_use < R_star:
-        # Inside star: stencil must stay inside (all points < R_star)
+    # Don't allow stencil to cross stellar surface
+    if r_use < R_iso:
         idx_max = min(idx_max, surf_idx + 1)
         idx_min = max(0, idx_max - interp_order)
     else:
-        # Outside star: stencil must stay outside (all points ≥ R_star)
         idx_min = max(idx_min, surf_idx)
-        idx_max = min(len(r_tov), idx_min + interp_order)
+        idx_max = min(len(r_iso), idx_min + interp_order)
 
     # Extract stencil
-    r_stencil = r_tov[idx_min:idx_max]
+    r_stencil = r_iso[idx_min:idx_max]
     field_stencil = field_tov[idx_min:idx_max]
 
     # Lagrange polynomial interpolation
-    # L_i(r) = Π_{j≠i} (r - r_j) / (r_i - r_j)
-    # f(r) ≈ Σ_i f_i L_i(r)
     result = 0.0
     for i in range(len(r_stencil)):
         L_i = 1.0
         for j in range(len(r_stencil)):
             if i != j:
-                L_i *= (r_use - r_stencil[j]) / (r_stencil[i] - r_stencil[j])
+                denom = r_stencil[i] - r_stencil[j]
+                if abs(denom) > 1e-30:
+                    L_i *= (r_use - r_stencil[j]) / denom
         result += field_stencil[i] * L_i
 
     return result
 
 
-def compute_adm_from_tov_interpolated(tov_solution, grid, atmosphere, interp_order=11):
+def compute_lambda_from_metric_fd(state_2d, grid, background):
     """
-    Extract ADM variables from TOV solution using high-order interpolation.
+    Compute lambda^i using finite differences of the metric quantities.
 
-    TOV solution is always in Schwarzschild coordinates:
-        ds² = -α² dt² + γ_rr dr² + r² dΩ²
-        α = exp(ν/2)
-        γ_rr = (1 - 2M/r)^(-1) = exp4phi
-        γ_θθ = r²
-        γ_φφ = r² sin²θ
+    In BSSN:
+        λ̄^i = γ̄^jk (Γ̄^i_jk - Γ̂^i_jk)
+
+    where Γ̄^i_jk are computed from finite differences of γ̄_ij.
+
+    For isotropic coordinates with h_ij = 0:
+        γ̄_ij = ĝ_ij (pointwise)
+
+    However, ∂_k γ̄_ij ≠ 0 on a numerical grid, so lambda^i ≠ 0.
 
     Args:
-        tov_solution: TOV solution dict (on fine, independent grid)
-        grid: Engrenage evolution grid
-        atmosphere: AtmosphereParams object
-        interp_order: Lagrange interpolation order (default 11)
+        state_2d: State vector (NUM_VARS, N) to modify in-place
+        grid: Grid object with FD operators
+        background: Background metric object
 
-    Returns:
-        adm_vars: Dict with keys 'alpha', 'beta_U', 'gamma_LL', 'K_LL'
-                  All arrays have shape (N,) or (N,3) or (N,3,3)
+    Modifies:
+        state_2d[idx_lambdar, :] in place
     """
+    from source.bssn.bssnvars import BSSNVars
+    from source.bssn.tensoralgebra import get_tensor_connections
+    from source.backgrounds.sphericalbackground import i_r
+
     N = grid.N
-    r_grid = grid.r
-    R_star = tov_solution.R
-    M_star = tov_solution.M_star
+    bssn_vars = BSSNVars(N)
+    bssn_vars.set_bssn_vars(state_2d)
 
-    # Initialize ADM variables
-    alpha_grid = np.ones(N)
-    beta_U = np.zeros((N, 3))  # β^i = 0 (static star)
-    gamma_LL = np.zeros((N, 3, 3))
-    K_LL = np.zeros((N, 3, 3))  # K_ij = 0 (static star)
+    # Get finite difference derivatives of metric quantities
+    # This computes ∂_r h_ij, ∂_θ h_ij, ∂_φ h_ij using FD stencils
+    d1 = grid.get_d1_metric_quantities(state_2d)
 
-    print(f"  Interpolating TOV solution to evolution grid (order {interp_order})...")
-    print(f"    Stellar radius: R = {R_star:.6f}")
-    print(f"    Evolution grid: N = {N}, r ∈ [{r_grid[0]:.3f}, {r_grid[-1]:.3f}]")
+    # Get connections: Delta^i = γ̄^jk (Γ̄^i_jk - Γ̂^i_jk)
+    # This function already exists in tensoralgebra.py and handles all the
+    # Christoffel symbol calculations correctly
+    Delta_U, Delta_ULL, Delta_LLL = get_tensor_connections(
+        grid.r, bssn_vars.h_LL, d1.h_LL, background
+    )
 
-    # Interpolate each grid point
-    for i, r in enumerate(r_grid):
-        r_abs = abs(r)
-
-        # Special handling for origin (r=0)
-        if r_abs < 1e-8:
-            # At origin, use values directly from TOV solution
-            exp4phi = tov_solution.exp4phi[0]
-            alpha = tov_solution.alpha[0]
-            alpha_grid[i] = alpha
-            r_metric = 1e-10  # Small but non-zero for metric components
-            gamma_LL[i, i_r, i_r] = exp4phi
-            gamma_LL[i, i_t, i_t] = r_metric ** 2
-            gamma_LL[i, i_p, i_p] = r_metric ** 2
-            continue
-
-        # For interpolation of TOV quantities, use minimum radius to avoid r=0
-        # But for metric components γ_θθ = r², use TRUE radius to maintain smoothness
-        r_min = 1e-3  # Minimum radius for TOV interpolation
-        r_interp = max(r_abs, r_min)  # Radius for interpolation
-        r_metric = max(r_abs, 1e-10)  # True radius for metric (much smaller threshold)
-
-        is_interior = r_interp < R_star
-
-        if is_interior:
-            # INTERIOR: Interpolate TOV quantities with surface protection
-            exp4phi = interpolate_tov_avoiding_surface(
-                r_interp, tov_solution, 'exp4phi', interp_order, 1.0)
-            alpha = interpolate_tov_avoiding_surface(
-                r_interp, tov_solution, 'alpha', interp_order, 1.0)
-
-            # Enforce positivity and physical bounds
-            # Note: exp4phi should be >= 1 for realistic stars
-            if exp4phi < 0.9:
-                print(f"  WARNING: exp4phi = {exp4phi:.3e} at r={r_abs:.3e} (should be >= 1.0)")
-                exp4phi = 1.0
-            alpha = max(alpha, 1e-10)
-        else:
-            # EXTERIOR: Use Schwarzschild vacuum solution
-            one_minus = max(1.0 - 2.0 * M_star / max(r_interp, 0.1), 1e-10)
-            alpha = np.sqrt(one_minus)
-            exp4phi = 1.0 / one_minus
-
-        alpha_grid[i] = alpha
-
-        # Build physical 3-metric γ_ij in Schwarzschild coordinates
-        # ds² = exp4phi dr² + r² dΩ²
-        # CRITICAL: Use r_metric (true radius) for angular terms, NOT r_interp!
-        gamma_LL[i, i_r, i_r] = exp4phi
-        gamma_LL[i, i_t, i_t] = r_metric ** 2
-        gamma_LL[i, i_p, i_p] = r_metric ** 2
-
-    return {
-        'alpha': alpha_grid,
-        'beta_U': beta_U,
-        'gamma_LL': gamma_LL,
-        'K_LL': K_LL,
-    }
+    # lambda^r is the radial component of Delta^i
+    # In spherical symmetry, only the radial component is non-zero
+    # Delta_U has shape (N, 3) where second index is [r, theta, phi]
+    state_2d[idx_lambdar, :] = Delta_U[:, i_r]
 
 
-def convert_adm_to_bssn(adm_vars, grid, background):
+def create_initial_data_iso(tov_solution, grid, background, eos,
+                             atmosphere=None,
+                             polytrope_K=None, polytrope_Gamma=None,
+                             interp_order=11):
     """
-    Convert ADM variables to BSSN variables using tensoralgebra functions.
-    This ensures consistency with BH initial conditions and evolution code.
+    Create BSSN + hydro initial data from TOV solution in isotropic coordinates.
 
-    Key steps (consistent with bhinitialconditions.py):
-    1. Compute φ = (1/12) ln(det(γ) / det(ĝ))
-    2. Compute γ̄_ij = e^{-4φ} γ_ij (enforces det(γ̄) = det(ĝ))
-    3. Compute h_ij = (γ̄_ij - ĝ_ij) / Re_ij
-    4. Use get_bar_gamma_LL to verify consistency
-    5. Compute K = γ^ij K_ij (trace)
-    6. Compute Ā_ij and a_ij using BSSN formulas
+    Key simplification: In isotropic coordinates, the spatial metric is conformally flat:
+        γ_ij = e^{4φ} ĝ_ij
+    Therefore:
+        γ̄_ij = ĝ_ij  (conformal metric equals reference metric)
+        h_ij = 0      (no metric deviation)
+        λ^r = 0       (connection function is zero)
 
     Args:
-        adm_vars: Dict with 'alpha', 'beta_U', 'gamma_LL', 'K_LL'
-        grid: Engrenage grid
-        background: FlatSphericalBackground
-
-    Returns:
-        bssn_state: (NUM_VARS, N) array with BSSN variables
-    """
-    N = grid.N
-    r = grid.r
-    alpha = adm_vars['alpha']
-    beta_U = adm_vars['beta_U']
-    gamma_LL = adm_vars['gamma_LL']
-    K_LL = adm_vars['K_LL']
-
-    # Get background metric ĝ_ij and scaling
-    ghat_LL = background.hat_gamma_LL  # (N, 3, 3)
-    ReDD = background.scaling_matrix   # (N, 3, 3)
-    det_ghat = background.det_hat_gamma  # Use precomputed determinant
-
-    print("  Converting ADM -> BSSN (consistent with tensoralgebra functions)...")
-
-    # Step 1: Compute determinants of physical metric
-    det_gamma = np.zeros(N)
-    gamma_UU = np.zeros((N, 3, 3))
-
-    for i in range(N):
-        # Check for NaN/inf in gamma_LL
-        if not np.all(np.isfinite(gamma_LL[i])):
-            print(f"    WARNING: Non-finite values in gamma_LL[{i}] at r={r[i]:.6f}")
-            print(f"      gamma_LL[{i}] = {gamma_LL[i]}")
-            # Set to flat metric as fallback
-            gamma_LL[i] = ghat_LL[i].copy()
-
-        det_gamma[i] = np.linalg.det(gamma_LL[i])
-
-        # Protect against singular or near-singular matrices
-        if abs(det_gamma[i]) < 1e-100:
-            print(f"    WARNING: Nearly singular gamma_LL[{i}] at r={r[i]:.6f}, det={det_gamma[i]:.3e}")
-            gamma_LL[i] = ghat_LL[i].copy()
-            det_gamma[i] = det_ghat[i]
-
-        gamma_UU[i] = np.linalg.inv(gamma_LL[i])
-
-    # Step 2: Compute conformal factor φ = (1/12) ln(det(γ) / det(ĝ))
-    # This is the standard BSSN definition
-    phi = (1.0/12.0) * np.log(np.maximum(det_gamma / det_ghat, 1e-300))
-
-    # Step 3: Compute conformal metric γ̄_ij = e^{-4φ} γ_ij
-    # This automatically enforces det(γ̄) = det(ĝ)
-    em4phi = np.exp(-4.0 * phi)
-    gammabar_LL = np.zeros((N, 3, 3))
-    for i in range(N):
-        gammabar_LL[i] = em4phi[i] * gamma_LL[i]
-
-    # Sanity check: verify det(γ̄) ≈ det(ĝ)
-    det_gammabar = np.array([np.linalg.det(gammabar_LL[i]) for i in range(N)])
-    max_det_violation = np.max(np.abs(det_gammabar - det_ghat) / np.maximum(det_ghat, 1e-30))
-    print(f"    det(γ̄) = det(ĝ) constraint violation: max = {max_det_violation:.3e}")
-
-    # Step 4: Compute rescaled conformal metric deviation h_ij = (γ̄_ij - ĝ_ij) / Re_ij
-    h_LL = np.zeros((N, 3, 3))
-    for i in range(N):
-        for j in range(3):
-            for k in range(3):
-                if ReDD[i, j, k] != 0:
-                    h_LL[i, j, k] = (gammabar_LL[i, j, k] - ghat_LL[i, j, k]) / ReDD[i, j, k]
-
-    # Step 5: Verify consistency by reconstructing γ̄_ij using get_bar_gamma_LL
-    # (same as in bhinitialconditions.py and evolution code)
-    bar_gamma_LL_check = get_bar_gamma_LL(r, h_LL, background)
-    max_consistency_error = np.max(np.abs(bar_gamma_LL_check - gammabar_LL))
-    print(f"    γ̄_ij consistency check: max error = {max_consistency_error:.3e}")
-
-    # Step 6: Compute trace of extrinsic curvature K = γ^ij K_ij
-    K = np.zeros(N)
-    for i in range(N):
-        K[i] = np.einsum('ij,ij->', gamma_UU[i], K_LL[i])
-
-    # Step 7: Compute conformal traceless extrinsic curvature
-    # Ā_ij = e^{-4φ} [K_ij - (1/3) γ_ij K]
-    Abar_LL = np.zeros((N, 3, 3))
-    for i in range(N):
-        for j in range(3):
-            for k in range(3):
-                A_LL_jk = K_LL[i, j, k] - (1.0/3.0) * gamma_LL[i, j, k] * K[i]
-                Abar_LL[i, j, k] = em4phi[i] * A_LL_jk
-
-    # Step 8: Compute rescaled a_ij = Ā_ij / Re_ij
-    a_LL = np.zeros((N, 3, 3))
-    for i in range(N):
-        for j in range(3):
-            for k in range(3):
-                if ReDD[i, j, k] != 0:
-                    a_LL[i, j, k] = Abar_LL[i, j, k] / ReDD[i, j, k]
-
-    # Step 8: Compute λ^r
-    # For static TOV initial data, we have two choices:
-    # A) λ^r = 0 (ideal static data) - better constraint satisfaction
-    # B) Compute λ^r numerically (discrete equilibrium) - may reduce initial transients
-
-    USE_ZERO_LAMBDA = True  # Set to False to compute λ^r numerically
-
-    if USE_ZERO_LAMBDA:
-        print("  Setting λ^r = 0 (ideal static TOV initial data)...")
-        lambda_r = np.zeros(N)
-    else:
-        print("  Computing λ^r using get_tensor_connections (consistent with BSSN evolution)...")
-
-        # Compute ∂_r h_ij using high-order finite differences
-        hrr_array = h_LL[:, i_r, i_r].reshape(1, N)
-        htt_array = h_LL[:, i_t, i_t].reshape(1, N)
-        hpp_array = h_LL[:, i_p, i_p].reshape(1, N)
-
-        dhrr_dr = (hrr_array @ grid.derivs.drn_matrix[1].T / grid.dr)[0, :]
-        dhtt_dr = (htt_array @ grid.derivs.drn_matrix[1].T / grid.dr)[0, :]
-        dhpp_dr = (hpp_array @ grid.derivs.drn_matrix[1].T / grid.dr)[0, :]
-
-        # Build d1_h_LL array (derivative tensor)
-        d1_h_LL = np.zeros((N, 3, 3, 3))
-        d1_h_LL[:, i_r, i_r, i_r] = dhrr_dr
-        d1_h_LL[:, i_t, i_t, i_r] = dhtt_dr
-        d1_h_LL[:, i_p, i_p, i_r] = dhpp_dr
-
-        # Use get_tensor_connections from tensoralgebra.py (same as evolution code)
-        # This computes Δ^i, Δ^i_jk, and Δ_ijk consistently with the BSSN formulation
-        Delta_U, Delta_ULL, Delta_LLL = get_tensor_connections(
-            grid.r, h_LL, d1_h_LL, background
-        )
-
-        # Rescale to get λ^r = Δ^r / s^r
-        # In the rescaled formulation: λ^i = Λ̄^i / s^i where s^i is the scaling vector
-        lambda_r = Delta_U[:, i_r] / background.scaling_vector[:, i_r]
-
-        print(f"    Δ^r:  min={np.min(Delta_U[:, i_r]):.6e}, max={np.max(Delta_U[:, i_r]):.6e}")
-        print(f"    λ^r:  min={np.min(lambda_r):.6e}, max={np.max(lambda_r):.6e}")
-
-    # Pack into BSSN state vector
-    state_2d = np.zeros((grid.NUM_VARS, N))
-
-    # Conformal metric variables
-    state_2d[idx_phi, :] = phi
-    state_2d[idx_hrr, :] = h_LL[:, i_r, i_r]
-    state_2d[idx_htt, :] = h_LL[:, i_t, i_t]
-    state_2d[idx_hpp, :] = h_LL[:, i_p, i_p]
-
-    # Extrinsic curvature variables
-    state_2d[idx_K, :] = K
-    state_2d[idx_arr, :] = a_LL[:, i_r, i_r]
-    state_2d[idx_att, :] = a_LL[:, i_t, i_t]
-    state_2d[idx_app, :] = a_LL[:, i_p, i_p]
-
-    # Gauge variables
-    state_2d[idx_lapse, :] = alpha
-
-    # Connection function and shift
-    # For static TOV:
-    # - λ^r must be computed from metric derivatives (above)
-    # - β^r = 0 (no shift - time slices are orthogonal to worldlines)
-    # - b^r = 0 (shift derivative is zero)
-    state_2d[idx_lambdar, :] = lambda_r
-    state_2d[idx_shiftr, :] = 0.0
-    state_2d[idx_br, :] = 0.0
-
-    # Diagnostic: Check values at origin
-    exp4phi_at_0 = np.exp(4.0 * state_2d[idx_phi, 0])
-    print("    ADM -> BSSN conversion complete")
-    print(f"    Values at origin (r=0, i=0):")
-    print(f"      phi_bssn[0] = {state_2d[idx_phi, 0]:.10e}")
-    print(f"      exp4phi[0] = {exp4phi_at_0:.10e}  (reconstructed from phi)")
-    print(f"      alpha[0] = {state_2d[idx_lapse, 0]:.10e}")
-    return state_2d
-
-
-def create_initial_data_interpolated(tov_solution, grid, background, eos,
-                                      atmosphere=None,
-                                      polytrope_K=None, polytrope_Gamma=None,
-                                      interp_order=11):
-    """
-    Create BSSN + hydro initial data from TOV solution.
-
-    This combines:
-    1. High-order Lagrange interpolation with Gibbs protection
-    2. Rigorous ADM→BSSN conversion enforcing constraints
-
-    Workflow:
-        TOV (fine grid) → [interpolate] → ADM (evolution grid) → BSSN
-
-    TOV solution is always in Schwarzschild coordinates.
-
-    Args:
-        tov_solution: TOV solution dict on fine grid (independent of evolution grid)
+        tov_solution: TOVSolutionIso object
         grid: Engrenage evolution grid
         background: FlatSphericalBackground
         eos: Equation of state
         atmosphere: AtmosphereParams object
-        polytrope_K, polytrope_Gamma: EOS parameters for polytropic EOS
-        interp_order: Lagrange interpolation order (default 11)
+        polytrope_K, polytrope_Gamma: EOS parameters
+        interp_order: Lagrange interpolation order
 
     Returns:
         state_2d: (NUM_VARS, N) initial data array with BSSN + hydro
-        primitives: Dict with primitive variables {'rho0', 'p', 'vr', 'eps'}
+        primitives: Tuple (rho0, vr, p, eps)
     """
-    from source.matter.hydro.atmosphere import AtmosphereParams
-
-    # Handle atmosphere
-    if atmosphere is None:
-        atmosphere = AtmosphereParams()
-    elif not isinstance(atmosphere, AtmosphereParams):
-        raise TypeError("atmosphere must be AtmosphereParams")
-
     atmosphere_rho = atmosphere.rho_floor
     p_atm = atmosphere.p_floor
 
-    # Set atmosphere pressure consistent with EOS
     if polytrope_K is not None and polytrope_Gamma is not None:
         p_atm = max(p_atm, polytrope_K * (atmosphere_rho ** polytrope_Gamma))
 
-    R_star = tov_solution.R
-
-    print(f"\nCreating TOV initial data with high-order interpolation + ADM→BSSN:")
-    print(f"  Coordinate system: Schwarzschild")
-    print(f"  Interpolation order: {interp_order}")
-
-    # Step 1: TOV → ADM (with high-order interpolation + Gibbs protection)
-    adm_vars = compute_adm_from_tov_interpolated(
-        tov_solution, grid, atmosphere, interp_order)
-
-    # Step 2: ADM → BSSN (rigorous conversion enforcing constraints)
-    bssn_state = convert_adm_to_bssn(adm_vars, grid, background)
-
-    # Step 3: Set hydro primitives and convert to conservatives
-    print("  Setting hydro variables (primitives → conservatives)...")
-
-    r_grid = np.abs(grid.r)
+    R_iso = tov_solution.R_iso
+    M_star = tov_solution.M_star
     N = grid.N
 
-    # Interpolate hydro quantities with surface protection
+    print(f"\nCreating TOV initial data (ISOTROPIC coordinates):")
+    print(f"  Stellar radius R_iso = {R_iso:.6f}")
+    print(f"  Stellar radius R_schw = {tov_solution.R_schw:.6f}")
+    print(f"  Total mass M = {M_star:.6f}")
+    print(f"  Interpolation order: {interp_order}")
+    print(f"  Key simplification: h_ij = 0 (conformally flat)")
+
+    # Initialize arrays
+    exp4phi_arr = np.ones(N)
+    alpha_arr = np.ones(N)
     rho_arr = np.zeros(N)
     P_arr = np.zeros(N)
 
-    for i in range(N):
-        r_abs = abs(grid.r[i])
-        is_interior = r_abs < R_star
+    # Interpolate TOV solution to grid
+    print("  Interpolating TOV solution to evolution grid...")
+
+    # Find the central value of exp4phi by extrapolation from interior points
+    # (not from r=0 which has artificial exp4phi=1.0)
+    # Use quadratic extrapolation from first few interior points
+    r_tov = tov_solution.r_iso
+    exp4phi_tov = tov_solution.exp4phi
+    # Skip first point (r~0) and use next points for extrapolation to r=0
+    if len(r_tov) > 3:
+        # Use points 1,2,3 (skip index 0 which has exp4phi=1.0 artifact)
+        r_fit = r_tov[1:4]
+        exp4phi_fit = exp4phi_tov[1:4]
+        # Quadratic fit: exp4phi = a + b*r + c*r^2, extrapolate to r=0 -> a
+        coeffs = np.polyfit(r_fit, exp4phi_fit, 2)
+        exp4phi_central = coeffs[2]  # constant term (value at r=0)
+    else:
+        exp4phi_central = exp4phi_tov[1] if len(exp4phi_tov) > 1 else 1.0
+
+    for i, r in enumerate(grid.r):
+        r_abs = abs(r)
+
+        # Special handling for origin (r=0)
+        if r_abs < 1e-8:
+            # At origin, use extrapolated central value (NOT exp4phi=1.0)
+            exp4phi_arr[i] = exp4phi_central
+            alpha_arr[i] = tov_solution.alpha[0]
+            rho_arr[i] = tov_solution.rho_baryon[0]
+            P_arr[i] = tov_solution.P[0]
+            continue
+
+        # Minimum radius for interpolation (avoid extremely small r)
+        r_abs = max(r_abs, 1e-6)
+
+        is_interior = r_abs < R_iso
 
         if is_interior:
-            rho_arr[i] = interpolate_tov_avoiding_surface(
+            exp4phi_arr[i] = interpolate_tov_iso_avoiding_surface(
+                r_abs, tov_solution, 'exp4phi', interp_order, 1.0)
+            alpha_arr[i] = interpolate_tov_iso_avoiding_surface(
+                r_abs, tov_solution, 'alpha', interp_order, 1.0)
+            rho_arr[i] = interpolate_tov_iso_avoiding_surface(
                 r_abs, tov_solution, 'rho_baryon', interp_order, atmosphere_rho)
-            P_arr[i] = interpolate_tov_avoiding_surface(
+            P_arr[i] = interpolate_tov_iso_avoiding_surface(
                 r_abs, tov_solution, 'P', interp_order, p_atm)
 
             # Enforce floors
+            # Note: exp4phi should be >= 1.0 (it equals 1 at origin)
+            if exp4phi_arr[i] < 0.9:
+                print(f"  WARNING: exp4phi[{i}] = {exp4phi_arr[i]:.3e} at r={grid.r[i]:.3e} (should be >= 1.0)")
+                exp4phi_arr[i] = 1.0  # Reset to minimum physical value
+            alpha_arr[i] = max(alpha_arr[i], 1e-10)
             rho_arr[i] = max(rho_arr[i], atmosphere_rho)
             P_arr[i] = max(P_arr[i], p_atm)
         else:
-            # Exterior: EXACT atmosphere values (no interpolation)
+            # Exterior: exact Schwarzschild in isotropic coordinates
+            factor = 1.0 + M_star / (2.0 * r_abs)
+            exp4phi_arr[i] = factor**4
+            alpha_arr[i] = (1.0 - M_star / (2.0 * r_abs)) / factor
             rho_arr[i] = atmosphere_rho
             P_arr[i] = p_atm
 
-    # Compute specific internal energy
+    # Create BSSN state vector
+    state_2d = np.zeros((grid.NUM_VARS, N))
+
+    # BSSN variables (SIMPLE in isotropic coordinates!)
+    # φ_BSSN = (1/4) ln(e^{4φ})
+    phi_bssn = 0.25 * np.log(np.maximum(exp4phi_arr, 1e-30))
+    state_2d[idx_phi, :] = phi_bssn
+
+    # Diagnostic: Check values at origin (find point closest to r=0)
+    idx_origin = np.argmin(np.abs(grid.r))
+    print(f"  Values near origin (r={grid.r[idx_origin]:.6f}, i={idx_origin}):")
+    print(f"    exp4phi = {exp4phi_arr[idx_origin]:.10e}  (should be ~1.0)")
+    print(f"    phi_bssn = {phi_bssn[idx_origin]:.10e}  (should be ~0.0)")
+    print(f"    alpha = {alpha_arr[idx_origin]:.10e}")
+    print(f"    rho = {rho_arr[idx_origin]:.10e}")
+
+    # h_ij = 0 because γ̄_ij = ĝ_ij in isotropic coordinates
+    state_2d[idx_hrr, :] = 0.0
+    state_2d[idx_htt, :] = 0.0
+    state_2d[idx_hpp, :] = 0.0
+
+    # Extrinsic curvature: K = 0, A_ij = 0 for static star
+    state_2d[idx_K, :] = 0.0
+    state_2d[idx_arr, :] = 0.0
+    state_2d[idx_att, :] = 0.0
+    state_2d[idx_app, :] = 0.0
+
+    # Connection function: λ^r must be computed using finite differences
+    # Set to zero temporarily, will be computed after filling ghost zones
+    state_2d[idx_lambdar, :] = 0.0
+
+    # Gauge variables
+    state_2d[idx_lapse, :] = alpha_arr
+    state_2d[idx_shiftr, :] = 0.0  # Static: no shift
+    state_2d[idx_br, :] = 0.0
+
+    print(f"  BSSN metric variables set:")
+    print(f"    φ:  min={np.min(phi_bssn):.6f}, max={np.max(phi_bssn):.6f}")
+    print(f"    h_ij = 0 (conformally flat)")
+    print(f"    λ^r will be computed using FD after ghost fill")
+    print(f"    alpha:  min={np.min(alpha_arr):.6f}, max={np.max(alpha_arr):.6f}")
+
+    # Hydro variables
+    print("  Setting hydro variables...")
+
+    # Specific internal energy
     if polytrope_Gamma is not None:
-        # For polytropic EOS: ε = P / [(Γ-1) ρ₀]
         eps_arr = P_arr / np.maximum((polytrope_Gamma - 1.0) * rho_arr, 1e-30)
     else:
-        # Use EOS to compute epsilon from pressure and density
         eps_arr = np.zeros(N)
         for i in range(N):
             eps_arr[i] = eos.epsilon_from_P_rho(P_arr[i], rho_arr[i])
 
-    # Static TOV: zero radial velocity everywhere
+    # Static TOV: zero velocity
     vr_arr = np.zeros(N)
 
-    # Extract conformal factor from BSSN state to densitize conservatives
-    phi_arr = bssn_state[idx_phi, :]
-    e6phi_arr = np.exp(6.0 * phi_arr)
+    # Densitized conserved variables
+    e6phi = np.exp(6.0 * phi_bssn)
 
-    # For static TOV (v=0), the conservative variables are:
-    # D̃ = e^{6φ} ρ₀W (densitized conserved baryon density)
-    # S̃^r = 0 (no momentum for static star)
-    # τ̃ = e^{6φ} (ρ₀hW² - p - ρ₀W) (Valencia formula, densitized)
-    # NOTE: These are DENSITIZED conservatives for consistency with Valencia RHS
-    D_arr = e6phi_arr * rho_arr
-    Sr_arr = np.zeros_like(rho_arr)
+    # D̃ = e^{6φ} ρ₀ W (W=1 for static)
+    D_arr = e6phi * rho_arr
 
-    # Use full Valencia formula: τ = ρ₀hW² - p - ρ₀W (then densitize with e^{6φ})
+    # S̃^r = 0 for static star
+    Sr_arr = np.zeros(N)
+
+    # τ̃ = e^{6φ} (ρ₀hW² - p - ρ₀W) (W=1 for static)
     h_arr = 1.0 + eps_arr + P_arr / np.maximum(rho_arr, 1e-30)
-    W_arr = np.ones_like(rho_arr)  # W = 1 for static TOV (v^r = 0)
-    tau_arr = e6phi_arr * (rho_arr * h_arr * W_arr**2 - P_arr - rho_arr * W_arr)
+    tau_arr = e6phi * (rho_arr * h_arr - P_arr - rho_arr)
 
-    # Store hydro conservatives (DENSITIZED)
-    bssn_state[NUM_BSSN_VARS + 0, :] = D_arr
-    bssn_state[NUM_BSSN_VARS + 1, :] = Sr_arr
-    bssn_state[NUM_BSSN_VARS + 2, :] = tau_arr
+    # Store hydro conservatives
+    state_2d[NUM_BSSN_VARS + 0, :] = D_arr
+    state_2d[NUM_BSSN_VARS + 1, :] = Sr_arr
+    state_2d[NUM_BSSN_VARS + 2, :] = tau_arr
 
-    # Ensure exterior is EXACTLY atmosphere (prevent any interpolation artifacts)
-    # NOTE: Atmosphere values must also be densitized for consistency
-    exterior_mask = r_grid > R_star
+    # Ensure exterior is exactly atmosphere
+    r_grid = np.abs(grid.r)
+    exterior_mask = r_grid > R_iso
     n_exterior = np.sum(exterior_mask)
     if n_exterior > 0:
-        bssn_state[NUM_BSSN_VARS + 0, exterior_mask] = e6phi_arr[exterior_mask] * atmosphere_rho
-        bssn_state[NUM_BSSN_VARS + 1, exterior_mask] = 0.0
-        bssn_state[NUM_BSSN_VARS + 2, exterior_mask] = e6phi_arr[exterior_mask] * atmosphere.tau_atm
-        print(f"  Set {n_exterior} exterior points (r > {R_star:.6f}) to densitized atmosphere")
+        state_2d[NUM_BSSN_VARS + 0, exterior_mask] = e6phi[exterior_mask] * atmosphere_rho
+        state_2d[NUM_BSSN_VARS + 1, exterior_mask] = 0.0
+        state_2d[NUM_BSSN_VARS + 2, exterior_mask] = e6phi[exterior_mask] * atmosphere.tau_atm
+        print(f"  Set {n_exterior} exterior points to atmosphere")
 
     # Fill ghost zones
-    grid.fill_boundaries(bssn_state)
+    grid.fill_boundaries(state_2d)
 
-    # Package primitives for later use (avoid unnecessary cons2prim conversion)
-    # Return as tuple: (rho0, vr, p, eps)
+    # Compute lambda^r via finite differences for consistency with evolution.
+    # Following NRPy+ approach: even though h_ij = 0 in isotropic coords,
+    # we compute lambda^r numerically to ensure the same FD operators are used
+    # in initial data and evolution equations.
+    # Result: lambda^r ~ O(Δr^4) - small but nonzero, consistent with FD truncation.
+    print("  Computing lambda^r via finite differences (4th-order)...")
+    compute_lambda_from_metric_fd(state_2d, grid, background)
+    lambda_min = np.min(state_2d[idx_lambdar, NUM_GHOSTS:-NUM_GHOSTS])
+    lambda_max = np.max(state_2d[idx_lambdar, NUM_GHOSTS:-NUM_GHOSTS])
+    print(f"    lambda^r: min={lambda_min:.6e}, max={lambda_max:.6e}")
+    print(f"    (Expected: ~O(10^-10) from 4th-order FD truncation)")
+
+    # Re-fill boundaries after lambda computation
+    grid.fill_boundaries(state_2d)
+
+    # Package primitives
     primitives = (rho_arr, vr_arr, P_arr, eps_arr)
 
     print("  Initial data created successfully!\n")
-    return bssn_state, primitives
+    return state_2d, primitives
 
-
-# ============================================================================
-# Diagnostic/Validation Functions 
-# ============================================================================
 
 def plot_initial_comparison(tov_solution, initial_state_2d, grid, primitives, output_dir=".", suffix=""):
     """
-    Plot initial data vs TOV comparison (ρ0, P, v^r, α).
+    Plot initial data vs TOV comparison.
 
     Args:
-        tov_solution: TOV solution dict
+        tov_solution: TOVSolutionIso object
         initial_state_2d: BSSN state array
         grid: Grid object
-        primitives: Tuple with primitive variables (rho0, vr, p, eps)
-        output_dir: Output directory for plots
+        primitives: Tuple (rho0, vr, p, eps)
+        output_dir: Output directory
         suffix: Suffix for output filename (e.g., "_iso" for isotropic coordinates)
     """
-    # Unpack primitives tuple
     rho0_all, vr_all, p_all, eps_all = primitives
 
-    r_tov = tov_solution.r
+    r_tov = tov_solution.r_iso
     r_grid = grid.r[NUM_GHOSTS:-NUM_GHOSTS]
     rho_grid = rho0_all[NUM_GHOSTS:-NUM_GHOSTS]
     P_grid = p_all[NUM_GHOSTS:-NUM_GHOSTS]
     v_grid = vr_all[NUM_GHOSTS:-NUM_GHOSTS]
     alpha_grid = initial_state_2d[idx_lapse, NUM_GHOSTS:-NUM_GHOSTS]
+    phi_grid = initial_state_2d[idx_phi, NUM_GHOSTS:-NUM_GHOSTS]
 
-    fig, axes = plt.subplots(2, 2, figsize=(14, 10))
+    fig, axes = plt.subplots(2, 3, figsize=(16, 10))
 
-    axes[0, 0].semilogy(r_tov, tov_solution.rho_baryon, 'b-', linewidth=2, label='TOV')
-    axes[0, 0].semilogy(r_grid, np.maximum(rho_grid, 1e-20), 'r--', linewidth=1.5, alpha=0.7, label='Initial (t=0)')
-    axes[0, 0].axvline(tov_solution.R, color='gray', linestyle=':', alpha=0.5, label=f"R={tov_solution.R:.2f}")
-    axes[0, 0].set_xlabel('r')
+    # Density
+    axes[0, 0].semilogy(r_tov, np.maximum(tov_solution.rho_baryon, 1e-20), 'b-', linewidth=2, label='TOV')
+    axes[0, 0].semilogy(r_grid, np.maximum(rho_grid, 1e-20), 'r--', linewidth=1.5, alpha=0.7, label='Initial')
+    axes[0, 0].axvline(tov_solution.R_iso, color='gray', linestyle=':', alpha=0.5, label=f"R_iso={tov_solution.R_iso:.2f}")
+    axes[0, 0].set_xlabel(r'$r_{iso}$')
     axes[0, 0].set_ylabel(r'$\rho_0$')
     axes[0, 0].set_title('Baryon Density')
-    axes[0, 0].legend(); axes[0, 0].grid(True, alpha=0.3)
+    axes[0, 0].legend()
+    axes[0, 0].grid(True, alpha=0.3)
 
-    axes[0, 1].semilogy(r_tov, tov_solution.P, 'b-', linewidth=2, label='TOV')
-    axes[0, 1].semilogy(r_grid, np.maximum(P_grid, 1e-20), 'r--', linewidth=1.5, alpha=0.7, label='Initial (t=0)')
-    axes[0, 1].axvline(tov_solution.R, color='gray', linestyle=':', alpha=0.5)
-    axes[0, 1].set_xlabel('r'); axes[0, 1].set_ylabel('P'); axes[0, 1].set_title('Pressure')
-    axes[0, 1].legend(); axes[0, 1].grid(True, alpha=0.3)
+    # Pressure
+    axes[0, 1].semilogy(r_tov, np.maximum(tov_solution.P, 1e-20), 'b-', linewidth=2, label='TOV')
+    axes[0, 1].semilogy(r_grid, np.maximum(P_grid, 1e-20), 'r--', linewidth=1.5, alpha=0.7, label='Initial')
+    axes[0, 1].axvline(tov_solution.R_iso, color='gray', linestyle=':', alpha=0.5)
+    axes[0, 1].set_xlabel(r'$r_{iso}$')
+    axes[0, 1].set_ylabel('P')
+    axes[0, 1].set_title('Pressure')
+    axes[0, 1].legend()
+    axes[0, 1].grid(True, alpha=0.3)
 
-    axes[1, 0].plot(r_grid, v_grid, 'r-', linewidth=2, label='Initial (t=0)')
-    axes[1, 0].axhline(0, color='gray', linestyle='--', alpha=0.5)
-    axes[1, 0].axvline(tov_solution.R, color='gray', linestyle=':', alpha=0.5)
-    axes[1, 0].set_xlabel('r'); axes[1, 0].set_ylabel(r'$v^r$'); axes[1, 0].set_title('Radial Velocity')
-    axes[1, 0].legend(); axes[1, 0].grid(True, alpha=0.3)
+    # Velocity
+    axes[0, 2].plot(r_grid, v_grid, 'r-', linewidth=2, label='Initial')
+    axes[0, 2].axhline(0, color='gray', linestyle='--', alpha=0.5)
+    axes[0, 2].axvline(tov_solution.R_iso, color='gray', linestyle=':', alpha=0.5)
+    axes[0, 2].set_xlabel(r'$r_{iso}$')
+    axes[0, 2].set_ylabel(r'$v^r$')
+    axes[0, 2].set_title('Radial Velocity (should be 0)')
+    axes[0, 2].legend()
+    axes[0, 2].grid(True, alpha=0.3)
 
-    axes[1, 1].plot(r_tov, tov_solution.alpha, 'b-', linewidth=2, label='TOV')
-    axes[1, 1].plot(r_grid, alpha_grid, 'r--', linewidth=1.5, alpha=0.7, label='Initial (t=0)')
-    axes[1, 1].axvline(tov_solution.R, color='gray', linestyle=':', alpha=0.5)
-    axes[1, 1].set_xlabel('r'); axes[1, 1].set_ylabel(r'$\alpha$'); axes[1, 1].set_title('Lapse')
-    axes[1, 1].legend(); axes[1, 1].grid(True, alpha=0.3)
+    # Lapse
+    axes[1, 0].plot(r_tov, tov_solution.alpha, 'b-', linewidth=2, label='TOV')
+    axes[1, 0].plot(r_grid, alpha_grid, 'r--', linewidth=1.5, alpha=0.7, label='Initial')
+    axes[1, 0].axvline(tov_solution.R_iso, color='gray', linestyle=':', alpha=0.5)
+    axes[1, 0].set_xlabel(r'$r_{iso}$')
+    axes[1, 0].set_ylabel(r'$\alpha$')
+    axes[1, 0].set_title('Lapse')
+    axes[1, 0].legend()
+    axes[1, 0].grid(True, alpha=0.3)
 
-    plt.suptitle('TOV vs Initial Data (t=0)', fontsize=14, y=1.00)
+    # Conformal factor φ
+    phi_tov = 0.25 * np.log(np.maximum(tov_solution.exp4phi, 1e-30))
+    axes[1, 1].plot(r_tov, phi_tov, 'b-', linewidth=2, label='TOV')
+    axes[1, 1].plot(r_grid, phi_grid, 'r--', linewidth=1.5, alpha=0.7, label='Initial')
+    axes[1, 1].axvline(tov_solution.R_iso, color='gray', linestyle=':', alpha=0.5)
+    axes[1, 1].set_xlabel(r'$r_{iso}$')
+    axes[1, 1].set_ylabel(r'$\phi$')
+    axes[1, 1].set_title(r'Conformal Factor $\phi$ (BSSN)')
+    axes[1, 1].legend()
+    axes[1, 1].grid(True, alpha=0.3)
+
+    # h_rr should be zero
+    h_rr_grid = initial_state_2d[idx_hrr, NUM_GHOSTS:-NUM_GHOSTS]
+    axes[1, 2].plot(r_grid, h_rr_grid, 'r-', linewidth=2, label=r'$h_{rr}$')
+    axes[1, 2].axhline(0, color='gray', linestyle='--', alpha=0.5)
+    axes[1, 2].axvline(tov_solution.R_iso, color='gray', linestyle=':', alpha=0.5)
+    axes[1, 2].set_xlabel(r'$r_{iso}$')
+    axes[1, 2].set_ylabel(r'$h_{rr}$')
+    axes[1, 2].set_title(r'$h_{rr}$ (should be 0 in isotropic)')
+    axes[1, 2].legend()
+    axes[1, 2].grid(True, alpha=0.3)
+
+    plt.suptitle(f'TOV Initial Data (Isotropic): M={tov_solution.M_star:.4f}, R_iso={tov_solution.R_iso:.3f}',
+                 fontsize=12, y=1.00)
     plt.tight_layout()
-    import os
+
     filepath = os.path.join(output_dir, f'tov_initial_data_comparison{suffix}.png')
     plt.savefig(filepath, dpi=150, bbox_inches='tight')
     plt.close(fig)
     print(f"Saved: {filepath}")
 
 
-def plot_hamiltonian_constraint(tov_solution, initial_state_2d, grid, background, hydro,
-                                  polytrope_K, polytrope_Gamma, rho_central, output_dir="."):
+def plot_hamiltonian_constraint_iso(tov_solution, initial_state_2d, grid, background, hydro,
+                                     polytrope_K, polytrope_Gamma, rho_central, output_dir="."):
     """
-    Compute and plot Hamiltonian constraint for TOV initial data.
-
-    Args:
-        tov_solution: TOV solution dict
-        initial_state_2d: BSSN state array (NUM_VARS, N)
-        grid: Grid object
-        background: Background object
-        hydro: PerfectFluid object
-        polytrope_K: Polytrope K parameter
-        polytrope_Gamma: Polytrope Gamma parameter
-        rho_central: Central density
-        output_dir: Output directory for plots
+    Compute and plot Hamiltonian constraint for TOV initial data in isotropic coords.
     """
     from source.bssn.constraintsdiagnostic import get_constraints_diagnostic
 
     print("\n" + "="*80)
-    print("HAMILTONIAN CONSTRAINT COMPUTATION")
+    print("HAMILTONIAN CONSTRAINT (Isotropic Coordinates)")
     print("="*80)
 
     print("\nComputing Hamiltonian constraint...")
-    print("  Using get_constraints_diagnostic from constraintsdiagnostic.py")
-
-    # Get constraints (Ham, Mom) at t=0
     Ham, Mom = get_constraints_diagnostic(
         initial_state_2d, t=0.0, grid=grid,
         background=background, matter=hydro
     )
 
-    # Ham has shape (num_times, N) - for single time it's (1, N)
     Ham_profile = Ham[0, :] if Ham.ndim == 2 else Ham
+    R_iso = tov_solution.R_iso
 
-    print("  Hamiltonian constraint computed successfully!")
-
-    # Find stellar surface index
-    R_star = tov_solution.R
-
-    # IMPORTANT: Exclude ghost zones from constraint analysis
+    # Exclude ghost zones
     N_total = len(grid.r)
     physical_mask = np.zeros(N_total, dtype=bool)
     physical_mask[NUM_GHOSTS:N_total-NUM_GHOSTS] = True
 
-    print(f"\nNote: Excluding {NUM_GHOSTS} ghost zones on each side from statistics")
-    print(f"      Physical domain: indices [{NUM_GHOSTS}, {N_total-NUM_GHOSTS-1}]")
-
-    # Compute statistics (interior vs exterior, excluding ghosts)
-    mask_interior = (np.abs(grid.r) < R_star) & physical_mask
-    mask_exterior = (np.abs(grid.r) >= R_star) & physical_mask
+    mask_interior = (np.abs(grid.r) < R_iso) & physical_mask
+    mask_exterior = (np.abs(grid.r) >= R_iso) & physical_mask
 
     Ham_interior = Ham_profile[mask_interior]
     Ham_exterior = Ham_profile[mask_exterior]
     Ham_physical = Ham_profile[physical_mask]
 
-    print(f"\nInterior (r < R = {R_star:.4f}, excluding ghosts):")
-    print(f"  Mean |Ham|     = {np.mean(np.abs(Ham_interior)):.6e}")
-    print(f"  Max |Ham|      = {np.max(np.abs(Ham_interior)):.6e}")
-    print(f"  RMS Ham        = {np.sqrt(np.mean(Ham_interior**2)):.6e}")
+    print(f"\nInterior (r_iso < R_iso = {R_iso:.4f}):")
+    print(f"  Mean |Ham| = {np.mean(np.abs(Ham_interior)):.6e}")
+    print(f"  Max |Ham|  = {np.max(np.abs(Ham_interior)):.6e}")
+    print(f"  RMS Ham    = {np.sqrt(np.mean(Ham_interior**2)):.6e}")
 
-    print(f"\nExterior (r >= R, excluding ghosts):")
-    print(f"  Mean |Ham|     = {np.mean(np.abs(Ham_exterior)):.6e}")
-    print(f"  Max |Ham|      = {np.max(np.abs(Ham_exterior)):.6e}")
-    print(f"  RMS Ham        = {np.sqrt(np.mean(Ham_exterior**2)):.6e}")
+    print(f"\nExterior:")
+    print(f"  Mean |Ham| = {np.mean(np.abs(Ham_exterior)):.6e}")
+    print(f"  Max |Ham|  = {np.max(np.abs(Ham_exterior)):.6e}")
 
-    print(f"\nGlobal (physical domain only):")
-    print(f"  Mean |Ham|     = {np.mean(np.abs(Ham_physical)):.6e}")
-    print(f"  Max |Ham|      = {np.max(np.abs(Ham_physical)):.6e}")
-    print(f"  RMS Ham        = {np.sqrt(np.mean(Ham_physical**2)):.6e}")
+    print(f"\nGlobal:")
+    print(f"  Mean |Ham| = {np.mean(np.abs(Ham_physical)):.6e}")
+    print(f"  Max |Ham|  = {np.max(np.abs(Ham_physical)):.6e}")
 
-    print("\n" + "="*80)
+    # Compute relative error (similar to NRPy+ tutorial)
+    # Use the maximum absolute value as reference
+    Ham_max = np.max(np.abs(Ham_physical))
 
-    # Plot Hamiltonian constraint
-    print("\nPlotting Hamiltonian constraint...")
+    # Avoid division by zero
+    if Ham_max < 1e-30:
+        Ham_max = 1.0
 
+    # Compute relative error and log10
+    relative_error = np.abs(Ham_profile) / Ham_max
+    log10_relative_error = np.log10(relative_error + 1e-20)  # Add small value to avoid log(0)
+
+    # Normalize x-axis by stellar mass
+    M_star = tov_solution.M_star
+    r_normalized = grid.r / M_star
+
+    # Plot
     fig, axes = plt.subplots(2, 1, figsize=(12, 8))
 
-    # Plot 1: Hamiltonian constraint vs radius
-    axes[0].plot(grid.r, Ham_profile, 'b-', linewidth=1.5, label='Ham constraint')
-    axes[0].axvline(R_star, color='red', linestyle='--',
-                   alpha=0.5, label=f'R = {R_star:.2f}')
-    axes[0].axhline(0, color='gray', linestyle=':', alpha=0.5)
-    axes[0].set_xlabel('r')
-    axes[0].set_ylabel('Ham')
-    axes[0].set_title('Hamiltonian Constraint')
+    # Plot 1: log10(Relative Error) vs r/M (like NRPy+ tutorial)
+    axes[0].plot(r_normalized, log10_relative_error, 'b-', linewidth=1.5)
+    axes[0].axvline(R_iso / M_star, color='red', linestyle='--', alpha=0.5,
+                    label=f'R_iso/M={R_iso/M_star:.2f}')
+    axes[0].set_xlabel(r'$r_{iso}/M$')
+    axes[0].set_ylabel(r'$\log_{10}$(Relative Error)')
+    axes[0].set_title(r'Hamiltonian Constraint: $\log_{10}$(|Ham|/|Ham|$_{max}$)')
     axes[0].legend()
+
+    
+    axes[0].set_xlim([0, 14])
+    axes[0].set_ylim([-10, -3])
     axes[0].grid(True, alpha=0.3)
 
-    # Plot 2: Log scale to see small violations
-    axes[1].semilogy(grid.r, np.abs(Ham_profile) + 1e-20, 'b-', linewidth=1.5, label='|Ham|')
-    axes[1].axvline(R_star, color='red', linestyle='--',
-                   alpha=0.5, label=f'R = {R_star:.2f}')
-    axes[1].set_xlabel('r')
+    # Plot 2: Absolute value in log scale
+    axes[1].semilogy(grid.r, np.abs(Ham_profile) + 1e-20, 'b-', linewidth=1.5)
+    axes[1].axvline(R_iso, color='red', linestyle='--', alpha=0.5)
+    axes[1].set_xlabel(r'$r_{iso}$')
     axes[1].set_ylabel('|Ham|')
-    axes[1].set_title('Hamiltonian Constraint (log scale)')
-    axes[1].legend()
+    axes[1].set_title('Hamiltonian Constraint (absolute value)')
+    axes[1].set_xlim([0, 14])
     axes[1].grid(True, alpha=0.3)
 
-    plt.suptitle(f'TOV Initial Data: Hamiltonian Constraint\nK={polytrope_K}, Γ={polytrope_Gamma}, ρ_c={rho_central:.3e}',
+    plt.suptitle(f'TOV Isotropic: Ham Constraint (K={polytrope_K}, Γ={polytrope_Gamma}, ρ_c={rho_central:.3e})',
                  fontsize=12, y=0.995)
     plt.tight_layout()
 
-    import os
-    filepath = os.path.join(output_dir, 'tov_hamiltonian_constraint.png')
+    filepath = os.path.join(output_dir, 'tov_hamiltonian_constraint_iso.png')
     plt.savefig(filepath, dpi=150, bbox_inches='tight')
     plt.close(fig)
-    print(f"  Saved: {filepath}")
+    print(f"\nSaved: {filepath}")
 
     print("\n" + "="*80)
-    print("INTERPRETATION:")
-    print("  - For ideal TOV initial data, Ham should be ~ 0 everywhere")
-    print("  - Small violations (< 10^-10) indicate numerical errors from interpolation")
-    print("  - Large violations indicate problems with initial data construction")
+    print("Note: In isotropic coords with h_ij=0, constraint violations")
+    print("      should come primarily from interpolation and FD errors.")
     print("="*80 + "\n")
 
 
-# Backward compatibility alias
-create_initial_data = create_initial_data_interpolated
+# Backward compatibility
+create_initial_data = create_initial_data_iso
 
 
 if __name__ == "__main__":
@@ -754,24 +594,24 @@ if __name__ == "__main__":
     from source.matter.hydro.eos import IdealGasEOS
     from source.matter.hydro.atmosphere import AtmosphereParams
     from source.backgrounds.sphericalbackground import FlatSphericalBackground
-    from examples.TOV.tov_solver import TOVSolver, plot_tov_diagnostics
+    from examples.TOV.tov_solver import TOVSolverIso, plot_tov_iso_diagnostics
 
-    p = argparse.ArgumentParser(description='Generate and validate TOV initial data in Engrenage.')
+    p = argparse.ArgumentParser(description='Generate TOV initial data in isotropic coordinates')
     p.add_argument('--r_max', type=float, default=20.0)
     p.add_argument('--num_points', type=int, default=3000)
     p.add_argument('--K', type=float, default=100.0)
     p.add_argument('--Gamma', type=float, default=2.0)
     p.add_argument('--rho_central', type=float, default=1.28e-3)
-    p.add_argument('--atmosphere_rho', type=float, default=1.0e-12)
-    p.add_argument('--interp_order', type=int, default=11)
-    p.add_argument('--save_npz', type=str, default='')
+    p.add_argument('--atmosphere_rho', type=float, default=1.0e-10)
+    p.add_argument('--interp_order', type=int, default=12)
+    p.add_argument('--save_npz', type=str, default=None)
     args = p.parse_args()
 
     print('='*70)
-    print('TOV Initial Data - Engrenage (High-Order Interpolation + ADM->BSSN)')
+    print('TOV Initial Data – ISOTROPIC COORDINATES')
     print('='*70)
     print(f"Grid: N={args.num_points}, r_max={args.r_max}")
-    print(f"EOS (TOV): K={args.K}, Gamma={args.Gamma}")
+    print(f"EOS: K={args.K}, Gamma={args.Gamma}")
     print(f"rho_central={args.rho_central}, rho_atm={args.atmosphere_rho}")
     print(f"Interpolation order: {args.interp_order}\n")
 
@@ -784,46 +624,51 @@ if __name__ == "__main__":
     grid = Grid(spacing, state_vector)
     background = FlatSphericalBackground(grid.r)
 
-    # Solve TOV on fine grid (independent of evolution grid)
-    solver = TOVSolver(K=args.K, Gamma=args.Gamma)
-    # Use 2x denser grid for TOV solution
-    r_tov_fine = np.linspace(0, args.r_max, 2 * args.num_points)
-    tov_solution = solver.solve(args.rho_central, r_grid=r_tov_fine, r_max=args.r_max)
-    print(f"TOV: M={tov_solution.M_star:.6f}, R={tov_solution.R:.3f}, C={tov_solution.C:.4f}\n")
+    # Solve TOV in isotropic coordinates
+    solver = TOVSolverIso(K=args.K, Gamma=args.Gamma)
+    tov_solution = solver.solve(args.rho_central, r_max_iso=args.r_max, accuracy='high')
 
-    plot_tov_diagnostics(tov_solution, args.r_max)
+    print(f"TOV Solution (Isotropic):")
+    print(f"  M       = {tov_solution.M_star:.6f}")
+    print(f"  R_schw  = {tov_solution.R_schw:.6f}")
+    print(f"  R_iso   = {tov_solution.R_iso:.6f}")
+    print(f"  C       = {tov_solution.C:.4f}\n")
+
+    # Plot TOV diagnostics
+    fig = plot_tov_iso_diagnostics(tov_solution, args.r_max)
+    plt.savefig('tov_solution_iso.png', dpi=150, bbox_inches='tight')
+    plt.close(fig)
 
     # Build initial data
     hydro = PerfectFluid(eos=IdealGasEOS(gamma=args.Gamma), spacetime_mode="dynamic",
                          atmosphere=ATMOSPHERE)
     hydro.background = background
-    initial_state_2d, primitives = create_initial_data_interpolated(
+
+    initial_state_2d, primitives = create_initial_data_iso(
         tov_solution, grid, background, hydro.eos,
         atmosphere=hydro.atmosphere,
         polytrope_K=args.K, polytrope_Gamma=args.Gamma,
         interp_order=args.interp_order
     )
 
-    # Diagnostics/plots (use primitives directly, no cons2prim needed)
+    # Diagnostics
     plot_initial_comparison(tov_solution, initial_state_2d, grid, primitives)
-
-    # Compute and plot Hamiltonian constraint
-    plot_hamiltonian_constraint(tov_solution, initial_state_2d, grid, background, hydro,
-                                args.K, args.Gamma, args.rho_central)
+    plot_hamiltonian_constraint_iso(tov_solution, initial_state_2d, grid, background, hydro,
+                                     args.K, args.Gamma, args.rho_central)
 
     if args.save_npz:
         np.savez_compressed(args.save_npz,
                             state=initial_state_2d,
                             r=grid.r,
-                            tov_r=tov_solution.r,
+                            r_iso=tov_solution.r_iso,
+                            r_schw=tov_solution.r_schw,
                             tov_rho=tov_solution.rho_baryon,
                             tov_P=tov_solution.P,
-                            tov_M=tov_solution.M,
                             tov_alpha=tov_solution.alpha,
                             tov_exp4phi=tov_solution.exp4phi)
-        print(f"\nSaved initial data NPZ to {args.save_npz}")
+        print(f"\nSaved initial data to {args.save_npz}")
 
     print('\nSaved diagnostic figures:')
-    print('  - tov_solution.png')
-    print('  - tov_initial_data_comparison.png')
-    print('  - tov_hamiltonian_constraint.png')
+    print('  - tov_solution_iso.png')
+    print('  - tov_initial_data_comparison_iso.png')
+    print('  - tov_hamiltonian_constraint_iso.png')

@@ -15,8 +15,6 @@ from .atmosphere import AtmosphereParams
 class PerfectFluid:
     """
     Relativistic perfect fluid implementation for engrenage.
-
-    Follows the engrenage matter interface pattern used by ScalarMatter and NoMatter.
     Implements Valencia formulation for conservative evolution and provides
     stress-energy tensor for BSSN coupling.
 

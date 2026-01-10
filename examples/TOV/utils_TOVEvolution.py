@@ -34,6 +34,37 @@ if not os.path.exists(plots_dir):
 # DATA MANAGEMENT
 # =============================================================================
 
+def get_star_folder_name(rho_central, num_points, K, Gamma, evolution_mode="cowling"):
+    """
+    Generate folder name based on star parameters and evolution mode.
+
+    Format: tov_star_rhoc{rho}_N{N}_K{K}_G{Gamma}_{mode}
+
+    Args:
+        rho_central: Central density (e.g., 1.28e-3)
+        num_points: Number of grid points
+        K: Polytropic constant
+        Gamma: Adiabatic index
+        evolution_mode: "cowling" or "dynamic"
+
+    Returns:
+        str: Folder name like "tov_star_rhoc1p28em3_N100_K100_G2_cow"
+    """
+    # Format rho_central: 1.28e-3 -> "1p28em3"
+    rho_str = f"{rho_central:.2e}"
+    # Replace '.' with 'p', remove '+', replace '-' with 'm'
+    rho_str = rho_str.replace(".", "p").replace("+", "").replace("-", "m")
+
+    # Format K and Gamma (as integers if they are whole numbers)
+    K_str = str(int(K)) if K == int(K) else f"{K:.1f}".replace(".", "p")
+    G_str = str(int(Gamma)) if Gamma == int(Gamma) else f"{Gamma:.1f}".replace(".", "p")
+
+    # Mode suffix: cow for cowling, dyn for dynamic
+    mode_suffix = "cow" if evolution_mode == "cowling" else "dyn"
+
+    return f"tov_star_rhoc{rho_str}_N{num_points}_K{K_str}_G{G_str}_{mode_suffix}"
+
+
 class SimulationDataManager:
     """Manages data storage for long TOV simulations."""
 
@@ -42,7 +73,7 @@ class SimulationDataManager:
         Initialize data manager.
 
         Args:
-            output_dir: Directory for output files
+            output_dir: Directory for output files (should be the star-specific folder)
             grid: Grid object
             hydro: Hydro object
             enable_saving: If True, saves data to files
@@ -57,14 +88,18 @@ class SimulationDataManager:
         self.grid = grid
         self.hydro = hydro
 
-        # Create output directory
+        # Create output directory (overwrites if exists)
         os.makedirs(output_dir, exist_ok=True)
 
-        # Initialize HDF5 files with coordinate system suffix
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        self.snapshot_file = os.path.join(output_dir, f"tov_snapshots{suffix}_{timestamp}.h5")
-        self.evolution_file = os.path.join(output_dir, f"tov_evolution{suffix}_{timestamp}.h5")
-        self.metadata_file = os.path.join(output_dir, f"tov_metadata{suffix}_{timestamp}.json")
+        # Initialize HDF5 files (no timestamp - will overwrite previous runs)
+        self.snapshot_file = os.path.join(output_dir, f"tov_snapshots{suffix}.h5")
+        self.evolution_file = os.path.join(output_dir, f"tov_evolution{suffix}.h5")
+        self.metadata_file = os.path.join(output_dir, f"tov_metadata{suffix}.json")
+
+        # Remove old files if they exist (to overwrite)
+        for f in [self.snapshot_file, self.evolution_file, self.metadata_file]:
+            if os.path.exists(f):
+                os.remove(f)
 
         # Initialize evolution data lists (for buffering)
         self.evolution_buffer = {
@@ -74,13 +109,11 @@ class SimulationDataManager:
             'p_central': [],
             'max_rho_error': [],
             'max_p_error': [],
-            'max_velocity': [],
             'l1_rho_error': [],
             'l2_rho_error': [],
             'max_D': [],
             'max_Sr': [],
-            'max_tau': [],
-            'c2p_fails': []
+            'max_tau': []
         }
 
         # Initialize HDF5 files
@@ -146,7 +179,7 @@ class SimulationDataManager:
                 'W_max': float(atmosphere_params.W_max)
             },
             'simulation': {
-                'coordinate_system': 'isotropic' if '_iso' in self.suffix else 'schwarzschild',
+                'coordinate_system': 'isotropic',
                 'dt': float(dt) if dt is not None else None,
                 'integration_method': integration_method,
                 'grid_N': int(self.grid.N),
@@ -234,13 +267,11 @@ class SimulationDataManager:
         self.evolution_buffer['p_central'].append(p[NUM_GHOSTS])
         self.evolution_buffer['max_rho_error'].append(np.max(rel_delta_rho))
         self.evolution_buffer['max_p_error'].append(np.max(rel_delta_p))
-        self.evolution_buffer['max_velocity'].append(np.max(np.abs(vr)))
         self.evolution_buffer['l1_rho_error'].append(l1_rho)
         self.evolution_buffer['l2_rho_error'].append(l2_rho)
         self.evolution_buffer['max_D'].append(np.max(state_2d[self.hydro.idx_D, :]))
         self.evolution_buffer['max_Sr'].append(np.max(np.abs(state_2d[self.hydro.idx_Sr, :])))
         self.evolution_buffer['max_tau'].append(np.max(state_2d[self.hydro.idx_tau, :]))
-        self.evolution_buffer['c2p_fails'].append(np.sum(~success))
 
     def flush_evolution_buffer(self):
         """Write buffered evolution data to HDF5 file."""
@@ -295,19 +326,6 @@ def diagnose_t0_residuals(state_2d, grid, background, hydro):
     print(f"  max |dS_r/dt| at r={grid.r[i_max]:.6f} (i={i_max}) -> {rhs_Sr[i_max]:.3e}")
     print(f"  max |dD/dt|   = {np.max(np.abs(rhs_D[interior])):.3e}")
     print(f"  max |dτ/dt|   = {np.max(np.abs(rhs_tau[interior])):.3e}")
-
-    # Coarse surface estimate from primitives
-    rho0, vr, p, eps, W, h, _ = hydro._get_primitives(bssn_vars, grid.r)
-    mask_interior = rho0 > 1e-6
-    if np.any(mask_interior):
-        i_surf = np.where(mask_interior)[0][-1]
-        print(f"  estimated stellar surface near r={grid.r[i_surf]:.6f} (i={i_surf})")
-        window = slice(max(NUM_GHOSTS, i_surf-5), min(grid.N-NUM_GHOSTS, i_surf+6))
-        print("  dS_r/dt in 11-pt window around surface:")
-        for ii in range(window.start, window.stop):
-            print(f"    i={ii:5d}, r={grid.r[ii]:8.5f}, dS_r/dt={rhs_Sr[ii]: .3e}")
-    else:
-        print("  WARNING: could not locate interior points above threshold.")
 
 
 # =============================================================================
@@ -573,7 +591,7 @@ def plot_tov_diagnostics(tov_solution, r_max, suffix=""):
     axes[0, 0].set_title('Baryon Density')
     axes[0, 0].set_xlim(0, r_max)
     axes[0, 0].legend()
-    axes[0, 0].grid(True, alpha=0.3)
+    # axes[0, 0].grid(True, alpha=0.3)
 
     # Pressure
     axes[0, 1].plot(r, P, color='darkgreen')
@@ -582,7 +600,7 @@ def plot_tov_diagnostics(tov_solution, r_max, suffix=""):
     axes[0, 1].set_ylabel('P')
     axes[0, 1].set_title('Pressure')
     axes[0, 1].set_xlim(0, r_max)
-    axes[0, 1].grid(True, alpha=0.3)
+    # axes[0, 1].grid(True, alpha=0.3)
 
     # Enclosed Mass
     axes[0, 2].plot(r, M, color='maroon')
@@ -593,7 +611,7 @@ def plot_tov_diagnostics(tov_solution, r_max, suffix=""):
     axes[0, 2].set_title('Enclosed Mass')
     axes[0, 2].set_xlim(0, r_max)
     axes[0, 2].legend()
-    axes[0, 2].grid(True, alpha=0.3)
+    # axes[0, 2].grid(True, alpha=0.3)
 
     # Lapse alpha(r)
     axes[1, 0].plot(r, alpha, color='purple')
@@ -602,7 +620,7 @@ def plot_tov_diagnostics(tov_solution, r_max, suffix=""):
     axes[1, 0].set_ylabel('alpha')
     axes[1, 0].set_title('Lapse Function')
     axes[1, 0].set_xlim(0, r_max)
-    axes[1, 0].grid(True, alpha=0.3)
+    # axes[1, 0].grid(True, alpha=0.3)
 
     # Phi(r)
     phi = 0.25 * np.log(exp4phi)
@@ -612,7 +630,7 @@ def plot_tov_diagnostics(tov_solution, r_max, suffix=""):
     axes[1, 1].set_ylabel('phi')
     axes[1, 1].set_title('Conformal Factor phi')
     axes[1, 1].set_xlim(0, r_max)
-    axes[1, 1].grid(True, alpha=0.3)
+    # axes[1, 1].grid(True, alpha=0.3)
 
     # a(r) metric function
     a_metric = np.sqrt(exp4phi)
@@ -622,7 +640,7 @@ def plot_tov_diagnostics(tov_solution, r_max, suffix=""):
     axes[1, 2].set_ylabel('a(r)')
     axes[1, 2].set_title('Metric a(r)')
     axes[1, 2].set_xlim(0, r_max)
-    axes[1, 2].grid(True, alpha=0.3)
+    # axes[1, 2].grid(True, alpha=0.3)
 
     plt.tight_layout()
     out_path = os.path.join(plots_dir, f'tov_solution{suffix}.png')
@@ -655,7 +673,7 @@ def plot_first_step(state_t0, state_t1, grid, hydro, tov_solution=None, suffix="
     axes[0, 0].set_ylabel('rho0')
     axes[0, 0].set_title('Baryon Density')
     axes[0, 0].legend()
-    axes[0, 0].grid(True, alpha=0.3)
+    # axes[0, 0].grid(True, alpha=0.3)
 
     axes[0, 1].plot(r, p_0, 'b-', label='t=0', linewidth=1.5)
     axes[0, 1].plot(r, p_1, 'r--', label='t=dt', linewidth=1.5)
@@ -663,7 +681,7 @@ def plot_first_step(state_t0, state_t1, grid, hydro, tov_solution=None, suffix="
     axes[0, 1].set_ylabel('P')
     axes[0, 1].set_title('Pressure')
     axes[0, 1].legend()
-    axes[0, 1].grid(True, alpha=0.3)
+    # axes[0, 1].grid(True, alpha=0.3)
 
     axes[0, 2].plot(r, vr_0, 'b-', label='t=0', linewidth=1.5)
     axes[0, 2].plot(r, vr_1, 'r--', label='t=dt', linewidth=1.5)
@@ -671,7 +689,7 @@ def plot_first_step(state_t0, state_t1, grid, hydro, tov_solution=None, suffix="
     axes[0, 2].set_ylabel('v^r')
     axes[0, 2].set_title('Radial Velocity')
     axes[0, 2].legend()
-    axes[0, 2].grid(True, alpha=0.3)
+    # axes[0, 2].grid(True, alpha=0.3)
 
     # Row 2: Conservative variables
     D_0 = state_t0[hydro.idx_D, :]
@@ -687,7 +705,7 @@ def plot_first_step(state_t0, state_t1, grid, hydro, tov_solution=None, suffix="
     axes[1, 0].set_ylabel('D')
     axes[1, 0].set_title('Conserved D')
     axes[1, 0].legend()
-    axes[1, 0].grid(True, alpha=0.3)
+    # axes[1, 0].grid(True, alpha=0.3)
 
     axes[1, 1].plot(r, Sr_0, 'b-', label='t=0', linewidth=1.5)
     axes[1, 1].plot(r, Sr_1, 'r--', label='t=dt', linewidth=1.5)
@@ -695,7 +713,7 @@ def plot_first_step(state_t0, state_t1, grid, hydro, tov_solution=None, suffix="
     axes[1, 1].set_ylabel('Sr')
     axes[1, 1].set_title('Conserved Sr')
     axes[1, 1].legend()
-    axes[1, 1].grid(True, alpha=0.3)
+    # axes[1, 1].grid(True, alpha=0.3)
 
     axes[1, 2].plot(r, tau_0, 'b-', label='t=0', linewidth=1.5)
     axes[1, 2].plot(r, tau_1, 'r--', label='t=dt', linewidth=1.5)
@@ -703,7 +721,7 @@ def plot_first_step(state_t0, state_t1, grid, hydro, tov_solution=None, suffix="
     axes[1, 2].set_ylabel('tau')
     axes[1, 2].set_title('Conserved tau')
     axes[1, 2].legend()
-    axes[1, 2].grid(True, alpha=0.3)
+    # axes[1, 2].grid(True, alpha=0.3)
 
     plt.tight_layout()
     out_path = os.path.join(plots_dir, f'tov_first_step{suffix}.png')
@@ -755,7 +773,7 @@ def plot_center_zoom(state_t0, state_t1, grid, hydro, window=0.5, suffix=""):
     axes[0, 0].set_ylabel(r'$\rho_0$')
     axes[0, 0].set_title('Baryon Density (center)')
     axes[0, 0].legend()
-    axes[0, 0].grid(True, alpha=0.3)
+    # axes[0, 0].grid(True, alpha=0.3)
 
     axes[0, 1].plot(r[mask], p_0[mask], 'b-', label='t=0', linewidth=1.5)
     axes[0, 1].plot(r[mask], p_1[mask], 'r--', label='t=dt', linewidth=1.5)
@@ -763,7 +781,7 @@ def plot_center_zoom(state_t0, state_t1, grid, hydro, window=0.5, suffix=""):
     axes[0, 1].set_ylabel('P')
     axes[0, 1].set_title('Pressure (center)')
     axes[0, 1].legend()
-    axes[0, 1].grid(True, alpha=0.3)
+    # axes[0, 1].grid(True, alpha=0.3)
 
     axes[0, 2].plot(r[mask], vr_0[mask], 'b-', label='t=0', linewidth=1.5)
     axes[0, 2].plot(r[mask], vr_1[mask], 'r--', label='t=dt', linewidth=1.5)
@@ -771,7 +789,7 @@ def plot_center_zoom(state_t0, state_t1, grid, hydro, window=0.5, suffix=""):
     axes[0, 2].set_ylabel(r'$v^r$')
     axes[0, 2].set_title('Radial Velocity (center)')
     axes[0, 2].legend()
-    axes[0, 2].grid(True, alpha=0.3)
+    # axes[0, 2].grid(True, alpha=0.3)
 
     # Row 2: Conservative variables
     axes[1, 0].plot(r[mask], D_0[mask], 'b-', label='t=0', linewidth=1.5)
@@ -780,7 +798,7 @@ def plot_center_zoom(state_t0, state_t1, grid, hydro, window=0.5, suffix=""):
     axes[1, 0].set_ylabel('D')
     axes[1, 0].set_title('Conserved D (center)')
     axes[1, 0].legend()
-    axes[1, 0].grid(True, alpha=0.3)
+    # axes[1, 0].grid(True, alpha=0.3)
 
     axes[1, 1].plot(r[mask], Sr_0[mask], 'b-', label='t=0', linewidth=1.5)
     axes[1, 1].plot(r[mask], Sr_1[mask], 'r--', label='t=dt', linewidth=1.5)
@@ -788,7 +806,7 @@ def plot_center_zoom(state_t0, state_t1, grid, hydro, window=0.5, suffix=""):
     axes[1, 1].set_ylabel(r'$S_r$')
     axes[1, 1].set_title('Conserved Sr (center)')
     axes[1, 1].legend()
-    axes[1, 1].grid(True, alpha=0.3)
+    # axes[1, 1].grid(True, alpha=0.3)
 
     axes[1, 2].plot(r[mask], tau_0[mask], 'b-', label='t=0', linewidth=1.5)
     axes[1, 2].plot(r[mask], tau_1[mask], 'r--', label='t=dt', linewidth=1.5)
@@ -796,7 +814,7 @@ def plot_center_zoom(state_t0, state_t1, grid, hydro, window=0.5, suffix=""):
     axes[1, 2].set_ylabel(r'$\tau$')
     axes[1, 2].set_title('Conserved tau (center)')
     axes[1, 2].legend()
-    axes[1, 2].grid(True, alpha=0.3)
+    # axes[1, 2].grid(True, alpha=0.3)
 
     plt.suptitle(f'Center Zoom: r ∈ [0, {window}]', fontsize=14)
     plt.tight_layout()
@@ -843,7 +861,7 @@ def plot_surface_zoom(tov_solution, state_t0, state_t1, grid, hydro, primitives_
     axes[0, 0].set_ylabel(r'$\rho_0$')
     axes[0, 0].set_title('Baryon Density (surface)')
     axes[0, 0].legend()
-    axes[0, 0].grid(True, alpha=0.3)
+    # axes[0, 0].grid(True, alpha=0.3)
 
     axes[0, 1].plot(r[mask], p_0[mask], 'b-', label='t=0', linewidth=1.5)
     axes[0, 1].plot(r[mask], p_1[mask], 'r--', label='t=dt', linewidth=1.5)
@@ -853,7 +871,7 @@ def plot_surface_zoom(tov_solution, state_t0, state_t1, grid, hydro, primitives_
     axes[0, 1].set_yscale('log')
     axes[0, 1].set_title('Pressure (surface)')
     axes[0, 1].legend()
-    axes[0, 1].grid(True, alpha=0.3)
+    # axes[0, 1].grid(True, alpha=0.3)
 
     axes[0, 2].plot(r[mask], vr_0[mask], 'b-', label='t=0', linewidth=1.5)
     axes[0, 2].plot(r[mask], vr_1[mask], 'r--', label='t=dt', linewidth=1.5)
@@ -862,7 +880,7 @@ def plot_surface_zoom(tov_solution, state_t0, state_t1, grid, hydro, primitives_
     axes[0, 2].set_ylabel(r'$v^r$')
     axes[0, 2].set_title('Radial Velocity (surface)')
     axes[0, 2].legend()
-    axes[0, 2].grid(True, alpha=0.3)
+    # axes[0, 2].grid(True, alpha=0.3)
 
     # Row 2: Conservative variables
     D_0 = state_t0[hydro.idx_D, :]
@@ -880,7 +898,7 @@ def plot_surface_zoom(tov_solution, state_t0, state_t1, grid, hydro, primitives_
     axes[1, 0].set_yscale('log')
     axes[1, 0].set_title('Conserved D (surface)')
     axes[1, 0].legend()
-    axes[1, 0].grid(True, alpha=0.3)
+    # axes[1, 0].grid(True, alpha=0.3)
 
     axes[1, 1].plot(r[mask], Sr_0[mask], 'b-', label='t=0', linewidth=1.5)
     axes[1, 1].plot(r[mask], Sr_1[mask], 'r--', label='t=dt', linewidth=1.5)
@@ -889,7 +907,7 @@ def plot_surface_zoom(tov_solution, state_t0, state_t1, grid, hydro, primitives_
     axes[1, 1].set_ylabel(r'$S_r$')
     axes[1, 1].set_title('Conserved Sr (surface)')
     axes[1, 1].legend()
-    axes[1, 1].grid(True, alpha=0.3)
+    # axes[1, 1].grid(True, alpha=0.3)
 
     axes[1, 2].plot(r[mask], tau_0[mask], 'b-', label='t=0', linewidth=1.5)
     axes[1, 2].plot(r[mask], tau_1[mask], 'r--', label='t=dt', linewidth=1.5)
@@ -899,7 +917,7 @@ def plot_surface_zoom(tov_solution, state_t0, state_t1, grid, hydro, primitives_
     axes[1, 2].set_yscale('log')
     axes[1, 2].set_title('Conserved tau (surface)')
     axes[1, 2].legend()
-    axes[1, 2].grid(True, alpha=0.3)
+    # axes[1, 2].grid(True, alpha=0.3)
 
     plt.suptitle(f'Surface Zoom: r ∈ [{r_min:.2f}, {r_max:.2f}], R*={R_star:.2f}', fontsize=14)
     plt.tight_layout()
@@ -931,7 +949,7 @@ def plot_bssn_evolution(state_t0, state_tfinal, grid, t_0=0.0, t_final=1.0, suff
     axes[0, 0].set_ylabel(r'$\phi$')
     axes[0, 0].set_title('Conformal Factor φ')
     axes[0, 0].legend()
-    axes[0, 0].grid(True, alpha=0.3)
+    # axes[0, 0].grid(True, alpha=0.3)
 
     # h_rr (metric deviation)
     axes[0, 1].plot(r, state_t0[idx_hrr, :], 'b-', label='t=0', linewidth=1.5)
@@ -940,16 +958,16 @@ def plot_bssn_evolution(state_t0, state_tfinal, grid, t_0=0.0, t_final=1.0, suff
     axes[0, 1].set_ylabel(r'$h_{rr}$')
     axes[0, 1].set_title('Metric Deviation h_rr')
     axes[0, 1].legend()
-    axes[0, 1].grid(True, alpha=0.3)
+    # axes[0, 1].grid(True, alpha=0.3)
 
     # alpha (lapse) - CORRECTED: use idx_lapse
     axes[0, 2].plot(r, state_t0[idx_lapse, :], 'b-', label='t=0', linewidth=1.5)
     axes[0, 2].plot(r, state_tfinal[idx_lapse, :], 'r--', label=f't={t_final}', linewidth=1.5)
     axes[0, 2].set_xlabel('r')
     axes[0, 2].set_ylabel(r'$\alpha$')
-    axes[0, 2].set_title('Lapse α')
+    axes[0, 2].set_title('Lapse alpha')
     axes[0, 2].legend()
-    axes[0, 2].grid(True, alpha=0.3)
+    # axes[0, 2].grid(True, alpha=0.3)
 
     # beta^r (shift) - CORRECTED: use idx_shiftr
     axes[1, 0].plot(r, state_t0[idx_shiftr, :], 'b-', label='t=0', linewidth=1.5)
@@ -958,7 +976,7 @@ def plot_bssn_evolution(state_t0, state_tfinal, grid, t_0=0.0, t_final=1.0, suff
     axes[1, 0].set_ylabel(r'$\beta^r$')
     axes[1, 0].set_title('Shift βʳ')
     axes[1, 0].legend()
-    axes[1, 0].grid(True, alpha=0.3)
+    # axes[1, 0].grid(True, alpha=0.3)
 
     # B^r (shift auxiliary) - CORRECTED: use idx_br
     axes[1, 1].plot(r, state_t0[idx_br, :], 'b-', label='t=0', linewidth=1.5)
@@ -967,7 +985,7 @@ def plot_bssn_evolution(state_t0, state_tfinal, grid, t_0=0.0, t_final=1.0, suff
     axes[1, 1].set_ylabel(r'$B^r$')
     axes[1, 1].set_title('Shift Auxiliary Bʳ')
     axes[1, 1].legend()
-    axes[1, 1].grid(True, alpha=0.3)
+    # axes[1, 1].grid(True, alpha=0.3)
 
     # K (mean curvature) - CORRECTED: use idx_K
     axes[1, 2].plot(r, state_t0[idx_K, :], 'b-', label='t=0', linewidth=1.5)
@@ -976,7 +994,7 @@ def plot_bssn_evolution(state_t0, state_tfinal, grid, t_0=0.0, t_final=1.0, suff
     axes[1, 2].set_ylabel('K')
     axes[1, 2].set_title('Extrinsic Curvature K')
     axes[1, 2].legend()
-    axes[1, 2].grid(True, alpha=0.3)
+    # axes[1, 2].grid(True, alpha=0.3)
 
     plt.suptitle('BSSN Variables: Cowling Check (should be identical)', fontsize=14)
     plt.tight_layout()
@@ -998,7 +1016,7 @@ def plot_mass_and_central_density(times, Mb_series, rho_c_series, suffix=""):
     axes[0].set_xlabel('t')
     axes[0].set_ylabel(r'$|M_b - M_{b,0}|$')
     axes[0].set_title('Baryon Mass Deviation')
-    axes[0].grid(True, alpha=0.3)
+    # axes[0].grid(True, alpha=0.3)
     axes[0].set_yscale('log')   
 
     # Central density deviation
@@ -1009,7 +1027,7 @@ def plot_mass_and_central_density(times, Mb_series, rho_c_series, suffix=""):
     axes[1].set_xlabel('t')
     axes[1].set_ylabel(r'$(\rho_c - \rho_{c,0})/\rho_{c,0}$')
     axes[1].set_title('Central Density Relative Change')
-    axes[1].grid(True, alpha=0.3)
+    # axes[1].grid(True, alpha=0.3)
     axes[1].set_yscale('log')
 
     plt.tight_layout()
@@ -1064,7 +1082,7 @@ def plot_evolution(states, times, grid, hydro, rho_ref, p_ref,
     ax1.set_title('Baryon Density Evolution')
     ax1.set_yscale('log')
     ax1.legend(loc='upper right')
-    ax1.grid(True, alpha=0.3)
+    # ax1.grid(True, alpha=0.3)
 
     # Row 1: Pressure at all checkpoints
     ax2 = plt.subplot(3, 2, 2)
@@ -1078,7 +1096,7 @@ def plot_evolution(states, times, grid, hydro, rho_ref, p_ref,
     ax2.set_title('Pressure Evolution')
     ax2.set_yscale('log')
     ax2.legend(loc='upper right')
-    ax2.grid(True, alpha=0.3)
+   #  #ax2.grid(True, alpha=0.3)
 
     # Row 2: Velocity at all checkpoints
     ax3 = plt.subplot(3, 2, 3)
@@ -1091,7 +1109,8 @@ def plot_evolution(states, times, grid, hydro, rho_ref, p_ref,
     ax3.set_ylabel(r'$v^r$')
     ax3.set_title('Radial Velocity Evolution')
     ax3.legend(loc='upper right')
-    ax3.grid(True, alpha=0.3)
+    ax3.set_ylim(0, 0.1)
+   #  #ax3.grid(True, alpha=0.3)
 
     # Row 2: Density error
     ax4 = plt.subplot(3, 2, 4)
@@ -1108,7 +1127,7 @@ def plot_evolution(states, times, grid, hydro, rho_ref, p_ref,
     ax4.set_ylabel(r'$|\Delta\rho|/\rho_0$')
     ax4.set_title('Relative Density Error')
     ax4.legend(loc='upper right')
-    ax4.grid(True, alpha=0.3)
+    # ax4.grid(True, alpha=0.3)
 
     # Row 3: Time series (if available)
     if Mb_series is not None and len(Mb_series) > 1:
@@ -1121,7 +1140,7 @@ def plot_evolution(states, times, grid, hydro, rho_ref, p_ref,
         ax5.set_xlabel('t')
         ax5.set_ylabel(r'$|M_b - M_{b,0}|$')
         ax5.set_title('Baryon Mass Deviation')
-        ax5.grid(True, alpha=0.3)
+        # ax5.grid(True, alpha=0.3)
 
     if rho_c_series is not None and len(rho_c_series) > 1:
         times_series = np.linspace(0, times[-1], len(rho_c_series))
@@ -1133,7 +1152,7 @@ def plot_evolution(states, times, grid, hydro, rho_ref, p_ref,
         ax6.set_xlabel('t')
         ax6.set_ylabel(r'$(\rho_c - \rho_{c,0})/\rho_{c,0}$')
         ax6.set_title('Central Density Relative Change')
-        ax6.grid(True, alpha=0.3)
+        # ax6.grid(True, alpha=0.3)
 
     plt.suptitle(f'TOV Evolution: 3-Checkpoint Structure', fontsize=14)
     plt.tight_layout()
@@ -1225,14 +1244,14 @@ def plot_tov_vs_initial_data_zoom(tov_solution, initial_state_2d, grid, primitiv
     ax[0, 0].axvline(R, color='gray', ls=':', linewidth=1.5, label=f'R={R:.3f}')
     ax[0, 0].set_title('rho_0 (zoom near surface)', fontsize=11)
     ax[0, 0].legend(fontsize=9)
-    ax[0, 0].grid(True, alpha=0.3)
+    # ax[0, 0].grid(True, alpha=0.3)
     ax[0, 0].set_ylabel('rho_0', fontsize=10)
 
     ax[0, 1].semilogy(rZ, np.maximum(P_tov_zoom[mask], 1e-20), 'k-', linewidth=2)
     ax[0, 1].semilogy(rZ, np.maximum(p_init[mask], 1e-20), 'b--', linewidth=1.5)
     ax[0, 1].axvline(R, color='gray', ls=':', linewidth=1.5)
     ax[0, 1].set_title('P (zoom near surface)', fontsize=11)
-    ax[0, 1].grid(True, alpha=0.3)
+    # ax[0, 1].grid(True, alpha=0.3)
     ax[0, 1].set_ylabel('P', fontsize=10)
 
     # v^r should be zero in TOV equilibrium
@@ -1241,14 +1260,14 @@ def plot_tov_vs_initial_data_zoom(tov_solution, initial_state_2d, grid, primitiv
     ax[0, 2].axvline(R, color='gray', ls=':', linewidth=1.5)
     ax[0, 2].set_title('v^r (zoom near surface)', fontsize=11)
     ax[0, 2].legend(fontsize=9)
-    ax[0, 2].grid(True, alpha=0.3)
+    # ax[0, 2].grid(True, alpha=0.3)
     ax[0, 2].set_ylabel('v^r', fontsize=10)
 
     # Row 2: D, Sr, tau (conservative variables)
     ax[1, 0].semilogy(rZ, np.maximum(D_init[mask], 1e-22), 'b-', linewidth=1.5)
     ax[1, 0].axvline(R, color='gray', ls=':', linewidth=1.5)
     ax[1, 0].set_title('D (conserved density)', fontsize=11)
-    ax[1, 0].grid(True, alpha=0.3)
+    # ax[1, 0].grid(True, alpha=0.3)
     ax[1, 0].set_ylabel('D', fontsize=10)
 
     ax[1, 1].plot(rZ, Sr_init[mask], 'b-', linewidth=1.5)
@@ -1256,13 +1275,13 @@ def plot_tov_vs_initial_data_zoom(tov_solution, initial_state_2d, grid, primitiv
     ax[1, 1].axvline(R, color='gray', ls=':', linewidth=1.5)
     ax[1, 1].set_title('S_r (conserved momentum)', fontsize=11)
     ax[1, 1].legend(fontsize=9)
-    ax[1, 1].grid(True, alpha=0.3)
+    # ax[1, 1].grid(True, alpha=0.3)
     ax[1, 1].set_ylabel('S_r', fontsize=10)
 
     ax[1, 2].semilogy(rZ, np.maximum(np.abs(tau_init[mask]), 1e-22), 'b-', linewidth=1.5)
     ax[1, 2].axvline(R, color='gray', ls=':', linewidth=1.5)
     ax[1, 2].set_title('tau (conserved energy)', fontsize=11)
-    ax[1, 2].grid(True, alpha=0.3)
+    # ax[1, 2].grid(True, alpha=0.3)
     ax[1, 2].set_ylabel('|tau|', fontsize=10)
 
     for a in ax.ravel():
@@ -1277,126 +1296,3 @@ def plot_tov_vs_initial_data_zoom(tov_solution, initial_state_2d, grid, primitiv
     print(f"Saved: {out_path}")
 
 
-def create_center_zoom_video(snapshot_file, output_path=None, window=0.5, fps=10, suffix=""):
-    """Create a video/gif of the center zoom evolution from HDF5 snapshots.
-
-    This function reads snapshots from an HDF5 file and creates an animated
-    visualization showing the evolution of primitives and conservatives near
-    the center (including ghost cells).
-
-    Args:
-        snapshot_file: Path to HDF5 snapshot file
-        output_path: Output path for the video. If None, uses default in plots_dir
-        window: Maximum radius to show (default 0.5)
-        fps: Frames per second for the video (default 10)
-        suffix: Suffix for output filename
-    """
-    import matplotlib.animation as animation
-
-    with h5py.File(snapshot_file, 'r') as f:
-        r = f['grid/r'][:]
-        snapshots = sorted(f['snapshots'].keys())
-        n_frames = len(snapshots)
-
-        if n_frames < 2:
-            print("Not enough snapshots to create video")
-            return
-
-        # Read initial state (t=0) for reference
-        snap0 = f['snapshots'][snapshots[0]]
-        rho0_ref = snap0['primitives/rho0'][:]
-        p_ref = snap0['primitives/p'][:]
-        vr_ref = snap0['primitives/vr'][:]
-        D_ref = snap0['conservatives/D'][:]
-        Sr_ref = snap0['conservatives/Sr'][:]
-        tau_ref = snap0['conservatives/tau'][:]
-
-        # Pre-load all data
-        times, steps = [], []
-        rho0_all, p_all, vr_all = [], [], []
-        D_all, Sr_all, tau_all = [], [], []
-
-        for snap_name in snapshots:
-            snap = f['snapshots'][snap_name]
-            times.append(snap.attrs['time'])
-            steps.append(snap.attrs['step'])
-            rho0_all.append(snap['primitives/rho0'][:])
-            p_all.append(snap['primitives/p'][:])
-            vr_all.append(snap['primitives/vr'][:])
-            D_all.append(snap['conservatives/D'][:])
-            Sr_all.append(snap['conservatives/Sr'][:])
-            tau_all.append(snap['conservatives/tau'][:])
-
-    # Mask for window (including ghost cells)
-    mask = r <= window
-
-    # Set up figure
-    fig, axes = plt.subplots(2, 3, figsize=(16, 10))
-    lines_curr = []
-
-    # Row 1: Primitives
-    axes[0, 0].plot(r[mask], rho0_ref[mask], 'b-', label='t=0', linewidth=1.5)
-    l, = axes[0, 0].plot(r[mask], rho0_ref[mask], 'r--', label='t=?', linewidth=1.5)
-    axes[0, 0].set_xlabel('r'); axes[0, 0].set_ylabel(r'$\rho_0$')
-    axes[0, 0].set_title('Baryon Density (center)'); axes[0, 0].legend(); axes[0, 0].grid(True, alpha=0.3)
-    lines_curr.append(l)
-
-    axes[0, 1].plot(r[mask], p_ref[mask], 'b-', label='t=0', linewidth=1.5)
-    l, = axes[0, 1].plot(r[mask], p_ref[mask], 'r--', label='t=?', linewidth=1.5)
-    axes[0, 1].set_xlabel('r'); axes[0, 1].set_ylabel('P')
-    axes[0, 1].set_title('Pressure (center)'); axes[0, 1].legend(); axes[0, 1].grid(True, alpha=0.3)
-    lines_curr.append(l)
-
-    axes[0, 2].plot(r[mask], vr_ref[mask], 'b-', label='t=0', linewidth=1.5)
-    l, = axes[0, 2].plot(r[mask], vr_ref[mask], 'r--', label='t=?', linewidth=1.5)
-    axes[0, 2].set_xlabel('r'); axes[0, 2].set_ylabel(r'$v^r$')
-    axes[0, 2].set_title('Radial Velocity (center)'); axes[0, 2].legend(); axes[0, 2].grid(True, alpha=0.3)
-    lines_curr.append(l)
-
-    # Row 2: Conservatives
-    axes[1, 0].plot(r[mask], D_ref[mask], 'b-', label='t=0', linewidth=1.5)
-    l, = axes[1, 0].plot(r[mask], D_ref[mask], 'r--', label='t=?', linewidth=1.5)
-    axes[1, 0].set_xlabel('r'); axes[1, 0].set_ylabel('D')
-    axes[1, 0].set_title('Conserved D (center)'); axes[1, 0].legend(); axes[1, 0].grid(True, alpha=0.3)
-    lines_curr.append(l)
-
-    axes[1, 1].plot(r[mask], Sr_ref[mask], 'b-', label='t=0', linewidth=1.5)
-    l, = axes[1, 1].plot(r[mask], Sr_ref[mask], 'r--', label='t=?', linewidth=1.5)
-    axes[1, 1].set_xlabel('r'); axes[1, 1].set_ylabel(r'$S_r$')
-    axes[1, 1].set_title('Conserved Sr (center)'); axes[1, 1].legend(); axes[1, 1].grid(True, alpha=0.3)
-    lines_curr.append(l)
-
-    axes[1, 2].plot(r[mask], tau_ref[mask], 'b-', label='t=0', linewidth=1.5)
-    l, = axes[1, 2].plot(r[mask], tau_ref[mask], 'r--', label='t=?', linewidth=1.5)
-    axes[1, 2].set_xlabel('r'); axes[1, 2].set_ylabel(r'$\tau$')
-    axes[1, 2].set_title('Conserved tau (center)'); axes[1, 2].legend(); axes[1, 2].grid(True, alpha=0.3)
-    lines_curr.append(l)
-
-    title = fig.suptitle(f'Center Zoom: r ∈ [0, {window}]  |  t=0.00, step=0', fontsize=14)
-    plt.tight_layout()
-
-    def animate(frame):
-        t, step = times[frame], steps[frame]
-        data = [rho0_all[frame], p_all[frame], vr_all[frame],
-                D_all[frame], Sr_all[frame], tau_all[frame]]
-        for i, line in enumerate(lines_curr):
-            line.set_ydata(data[i][mask])
-            line.set_label(f't={t:.2f}')
-        for ax in axes.flatten():
-            ax.legend()
-            ax.relim()
-            ax.autoscale_view()
-        title.set_text(f'Center Zoom: r ∈ [0, {window}]  |  t={t:.2f}, step={step}')
-        return lines_curr
-
-    anim = animation.FuncAnimation(fig, animate, frames=n_frames, interval=1000//fps, blit=False)
-
-    if output_path is None:
-        output_path = os.path.join(plots_dir, f'tov_center_zoom_evolution{suffix}.gif')
-
-    print(f"Creating animation with {n_frames} frames...")
-    writer = 'pillow' if output_path.endswith('.gif') else 'ffmpeg'
-    anim.save(output_path, writer=writer, fps=fps)
-    plt.close(fig)
-    print(f"Saved: {output_path}")
-    return output_path

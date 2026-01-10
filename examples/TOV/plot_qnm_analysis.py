@@ -1,41 +1,51 @@
 #!/usr/bin/env python3
 """
-Quasi-Normal Mode (QNM) Analysis for TOV Star Evolution
+Quasi-Normal Mode (QNM) Analysis for TOV Star Evolution - Version 2
 
-Analyzes the central density oscillations to extract QNM frequencies
-and compares with theoretical values from Cowling approximation.
+Improved peak detection that searches near theoretical frequencies.
 
-Reference: Shum et al. 2025 (arXiv:2509.15303v1)
-- TOV star with K=100, Gamma=2, rho_c ~ 1.28e-3
-- Cowling approximation (fixed spacetime)
-- Theoretical f-mode: ~2.69 kHz, H1: ~4.55 kHz, H2: ~6.36 kHz
+References:
+- Font et al. 2002 (gr-qc/0110047) - Table I & II
+- GRoovy paper (arXiv:2412.03659) - Figure 4
+
+TOV star parameters: K=100, Gamma=2, rho_c = 1.28e-3, M/R = 0.15
 """
 
 import numpy as np
 import matplotlib.pyplot as plt
 from scipy import signal
-from scipy.optimize import curve_fit
+from scipy.ndimage import maximum_filter1d
 import h5py
 import os
 
 # =============================================================================
 # Unit conversions
 # =============================================================================
-# In geometric units with G = c = 1 and M_sun as mass unit:
-# 1 M_sun = G M_sun / c^3 = 4.926e-6 s in time
-# Frequency conversion: f[kHz] = f[1/M_sun] * c^3 / (2*pi*G*M_sun)
-#                              = f[1/M_sun] * 1/(2*pi * 4.926e-6 s)
-#                              = f[1/M_sun] * 32.26 kHz
-
 M_SUN_SECONDS = 4.926e-6  # 1 M_sun in seconds
-FREQ_CONVERSION = 1.0 / (2 * np.pi * M_SUN_SECONDS * 1e3)  # Convert to kHz
+FREQ_CONVERSION = 1.0 / (M_SUN_SECONDS * 1e3)  # Convert 1/M_sun to kHz
 
-# Theoretical QNM frequencies from Shum et al. 2025 (Cowling approximation)
-# For TOV star with K=100, Gamma=2, rho_c = 0.00128, M = 1.4 M_sun
-THEORETICAL_FREQUENCIES_KHZ = {
-    'F': 2.69,    # Fundamental mode
-    'H1': 4.55,   # First overtone
-    'H2': 6.36,   # Second overtone
+# =============================================================================
+# Theoretical QNM frequencies from Font et al. 2002 (gr-qc/0110047)
+# For TOV star with K=100, Gamma=2, rho_c = 1.28e-3, M/R = 0.15
+# =============================================================================
+
+# Table I: Cowling approximation (fixed spacetime)
+FREQUENCIES_COWLING_KHZ = {
+    'F':  2.696,
+    'H1': 4.534,
+    'H2': 6.346,
+    'H3': 8.161,
+    'H4': 9.971,
+    'H5': 11.806,
+    'H6': 13.605,
+}
+
+# Table II: Full GR (coupled evolution)
+FREQUENCIES_FULL_GR_KHZ = {
+    'F':  1.450,
+    'H1': 3.958,
+    'H2': 5.935,
+    'H3': 7.812,
 }
 
 
@@ -46,214 +56,258 @@ def load_evolution_data(h5_file):
             't': f['time'][:],
             'rho_c': f['rho_central'][:],
         }
-        # Load additional fields if available
         for key in ['p_central', 'max_velocity', 'max_rho_error']:
             if key in f:
                 data[key] = f[key][:]
     return data
 
 
-def compute_psd(t, signal_data, t_start=100, window='blackman'):
+def compute_power_spectrum(t, signal_data, t_start=None, window='hann'):
     """
     Compute Power Spectral Density of the signal.
-
-    Parameters
-    ----------
-    t : array
-        Time array in code units (M_sun)
-    signal_data : array
-        Signal to analyze (e.g., delta_rho/rho)
-    t_start : float
-        Start time to exclude initial transient
-    window : str
-        Window function for FFT
-
-    Returns
-    -------
-    freq_khz : array
-        Frequencies in kHz
-    psd : array
-        Power spectral density
     """
-    # Select data after transient
-    mask = t > t_start
-    t_sel = t[mask]
-    sig_sel = signal_data[mask]
+    if t_start is not None:
+        mask = t > t_start
+        t_sel = t[mask]
+        sig_sel = signal_data[mask]
+    else:
+        t_sel = t
+        sig_sel = signal_data
 
-    # Remove mean/trend
+    # Remove mean
     sig_detrend = sig_sel - np.mean(sig_sel)
 
-    # Apply window
-    if window == 'blackman':
-        win = np.blackman(len(sig_detrend))
-    elif window == 'hann':
-        win = np.hann(len(sig_detrend))
+    # Apply window function
+    n = len(sig_detrend)
+    if window == 'hann':
+        win = np.hanning(n)
+    elif window == 'blackman':
+        win = np.blackman(n)
     else:
-        win = np.ones(len(sig_detrend))
+        win = np.ones(n)
 
     sig_windowed = sig_detrend * win
 
     # Compute FFT
     dt = np.mean(np.diff(t_sel))
-    n = len(sig_windowed)
-    freq = np.fft.rfftfreq(n, dt)  # Frequency in 1/M_sun
-    fft_vals = np.abs(np.fft.rfft(sig_windowed))
+    freq = np.fft.rfftfreq(n, dt)
+    fft_vals = np.fft.rfft(sig_windowed)
 
-    # Convert to kHz
+    # Convert frequency to kHz
     freq_khz = freq * FREQ_CONVERSION
 
-    # Power spectral density
-    psd = fft_vals**2
+    # Power spectrum
+    power = np.abs(fft_vals)**2
+    power = power / np.sum(win**2)
 
-    return freq_khz, psd, fft_vals
+    return freq_khz, power
 
 
-def find_peaks_qnm(freq_khz, psd, min_freq=1.0, max_freq=10.0,
-                   prominence_factor=0.1, n_peaks=5):
+def find_peak_near_frequency(freq_khz, power, target_freq, tolerance=0.5):
     """
-    Find QNM peaks in the power spectrum.
-
+    Find the peak closest to a target frequency within a tolerance.
+    
     Parameters
     ----------
     freq_khz : array
-        Frequencies in kHz
-    psd : array
-        Power spectral density
-    min_freq, max_freq : float
-        Frequency range to search (kHz)
-    prominence_factor : float
-        Minimum prominence as fraction of max
-    n_peaks : int
-        Maximum number of peaks to return
-
+        Frequency array in kHz
+    power : array
+        Power spectrum
+    target_freq : float
+        Target frequency in kHz
+    tolerance : float
+        Search window half-width in kHz
+        
     Returns
     -------
-    peak_freqs : array
-        Peak frequencies in kHz
-    peak_amplitudes : array
-        Peak amplitudes
+    peak_freq : float or None
+        Detected peak frequency, or None if not found
+    peak_power : float or None
+        Power at the peak
     """
-    # Restrict to frequency range
-    mask = (freq_khz > min_freq) & (freq_khz < max_freq)
-    freq_sel = freq_khz[mask]
-    psd_sel = psd[mask]
+    # Define search window
+    mask = (freq_khz >= target_freq - tolerance) & (freq_khz <= target_freq + tolerance)
+    
+    if not np.any(mask):
+        return None, None
+    
+    freq_window = freq_khz[mask]
+    power_window = power[mask]
+    
+    # Find maximum within window
+    max_idx = np.argmax(power_window)
+    
+    # Verify it's a local maximum (not at boundary)
+    if max_idx == 0 or max_idx == len(power_window) - 1:
+        # Check if it's still significantly above neighbors
+        if power_window[max_idx] > 2 * np.median(power_window):
+            return freq_window[max_idx], power_window[max_idx]
+        return None, None
+    
+    # Check it's a true peak (higher than neighbors)
+    if (power_window[max_idx] > power_window[max_idx-1] and 
+        power_window[max_idx] > power_window[max_idx+1]):
+        return freq_window[max_idx], power_window[max_idx]
+    
+    # If not a clean peak, still return max if significantly above baseline
+    if power_window[max_idx] > 5 * np.median(power_window):
+        return freq_window[max_idx], power_window[max_idx]
+    
+    return None, None
 
-    # Find peaks
-    peaks, properties = signal.find_peaks(
-        psd_sel,
-        height=np.max(psd_sel) * prominence_factor,
-        distance=10,
-        prominence=np.max(psd_sel) * 0.05
-    )
 
-    # Sort by amplitude
-    if len(peaks) > 0:
-        sorted_idx = np.argsort(psd_sel[peaks])[::-1]
-        peaks = peaks[sorted_idx[:n_peaks]]
-
-        peak_freqs = freq_sel[peaks]
-        peak_amplitudes = psd_sel[peaks]
-    else:
-        peak_freqs = np.array([])
-        peak_amplitudes = np.array([])
-
-    return peak_freqs, peak_amplitudes
-
-
-def damped_sinusoid(t, A, tau, omega, phi, C):
-    """Damped sinusoidal function for fitting."""
-    return A * np.exp(-t / tau) * np.cos(omega * t + phi) + C
-
-
-def fit_decay_rate(t, signal_data, f_mode_khz, t_start=500, t_end=None):
+def detect_qnm_frequencies(freq_khz, power, theoretical_freqs, tolerance=0.5):
     """
-    Fit decay rate of the fundamental mode.
-
+    Detect QNM frequencies by searching near theoretical values.
+    
     Parameters
     ----------
-    t : array
-        Time in code units
-    signal_data : array
-        Signal (delta_rho/rho)
-    f_mode_khz : float
-        Expected f-mode frequency in kHz
-    t_start, t_end : float
-        Time window for fitting
-
+    freq_khz : array
+        Frequency array in kHz
+    power : array
+        Power spectrum
+    theoretical_freqs : dict
+        Dictionary of theoretical frequencies {'F': f0, 'H1': f1, ...}
+    tolerance : float
+        Search window half-width in kHz
+        
     Returns
     -------
-    tau : float
-        Decay time in code units
-    omega : float
-        Angular frequency in 1/M_sun
-    fit_params : dict
-        All fitted parameters
+    detected : dict
+        Dictionary with detected frequencies for each mode
     """
-    if t_end is None:
-        t_end = t[-1]
-
-    mask = (t > t_start) & (t < t_end)
-    t_fit = t[mask]
-    sig_fit = signal_data[mask]
-
-    # Apply bandpass filter around f-mode
-    dt = np.mean(np.diff(t_fit))
-    fs = 1.0 / dt
-    f_mode_code = f_mode_khz / FREQ_CONVERSION  # Convert to code units
-
-    # Butterworth bandpass filter
-    f_low = 0.7 * f_mode_code
-    f_high = 1.3 * f_mode_code
-    nyq = 0.5 * fs
-
-    if f_high < nyq:
-        b, a = signal.butter(4, [f_low/nyq, f_high/nyq], btype='band')
-        sig_filtered = signal.filtfilt(b, a, sig_fit)
-    else:
-        sig_filtered = sig_fit
-
-    # Initial guess
-    omega_guess = 2 * np.pi * f_mode_code
-    A_guess = np.max(np.abs(sig_filtered))
-    tau_guess = (t_fit[-1] - t_fit[0]) / 2
-
-    try:
-        popt, pcov = curve_fit(
-            damped_sinusoid,
-            t_fit - t_fit[0],
-            sig_filtered,
-            p0=[A_guess, tau_guess, omega_guess, 0, 0],
-            bounds=([0, 100, 0.5*omega_guess, -np.pi, -np.inf],
-                    [np.inf, np.inf, 1.5*omega_guess, np.pi, np.inf]),
-            maxfev=10000
-        )
-
-        fit_params = {
-            'A': popt[0],
-            'tau': popt[1],
-            'omega': popt[2],
-            'phi': popt[3],
-            'C': popt[4],
-            'tau_seconds': popt[1] * M_SUN_SECONDS,
-            'decay_rate_per_s': 1.0 / (popt[1] * M_SUN_SECONDS),
+    detected = {}
+    
+    for mode, f_theo in theoretical_freqs.items():
+        f_det, p_det = find_peak_near_frequency(freq_khz, power, f_theo, tolerance)
+        detected[mode] = {
+            'theoretical': f_theo,
+            'detected': f_det,
+            'power': p_det,
+            'diff_percent': ((f_det - f_theo) / f_theo * 100) if f_det else None
         }
-
-        return popt[1], popt[2], fit_params
-
-    except Exception as e:
-        print(f"Fitting failed: {e}")
-        return None, None, None
+    
+    return detected
 
 
-def plot_qnm_analysis(data, output_dir, suffix=""):
+def print_frequency_table(detected, title="QNM Frequency Analysis"):
+    """Print a formatted table of detected vs theoretical frequencies."""
+    print("\n" + "="*75)
+    print(title)
+    print("="*75)
+    print(f"\n{'Mode':<8} {'Theoretical [kHz]':<20} {'Detected [kHz]':<20} {'Diff [%]':<12}")
+    print("-"*75)
+    
+    for mode, data in detected.items():
+        f_theo = data['theoretical']
+        f_det = data['detected']
+        diff = data['diff_percent']
+        
+        if f_det is not None:
+            print(f"{mode:<8} {f_theo:<20.3f} {f_det:<20.3f} {diff:<12.2f}")
+        else:
+            print(f"{mode:<8} {f_theo:<20.3f} {'N/A':<20} {'N/A':<12}")
+    
+    print("="*75)
+
+
+def plot_qnm_analysis(t, rho_c, freq_khz, power, detected,
+                      output_path=None, max_freq=14.0):
     """
-    Create comprehensive QNM analysis plots.
+    Create publication-quality plot with 2 subplots:
+    1. Central density evolution with zoom inset
+    2. Power spectrum with QNM frequencies
+    """
+    from mpl_toolkits.axes_grid1.inset_locator import inset_axes
 
+    fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+
+    # =========================================================================
+    # Left plot: Central density evolution with zoom inset
+    # =========================================================================
+    ax1 = axes[0]
+
+    rho_c_0 = rho_c[0]
+    delta_rho_rel = (rho_c - rho_c_0) / rho_c_0
+
+    ax1.plot(t, delta_rho_rel, color='red', linewidth=0.8)
+    ax1.set_xlabel(r'$t$', fontsize=12)
+    ax1.set_ylabel(r'$(\rho_c - \rho_{c,0})/\rho_{c,0}$', fontsize=12)
+    ax1.set_title('Central Density Relative Change', fontsize=14)
+    ax1.grid(True, alpha=0.3)
+
+    # Zoom inset for first 1000 M
+    ax_inset = inset_axes(ax1, width="45%", height="40%", loc='upper right',
+                          bbox_to_anchor=(0.0, 0.0, 0.95, 0.95),
+                          bbox_transform=ax1.transAxes)
+
+    # Mask for zoom region
+    mask_zoom = t <= 1000
+    t_zoom = t[mask_zoom]
+    delta_zoom = delta_rho_rel[mask_zoom]
+
+    # Plot rho_c/rho_c0 in inset (like image 1)
+    rho_ratio = rho_c[mask_zoom] / rho_c_0
+    ax_inset.plot(t_zoom, rho_ratio, 'k-', linewidth=0.6)
+    ax_inset.set_xlabel(r'Time', fontsize=9)
+    ax_inset.set_ylabel(r'$\rho_c/\rho_{c,0}$', fontsize=9)
+    ax_inset.tick_params(labelsize=8)
+    ax_inset.set_xlim(0, 1000)
+
+    # =========================================================================
+    # Right plot: Power spectrum
+    # =========================================================================
+    ax2 = axes[1]
+
+    ax2.semilogy(freq_khz, power, color='#8B0000', linewidth=1.5, label='Simulation')
+
+    # Add theoretical frequencies and detected peaks
+    for mode, data in detected.items():
+        f_theo = data['theoretical']
+        f_det = data['detected']
+        p_det = data['power']
+
+        if f_theo < max_freq:
+            ax2.axvline(f_theo, color='gray', linestyle='--', linewidth=1, alpha=0.7)
+
+            ymax = ax2.get_ylim()[1] if ax2.get_ylim()[1] > 0 else np.max(power) * 2
+            ax2.text(f_theo, ymax * 0.4, mode, ha='center', va='bottom',
+                    fontsize=11, fontweight='bold')
+
+            if f_det is not None and p_det is not None:
+                ax2.plot(f_det, p_det, 'bo', markersize=6, alpha=0.7)
+
+    ax2.set_xlabel('Frequency [kHz]', fontsize=12)
+    ax2.set_ylabel('Power', fontsize=12)
+    ax2.set_xlim(0, max_freq)
+    ax2.set_title('Power Spectrum - QNM Frequencies', fontsize=14)
+    ax2.grid(True, which='major', linestyle=':', alpha=0.3)
+
+    plt.tight_layout()
+
+    if output_path:
+        plt.savefig(output_path, dpi=150, bbox_inches='tight')
+        print(f"Saved: {output_path}")
+
+    return fig, axes
+
+
+def analyze_qnm(data, theoretical_freqs, t_start=None, tolerance=0.5, 
+                output_dir=None, suffix=""):
+    """
+    Complete QNM analysis pipeline.
+    
     Parameters
     ----------
     data : dict
         Dictionary with 't' and 'rho_c' arrays
-    output_dir : str
+    theoretical_freqs : dict
+        Theoretical frequencies to compare
+    t_start : float, optional
+        Start time to exclude transient
+    tolerance : float
+        Search window for peak detection (kHz)
+    output_dir : str, optional
         Output directory for plots
     suffix : str
         Suffix for output filename
@@ -261,162 +315,111 @@ def plot_qnm_analysis(data, output_dir, suffix=""):
     t = data['t']
     rho_c = data['rho_c']
     rho_c_0 = rho_c[0]
-
-    # Relative perturbation
+    
+    # Compute relative perturbation
     delta_rho = (rho_c - rho_c_0) / rho_c_0
-
-    # Compute PSD
-    freq_khz, psd, fft_amp = compute_psd(t, delta_rho, t_start=100)
-
-    # Find peaks
-    peak_freqs, peak_amps = find_peaks_qnm(freq_khz, psd)
-
-    # Create figure
-    fig = plt.figure(figsize=(16, 12))
-
-    # =========================================================================
-    # Panel 1: Central density vs time
-    # =========================================================================
-    ax1 = fig.add_subplot(2, 2, 1)
-    ax1.plot(t, rho_c, 'b-', linewidth=0.5, alpha=0.8)
-    ax1.axhline(rho_c_0, color='r', linestyle='--', alpha=0.5,
-                label=f'$\\rho_{{c,0}}$ = {rho_c_0:.4e}')
-    ax1.set_xlabel('t [M$_\\odot$]', fontsize=12)
-    ax1.set_ylabel('$\\rho_c$ [M$_\\odot^{-2}$]', fontsize=12)
-    ax1.set_title('Central Density Evolution', fontsize=14)
-    ax1.legend(fontsize=10)
-    ax1.grid(True, alpha=0.3)
-
-    # =========================================================================
-    # Panel 2: Relative perturbation
-    # =========================================================================
-    ax2 = fig.add_subplot(2, 2, 2)
-    ax2.plot(t, delta_rho * 100, 'b-', linewidth=0.5, alpha=0.8)
-    ax2.set_xlabel('t [M$_\\odot$]', fontsize=12)
-    ax2.set_ylabel('$\\Delta\\rho_c / \\rho_{c,0}$ [%]', fontsize=12)
-    ax2.set_title('Relative Density Perturbation', fontsize=14)
-    ax2.grid(True, alpha=0.3)
-
-    # =========================================================================
-    # Panel 3: Power Spectral Density with theoretical lines
-    # =========================================================================
-    ax3 = fig.add_subplot(2, 2, 3)
-
-    # Plot PSD
-    ax3.semilogy(freq_khz, psd, 'b-', linewidth=1, alpha=0.8, label='Simulation')
-
-    # Add theoretical frequencies as vertical dashed lines
-    colors = {'F': 'red', 'H1': 'green', 'H2': 'orange'}
-    for mode, f_theo in THEORETICAL_FREQUENCIES_KHZ.items():
-        ax3.axvline(f_theo, color=colors[mode], linestyle='--', linewidth=2,
-                    label=f'{mode} (theo) = {f_theo:.2f} kHz', alpha=0.8)
-
-    # Mark detected peaks
-    for i, (f_peak, amp_peak) in enumerate(zip(peak_freqs[:3], peak_amps[:3])):
-        ax3.plot(f_peak, amp_peak, 'ko', markersize=8)
-        ax3.annotate(f'{f_peak:.2f} kHz',
-                     xy=(f_peak, amp_peak),
-                     xytext=(5, 10), textcoords='offset points',
-                     fontsize=9, fontweight='bold')
-
-    ax3.set_xlabel('Frequency [kHz]', fontsize=12)
-    ax3.set_ylabel('PSD', fontsize=12)
-    ax3.set_title('Power Spectral Density - QNM Spectrum', fontsize=14)
-    ax3.set_xlim(0, 10)
-    ax3.legend(fontsize=9, loc='upper right')
-    ax3.grid(True, alpha=0.3)
-
-    # =========================================================================
-    # Panel 4: Zoom on oscillations
-    # =========================================================================
-    ax4 = fig.add_subplot(2, 2, 4)
-
-    # Select a time window to show oscillations clearly
-    t_zoom_start = len(t) // 4
-    t_zoom_end = t_zoom_start + 500 if t_zoom_start + 500 < len(t) else len(t) // 2
-
-    ax4.plot(t[t_zoom_start:t_zoom_end],
-             delta_rho[t_zoom_start:t_zoom_end] * 100,
-             'b-', linewidth=1)
-
-    # Calculate expected period from f-mode
-    f_mode = THEORETICAL_FREQUENCIES_KHZ['F']
-    T_mode = 1.0 / (f_mode / FREQ_CONVERSION)  # Period in code units
-
-    ax4.set_xlabel('t [M$_\\odot$]', fontsize=12)
-    ax4.set_ylabel('$\\Delta\\rho_c / \\rho_{c,0}$ [%]', fontsize=12)
-    ax4.set_title(f'Zoom: Oscillations (Expected T$_F$ = {T_mode:.1f} M$_\\odot$)',
-                  fontsize=14)
-    ax4.grid(True, alpha=0.3)
-
-    plt.tight_layout()
-
-    # Save figure
-    out_path = os.path.join(output_dir, f'tov_qnm_analysis{suffix}.png')
-    plt.savefig(out_path, dpi=150, bbox_inches='tight')
-    print(f"Saved: {out_path}")
-
-    # =========================================================================
-    # Create detailed frequency comparison table
-    # =========================================================================
-    print("\n" + "="*70)
-    print("QNM FREQUENCY ANALYSIS")
-    print("="*70)
+    
+    # Compute power spectrum
+    freq_khz, power = compute_power_spectrum(t, delta_rho, t_start=t_start, window='hann')
+    
+    # Detect peaks near theoretical frequencies
+    detected = detect_qnm_frequencies(freq_khz, power, theoretical_freqs, tolerance)
+    
+    # Print results
     print(f"\nSimulation parameters:")
     print(f"  Total time: {t[-1]:.1f} M_sun = {t[-1] * M_SUN_SECONDS * 1e3:.2f} ms")
     print(f"  Initial rho_c: {rho_c_0:.6e}")
-    print(f"  Final rho_c: {rho_c[-1]:.6e}")
-    print(f"  Max |delta_rho/rho|: {np.max(np.abs(delta_rho))*100:.2f}%")
+    print(f"  Max |delta_rho/rho|: {np.max(np.abs(delta_rho))*100:.3f}%")
+    print(f"  Peak detection tolerance: ±{tolerance} kHz")
+    
+    print_frequency_table(detected)
+    
+    # Create plot
+    if output_dir:
+        os.makedirs(output_dir, exist_ok=True)
+        out_path = os.path.join(output_dir, f'qnm_analysis{suffix}.png')
+        plot_qnm_analysis(t, rho_c, freq_khz, power, detected, out_path)
 
-    print(f"\n{'Mode':<8} {'Theoretical [kHz]':<20} {'Detected [kHz]':<20} {'Difference [%]':<15}")
-    print("-"*70)
+    return detected, freq_khz, power
 
-    mode_names = ['F', 'H1', 'H2']
-    for i, mode in enumerate(mode_names):
-        f_theo = THEORETICAL_FREQUENCIES_KHZ[mode]
-        if i < len(peak_freqs):
-            f_det = peak_freqs[i]
-            diff = (f_det - f_theo) / f_theo * 100
-            print(f"{mode:<8} {f_theo:<20.2f} {f_det:<20.2f} {diff:<15.1f}")
-        else:
-            print(f"{mode:<8} {f_theo:<20.2f} {'N/A':<20} {'N/A':<15}")
 
-    print("="*70)
+# =============================================================================
+# Test with synthetic data
+# =============================================================================
+def generate_test_data(t_max=15000, dt=0.5, frequencies_khz=None, noise_level=0.0005):
+    """Generate synthetic TOV oscillation data for testing."""
+    if frequencies_khz is None:
+        frequencies_khz = FREQUENCIES_COWLING_KHZ
 
-    return fig, peak_freqs, peak_amps
+    t = np.arange(0, t_max, dt)
+    rho_c_0 = 1.28e-3
+    
+    delta_rho = np.zeros_like(t)
+    
+    for i, (mode, f_khz) in enumerate(frequencies_khz.items()):
+        f_code = f_khz / FREQ_CONVERSION
+        omega = 2 * np.pi * f_code
+        amplitude = 0.005 / (i + 1)**1.5
+        tau = t_max / (1.5 * (i + 1))
+        delta_rho += amplitude * np.exp(-t / tau) * np.cos(omega * t)
+    
+    delta_rho += noise_level * np.random.randn(len(t))
+    rho_c = rho_c_0 * (1 + delta_rho)
+    
+    return {'t': t, 'rho_c': rho_c}
 
 
 def main():
-    """Main function to run QNM analysis."""
-    # Find the most recent/largest evolution file
-    data_dir = "/home/davidbamba/repositories/engrenage/examples/TOV/tov_evolution_data"
-    plot_dir = "/home/davidbamba/repositories/engrenage/examples/TOV/plots"
+    """Main function."""
 
-    # List h5 files and find the largest one (most data)
-    h5_files = [f for f in os.listdir(data_dir)
-                if f.startswith('tov_evolution') and f.endswith('.h5')]
+    # Use paths relative to script location
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    data_dir = os.path.join(script_dir, "tov_evolution_data")
+    plot_dir = os.path.join(script_dir, "plots")
 
-    if not h5_files:
-        print("No evolution data files found!")
-        return
+    use_synthetic = True
 
-    # Get file sizes and find largest
-    file_sizes = {f: os.path.getsize(os.path.join(data_dir, f)) for f in h5_files}
-    largest_file = max(file_sizes, key=file_sizes.get)
-    h5_path = os.path.join(data_dir, largest_file)
+    # Search for evolution data in star-specific subfolders (new structure)
+    if os.path.exists(data_dir):
+        # Find star folders
+        star_folders = [os.path.join(data_dir, d) for d in os.listdir(data_dir)
+                        if os.path.isdir(os.path.join(data_dir, d)) and d.startswith('tov_star_')]
 
-    print(f"Loading data from: {largest_file}")
-    print(f"File size: {file_sizes[largest_file] / 1024:.1f} KB")
+        if star_folders:
+            # Use most recent star folder
+            star_folder = max(star_folders, key=os.path.getmtime)
+            h5_path = os.path.join(star_folder, 'tov_evolution.h5')
 
-    # Load data
-    data = load_evolution_data(h5_path)
+            if os.path.exists(h5_path):
+                print(f"Loading data from: {os.path.relpath(h5_path, data_dir)}")
+                data = load_evolution_data(h5_path)
+                use_synthetic = False
 
+    if use_synthetic:
+        print("Generating synthetic test data...")
+        data = generate_test_data()
+    
+    os.makedirs(plot_dir, exist_ok=True)
+    
     print(f"Time range: {data['t'][0]:.2f} to {data['t'][-1]:.2f} M_sun")
     print(f"Number of points: {len(data['t'])}")
-
-    # Run analysis
-    fig, peak_freqs, peak_amps = plot_qnm_analysis(data, plot_dir, suffix="_iso")
-
+    
+    # Choose approximation (Cowling or full GR)
+    is_cowling = True
+    theoretical_freqs = FREQUENCIES_COWLING_KHZ if is_cowling else FREQUENCIES_FULL_GR_KHZ
+    approx_name = "Cowling" if is_cowling else "Full GR"
+    print(f"\nUsing {approx_name} approximation frequencies")
+    
+    # Run analysis with improved peak detection
+    detected, freq_khz, power = analyze_qnm(
+        data, 
+        theoretical_freqs, 
+        t_start=100,
+        tolerance=0.4,  # Search ±0.4 kHz around theoretical
+        output_dir=plot_dir,
+        suffix=f"_{approx_name.lower().replace(' ', '_')}"
+    )
+    
     plt.show()
 
 

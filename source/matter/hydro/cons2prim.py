@@ -50,20 +50,16 @@ class Cons2PrimSolver:
             "total_calls": 0,
             "successful_conversions": 0,
             "newton_successes": 0,
-            "galeazzi_successes": 0,
             "atmosphere_fallbacks": 0,
             "conservative_floors_applied": 0
         }
 
         # =====================================================================
         # SOLVER METHOD SELECTION (hardcoded)
-        # Options: "newton" or "galeazzi"
+        # Options: "newton"
         #   - "newton": Newton-Raphson on pressure (fast, needs good initial guess)
-        #   - "galeazzi": Bisection method on pressure (robust, always converges)
-        #                 Inspired by bracketed methods in Galeazzi et al. and AthenaK
-        #                 Uses same residual function as Newton but with guaranteed convergence
-        # =====================================================================
-        self._solver_method = "newton"  # Change to "newton" or "galeazzi"
+ # =====================================================================
+        self._solver_method = "newton"  
 
     def convert(self, D, Sr, tau, gamma_rr, p_guess=None, apply_conservative_floors=True,
                 e6phi=None, alpha=None, beta_r=None):
@@ -72,19 +68,8 @@ class Cons2PrimSolver:
 
         IMPORTANT: Expects PHYSICAL (non-densitized) conservative variables:
             D  = ρ₀ W
-            Sʳ = ρ₀ h W² vʳ γᵣᵣ / α
+            Sʳ = ρ₀ h W² vʳ γᵣᵣ / alpha
             τ  = ρ₀ h - P - D
-
-        Args:
-            D: array - Conserved density (physical)
-            Sr: array - Conserved radial momentum (physical)
-            tau: array - Conserved energy (physical)
-            gamma_rr: array - Radial metric component
-            p_guess: array (optional) - Pressure guess from previous timestep
-            apply_conservative_floors: bool - Apply tau/S floors before solve (default: True)
-            e6phi: array (optional) - Densitization factor e^{6φ} for conservative update
-            alpha: array (optional) - Lapse function for conservative update
-            beta_r: array (optional) - Radial shift component for conservative update
 
         Returns:
             tuple: (rho0, vr, p, eps, W, h, success, D_out, Sr_out, tau_out)
@@ -157,12 +142,7 @@ class Cons2PrimSolver:
 
         if np.any(solve_mask):
             # Select solver method based on hardcoded setting
-            if self._solver_method == "galeazzi":
-                result = self._solve_galeazzi_vectorized(
-                    D[solve_mask], Sr[solve_mask], tau[solve_mask], gamma_rr[solve_mask]
-                )
-            else:  # "newton" (default fallback)
-                result = self._solve_vectorized_points(
+            result = self._solve_vectorized_points(
                     D[solve_mask], Sr[solve_mask], tau[solve_mask], gamma_rr[solve_mask],
                     p_guess[solve_mask] if p_guess is not None else None, alpha[solve_mask]
                 )
@@ -379,14 +359,6 @@ class Cons2PrimSolver:
         """
         Vectorized evaluation of pressure residual for Newton-Raphson.
         
-        Args:
-            D: Conserved density
-            Sr: Conserved radial momentum
-            tau: Conserved energy
-            p: Pressure (trial value)
-            gamma_rr: Radial metric component
-            alpha: Lapse function (optional, default=1.0)
-        
         Returns:
             tuple: (valid, (rho0, vr, eps, W, h, f))
         """
@@ -406,8 +378,8 @@ class Cons2PrimSolver:
         alpha_safe = np.maximum(alpha, 1e-30)
         
         # Compute velocity for all points
-        # vr = α * Sr / (Q * γrr)
-        # From: Sr = ρ h W² vr γrr / α
+        # vr = alpha * Sr / (Q * γrr)
+        # From: Sr = ρ h W² vr γrr / alpha
         vr = alpha_safe * Sr / (Q * gamma_rr_safe)
         v2 = gamma_rr_safe * vr * vr
         
@@ -466,252 +438,6 @@ class Cons2PrimSolver:
         
         return valid, (rho0, vr, eps, W, h, f)
    
-    # =========================================================================
-    # BISECTION SOLVER (bracketed root finding)
-    # Uses the same residual function as Newton but with bisection root finding
-    # More robust than Newton-Raphson, guaranteed to converge for physical states
-    # =========================================================================
-
-    def _evaluate_residual_for_p(self, p, D, Sr, tau, gamma_rr):
-        """
-        Evaluate residual f(p) = ρ₀ h W² - Q for given pressure.
-
-        Same formulation as Newton-Raphson but returns only the residual
-        and derived quantities for False Position method.
-
-        Returns:
-            tuple: (f, rho0, vr, eps, W, h, valid)
-        """
-        p = np.maximum(p, self.p_floor)
-
-        # Q = τ + D + p
-        Q = tau + D + p
-        gamma_rr_safe = np.maximum(gamma_rr, 1e-30)
-
-        # Velocity: vr = Sr / (Q * γᵣᵣ)
-        vr = Sr / (Q * gamma_rr_safe)
-        v2 = gamma_rr_safe * vr * vr
-
-        # Lorentz factor
-        v2_safe = np.clip(v2, 0.0, 1.0 - 1e-16)
-        W = 1.0 / np.sqrt(1.0 - v2_safe)
-
-        # Rest mass density
-        rho0 = D / np.maximum(W, 1e-30)
-
-        # For ideal gas
-        if self._is_ideal_gas:
-            gm1 = self._eos_gamma - 1.0
-            eps = p / (rho0 * gm1)
-            h = 1.0 + eps + p / np.maximum(rho0, 1e-30)
-        else:
-            eps = self.eos.eps_from_rho_p(rho0, p)
-            h = 1.0 + eps + p / np.maximum(rho0, 1e-30)
-
-        # Residual: f = ρ₀ h W² - Q
-        f = rho0 * h * W * W - Q
-
-        # Validity check
-        valid = (Q > 0) & (v2 < 1.0) & (W >= 1.0) & (rho0 > 0) & np.isfinite(f)
-
-        return f, rho0, vr, eps, W, h, valid
-
-    def _solve_galeazzi_vectorized(self, D, Sr, tau, gamma_rr):
-        """
-        Vectorized solver using bisection method on pressure.
-
-        Uses the same residual function as Newton-Raphson:
-            f(p) = ρ₀ h W² - Q
-
-        But with bracketed bisection instead of Newton iteration.
-        This is more robust and guaranteed to converge for physical states.
-
-        Args:
-            D: Conserved density (physical, not densitized)
-            Sr: Conserved radial momentum (physical)
-            tau: Conserved energy (physical)
-            gamma_rr: Radial metric component
-
-        Returns:
-            tuple: (rho0, vr, p, eps, W, h, success)
-        """
-        N = len(D)
-
-        # Output arrays
-        rho0 = np.zeros(N)
-        vr = np.zeros(N)
-        p = np.zeros(N)
-        eps = np.zeros(N)
-        W = np.ones(N)
-        h = np.ones(N)
-        success = np.zeros(N, dtype=bool)
-
-        if not self._is_ideal_gas:
-            # Fall back to Newton for non-ideal gas
-            return self._solve_vectorized_points(D, Sr, tau, gamma_rr, None, None)
-
-        gamma = self._eos_gamma
-        gm1 = gamma - 1.0
-
-        # Check for valid input
-        valid_input = (D > 0) & np.isfinite(D) & np.isfinite(Sr) & np.isfinite(tau)
-
-        if not np.any(valid_input):
-            return rho0, vr, p, eps, W, h, success
-
-        # =====================================================================
-        # BRACKET ESTIMATION
-        # For f(p) = ρ₀ h W² - Q, we need p_lo and p_hi such that
-        # f(p_lo) and f(p_hi) have opposite signs
-        #
-        # Physical constraint: v² < 1 requires Q > |Sr|/√γᵣᵣ
-        # So: p > |Sr|/√γᵣᵣ - τ - D for subluminal velocity
-        # =====================================================================
-
-        gamma_rr_safe = np.maximum(gamma_rr, 1e-30)
-
-        # Minimum pressure for subluminal velocity: Q > |Sr|/√γᵣᵣ
-        # p_min_physical = |Sr|/√γᵣᵣ - τ - D (with some margin)
-        Sr_mag = np.abs(Sr)
-        Q_min = Sr_mag / np.sqrt(gamma_rr_safe) * 1.001  # Small margin for safety
-        p_min_physical = Q_min - tau - D
-
-        # Lower bracket: max of p_floor and physical minimum
-        p_lo = np.maximum(self.p_floor, p_min_physical + self.p_floor)
-
-        # Upper bracket estimation:
-        # At high p: v → 0, W → 1, ρ₀ → D, h ≈ γp/(D(γ-1))
-        # f ≈ D * γp/(D(γ-1)) - (τ + D + p) = γp/(γ-1) - τ - D - p
-        #   = p(γ/(γ-1) - 1) - τ - D = p/(γ-1) - τ - D
-        # f = 0 → p = (τ + D)(γ-1)
-        # Use a larger value to ensure we bracket the root
-        p_hi = np.maximum(10.0 * np.abs(tau + D) * gm1, 10.0 * self.p_floor)
-        p_hi = np.maximum(p_hi, np.abs(tau + D) + self.p_floor)
-        p_hi = np.maximum(p_hi, p_lo * 100.0)  # Ensure p_hi >> p_lo
-
-        # Evaluate at brackets
-        f_lo, _, _, _, _, _, valid_lo = self._evaluate_residual_for_p(
-            p_lo, D, Sr, tau, gamma_rr
-        )
-        f_hi, _, _, _, _, _, valid_hi = self._evaluate_residual_for_p(
-            p_hi, D, Sr, tau, gamma_rr
-        )
-
-        # Check if brackets are valid (opposite signs)
-        bracket_ok = valid_lo & valid_hi & (f_lo * f_hi < 0)
-
-        # For cases where bracket fails, try to adjust
-        need_adjust = valid_input & ~bracket_ok
-        if np.any(need_adjust):
-            # Try expanding upper bracket
-            p_hi[need_adjust] *= 10.0
-            f_hi[need_adjust], _, _, _, _, _, valid_hi[need_adjust] = self._evaluate_residual_for_p(
-                p_hi[need_adjust], D[need_adjust], Sr[need_adjust],
-                tau[need_adjust], gamma_rr[need_adjust]
-            )
-            bracket_ok = valid_lo & valid_hi & (f_lo * f_hi < 0)
-
-        # Points that can be solved
-        solvable = valid_input & bracket_ok
-
-        if not np.any(solvable):
-            return rho0, vr, p, eps, W, h, success
-
-        # Extract solvable points
-        idx_solve = np.where(solvable)[0]
-        D_s = D[solvable]
-        Sr_s = Sr[solvable]
-        tau_s = tau[solvable]
-        gamma_rr_s = gamma_rr[solvable]
-        p_lo_s = p_lo[solvable]
-        p_hi_s = p_hi[solvable]
-        f_lo_s = f_lo[solvable]
-        f_hi_s = f_hi[solvable]
-        N_solve = len(D_s)
-
-        # Initialize pressure guess (midpoint)
-        p_s = 0.5 * (p_lo_s + p_hi_s)
-        converged = np.zeros(N_solve, dtype=bool)
-
-        # =====================================================================
-        # BISECTION METHOD (guaranteed convergence)
-        # More robust than False Position, O(log2(N)) convergence
-        # =====================================================================
-        for iteration in range(self.max_iter):
-            if np.all(converged):
-                break
-
-            active = ~converged
-
-            # Bisection: midpoint of bracket
-            p_new = 0.5 * (p_lo_s[active] + p_hi_s[active])
-            p_new = np.maximum(p_new, self.p_floor)
-
-            # Evaluate at midpoint
-            f_new, rho0_new, vr_new, eps_new, W_new, h_new, valid_new = self._evaluate_residual_for_p(
-                p_new, D_s[active], Sr_s[active], tau_s[active], gamma_rr_s[active]
-            )
-
-            # Check convergence (either small residual or small bracket)
-            tol_check = self.tol * np.maximum(1.0, np.abs(p_new))
-            bracket_small = (p_hi_s[active] - p_lo_s[active]) < tol_check
-            conv_now = (np.abs(f_new) < tol_check) | bracket_small
-            conv_indices = np.where(active)[0][conv_now]
-
-            if np.any(conv_now):
-                converged[conv_indices] = True
-                p_s[conv_indices] = p_new[conv_now]
-
-            # Update brackets for non-converged points
-            update_mask = ~conv_now & valid_new
-            if not np.any(update_mask):
-                continue
-
-            active_indices = np.where(active)[0][update_mask]
-
-            # Determine which bracket to update based on sign of f_new vs f_lo
-            # f_lo and f_hi have opposite signs (guaranteed by bracketing)
-            same_sign_lo = (f_new[update_mask] * f_lo_s[active_indices]) > 0
-
-            # Update lower bracket where f_new has same sign as f_lo
-            lo_update = active_indices[same_sign_lo]
-            if len(lo_update) > 0:
-                p_lo_s[lo_update] = p_new[update_mask][same_sign_lo]
-                f_lo_s[lo_update] = f_new[update_mask][same_sign_lo]
-
-            # Update upper bracket where f_new has same sign as f_hi
-            hi_update = active_indices[~same_sign_lo]
-            if len(hi_update) > 0:
-                p_hi_s[hi_update] = p_new[update_mask][~same_sign_lo]
-                f_hi_s[hi_update] = f_new[update_mask][~same_sign_lo]
-
-            p_s[active_indices] = p_new[update_mask]
-
-        # =====================================================================
-        # RECOVER ALL PRIMITIVE VARIABLES FROM CONVERGED PRESSURE
-        # =====================================================================
-        _, rho0_s, vr_s, eps_s, W_s, h_s, _ = self._evaluate_residual_for_p(
-            p_s, D_s, Sr_s, tau_s, gamma_rr_s
-        )
-
-        # Apply floors
-        rho0_s = np.maximum(rho0_s, self.rho_floor)
-        p_s = np.maximum(p_s, self.p_floor)
-
-        # Store results
-        rho0[idx_solve] = rho0_s
-        vr[idx_solve] = vr_s
-        p[idx_solve] = p_s
-        eps[idx_solve] = eps_s
-        W[idx_solve] = W_s
-        h[idx_solve] = h_s
-        success[idx_solve] = converged
-
-        # Update statistics
-        self.stats["galeazzi_successes"] += np.sum(converged)
-
-        return rho0, vr, p, eps, W, h, success
-
 
 # ============================================================================
 # PRIMITIVE TO CONSERVATIVE CONVERSION
@@ -730,15 +456,7 @@ def prim_to_cons(rho0, vr, pressure, gamma_rr, eos, e6phi=None, alpha=None, beta
         Densitized (e6phi provided):
             D̃  = e^{6φ} W ρ₀
             S̃r = e^{6φ} W² ρ₀ h vr γrr
-            τ̃  = e^{6φ} (α² T^{00} - W ρ₀)
-    Args:
-        rho0: Rest mass density
-        vr: Radial velocity
-        pressure: Pressure
-        gamma_rr: Radial metric component
-        eos: Equation of state
-        e6phi: Densitization factor e^{6φ} (optional, default=None for non-densitized)
-        alpha: Lapse (optional, default=1.0)
+            τ̃  = e^{6φ} (alpha² T^{00} - W ρ₀)
 
     Returns:
         tuple: (D, Sr, tau) conservative variables (densitized if e6phi provided)

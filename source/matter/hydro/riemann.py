@@ -16,17 +16,7 @@ def physical_flux(U, prim, gamma_rr, alpha, e6phi, eos):
     Compute physical (non-densitized) flux for 1D radial direction.
 
     Calls Valencia._compute_fluxes (static method) and extracts the radial
-    component, dividing by e^{6φ} to get non-densitized flux.
-
-    This ensures flux calculations are maintained in one place (Valencia).
-
-    Args:
-        U: (M, 3) conservative variables [D, Sr, tau]
-        prim: (M, 3) primitive variables [rho0, vr, pressure]
-        gamma_rr: (M,) metric component γ_{rr}
-        alpha: (M,) lapse function
-        e6phi: (M,) conformal factor e^{6φ}
-        eos: equation of state object
+    component
 
     Returns:
         F_phys: (M, 3) physical flux [F_D, F_Sr, F_tau]
@@ -67,11 +57,10 @@ def physical_flux(U, prim, gamma_rr, alpha, e6phi, eos):
     fD_U, fTau_U, fS_D = ValenciaReferenceMetric._compute_fluxes(rho0, v_U, pressure, W, h, alpha, e6phi, gamma_LL, gamma_UU, beta_U)
 
     # Extract radial component and divide by e^{6φ} to get non-densitized flux
-    # F_phys = F̃ / (e^{6φ})
 
-    F_D   = fD_U[:, 0]    #/ e6phi
-    F_Sr  = fS_D[:, 0, 0] #/ e6phi # F^r_r component
-    F_tau = fTau_U[:, 0]  #/ e6phi
+    F_D   = fD_U[:, 0]   
+    F_Sr  = fS_D[:, 0, 0] 
+    F_tau = fTau_U[:, 0] 
 
     return np.stack([F_D, F_Sr, F_tau], axis=1)
 

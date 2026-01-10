@@ -7,7 +7,7 @@ Provides four reconstruction schemes with optimal performance:
     3. WENO5    - 5th order WENO (industry standard)
     4. WENO-Z   - 5th order WENO-Z (best overall, recommended)
 
-All methods are fully vectorized and JIT-compiled with Numba for 10-20× speedup.
+All methods are fully vectorized and JIT-compiled with Numba.
 """
 
 import numpy as np

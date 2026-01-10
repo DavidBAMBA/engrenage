@@ -26,18 +26,44 @@ plots_dir = os.path.join(script_dir, 'plots')
 if not os.path.exists(plots_dir):
     os.makedirs(plots_dir)
 
-def load_latest_snapshots(data_dir, suffix="_iso"):
+def find_star_folders(data_dir):
+    """Encuentra todas las carpetas de estrellas en el directorio de datos."""
+    star_folders = []
+    if os.path.exists(data_dir):
+        for item in os.listdir(data_dir):
+            item_path = os.path.join(data_dir, item)
+            if os.path.isdir(item_path) and item.startswith('tov_star_'):
+                star_folders.append(item_path)
+    return sorted(star_folders)
+
+
+def load_latest_snapshots(data_dir, suffix=""):
     """Carga los snapshots más recientes."""
-    pattern = os.path.join(data_dir, f'tov_snapshots{suffix}_*.h5')
-    snapshot_files = glob(pattern)
+    # Primero buscar en carpetas de estrellas (nueva estructura)
+    star_folders = find_star_folders(data_dir)
 
-    if not snapshot_files:
-        print(f"No se encontraron archivos de snapshots en {data_dir}")
-        return None
+    if star_folders:
+        # Usar la carpeta más reciente (por fecha de modificación)
+        star_folder = max(star_folders, key=os.path.getmtime)
+        snapshot_file = os.path.join(star_folder, f'tov_snapshots{suffix}.h5')
 
-    # Usar el archivo más reciente
-    snapshot_file = sorted(snapshot_files)[-1]
-    print(f"\nCargando snapshots de: {os.path.basename(snapshot_file)}")
+        if not os.path.exists(snapshot_file):
+            print(f"No se encontró archivo de snapshots en {star_folder}")
+            return None
+
+        print(f"\nCargando snapshots de: {os.path.relpath(snapshot_file, data_dir)}")
+    else:
+        # Fallback: buscar en el directorio raíz (estructura antigua)
+        pattern = os.path.join(data_dir, f'tov_snapshots{suffix}*.h5')
+        snapshot_files = glob(pattern)
+
+        if not snapshot_files:
+            print(f"No se encontraron archivos de snapshots en {data_dir}")
+            return None
+
+        # Usar el archivo más reciente
+        snapshot_file = sorted(snapshot_files)[-1]
+        print(f"\nCargando snapshots de: {os.path.basename(snapshot_file)}")
 
     try:
         with h5py.File(snapshot_file, 'r') as f:
@@ -77,17 +103,49 @@ def load_latest_snapshots(data_dir, suffix="_iso"):
         print("Asegúrate de que la simulación no esté corriendo o espera a que termine.")
         return None
 
-def load_metadata(data_dir, suffix="_iso"):
+def load_metadata(data_dir, suffix=""):
     """Carga metadatos de la simulación."""
-    pattern = os.path.join(data_dir, f'tov_metadata{suffix}_*.json')
-    metadata_files = glob(pattern)
+    # Primero buscar en carpetas de estrellas (nueva estructura)
+    star_folders = find_star_folders(data_dir)
 
-    if not metadata_files:
-        return None
+    if star_folders:
+        # Usar la carpeta más reciente
+        star_folder = max(star_folders, key=os.path.getmtime)
+        metadata_file = os.path.join(star_folder, f'tov_metadata{suffix}.json')
 
-    metadata_file = sorted(metadata_files)[-1]
+        if not os.path.exists(metadata_file):
+            return None
+    else:
+        # Fallback: estructura antigua
+        pattern = os.path.join(data_dir, f'tov_metadata{suffix}*.json')
+        metadata_files = glob(pattern)
+
+        if not metadata_files:
+            return None
+
+        metadata_file = sorted(metadata_files)[-1]
+
     with open(metadata_file, 'r') as f:
         metadata = json.load(f)
+
+    # Extraer datos de la nueva estructura anidada
+    if 'tov_solution' in metadata:
+        # Nueva estructura
+        tov = metadata['tov_solution']
+        flat_metadata = {
+            'K': tov.get('K'),
+            'Gamma': tov.get('Gamma'),
+            'rho_central': tov.get('rho_central'),
+            'R_star': tov.get('R'),
+            'M_star': tov.get('M_star'),
+            'C': tov.get('C'),
+        }
+        if 'atmosphere' in metadata:
+            flat_metadata['rho_floor'] = metadata['atmosphere'].get('rho_floor')
+        if 'simulation' in metadata:
+            flat_metadata['dt'] = metadata['simulation'].get('dt')
+            flat_metadata['grid_N'] = metadata['simulation'].get('grid_N')
+        return flat_metadata
 
     return metadata
 

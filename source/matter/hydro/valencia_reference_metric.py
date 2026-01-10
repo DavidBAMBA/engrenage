@@ -1,23 +1,5 @@
 # valencia_reference_metric.py
-"""
-Valencia formulation with reference metric - full 3D.
-
-Follows the exact same tensor algebra pattern as bssnrhs.py:
-- Full 3D einsum contractions for all tensor operations
-- Spherical symmetry imposed by velocity (v^θ = v^φ = 0) and background metric
-
-Conservative evolution equations in curvilinear coordinates:
-     used here:  ∂_t(Û) + ∂_j(F̃^j) = S + connection
-with F̃^j = α e^{6phy} F^j 
-and connection terms:
-    D, τ:   -Γ̂^k_{kj} F̃^j
-    S_i:   -Γ̂^k_{kj} F̃^j_i + Γ̂^l_{ji} F̃^j_l
-
-Where:
-    U = (D, S_i, τ)  conserved variables densitized by e^{6φ}
-    F^j = physical fluxes
-    S = geometric source terms (K_ij, ∂_iα, ∇̂γ_{ij} couplings)
-"""
+"""Valencia formulation with reference metric - full 3D."""
 
 import numpy as np
 
@@ -101,7 +83,7 @@ class ValenciaReferenceMetric:
             self.sqrt_g_hat_face = 0.5 * (self.sqrt_g_hat_cell[:-1] + self.sqrt_g_hat_cell[1:])
 
         else:
-            # Lapse α
+            # Lapse alpha
             self.alpha = np.asarray(bssn_vars.lapse, dtype=float)
 
             # Shift β^i (all three components)
@@ -131,10 +113,6 @@ class ValenciaReferenceMetric:
         Compute contravariant stress-energy tensor T^{μν}
 
         T^{μν} = ρ₀ h u^μ u^ν + P g^{μν}
-
-        Args:
-            v_U: (N, 3) array with spatial velocity components
-
         Returns:
             tuple: (T00, T0i, Tij) - Components of contravariant stress-energy tensor T^{μν}
                 - T00: (N,) array - T^{00} = T^{tt} (energy density in Eulerian frame)
@@ -166,13 +144,6 @@ class ValenciaReferenceMetric:
     def _compute_T4UD(self, T00, T0i, Tij):
         """
         Compute mixed stress-energy tensor T^μ_ν = T^{μδ} g_{δν}.
-
-        Needed for momentum flux computation.
-
-        Args:
-            T00: (N,) array - Contravariant T^{00} component
-            T0i: (N, 3) array - Contravariant T^{0i} components
-            Tij: (N, 3, 3) array - Contravariant T^{ij} components
 
         Returns:
             tuple: (T0_0, T0_j, Ti_j) - Components of mixed stress-energy tensor T^μ_ν
@@ -212,16 +183,13 @@ class ValenciaReferenceMetric:
         Physical source terms of GRHD equations in Fully 3D implementation.
 
         Energy source (tau_source_term,  line 334-358):
-            S_τ = α e^{6φ}  [  K_ij (T^{00} β^i β^j + 2 T^{0i} β^j + T^{ij})
-                                - (T^{00} β^i + T^{0i}) ∂_i α]
+            S_τ = alpha e^{6φ}  [  K_ij (T^{00} β^i β^j + 2 T^{0i} β^j + T^{ij})
+                                - (T^{00} β^i + T^{0i}) ∂_i alpha]
 
         Momentum source S_source_termD:
-            S_{S_i} = α e^{6φ} [ -T^{00} α ∂_i α
+            S_{S_i} = alpha e^{6φ} [ -T^{00} alpha ∂_i alpha
                                  + T^0_j (∂_i β^j + Γ̂^j_{ik} β^k)
                                  + (1/2) (T^{00} β^j β^k + 2 T^{0j} β^k + T^{jk}) ∇̂^_i γ_{jk}]
-
-        Args:
-            v_U: (N, 3) array with [v^r, v^theta, v^phi] spatial velocity components
 
         Returns:
             src_S_vector: (N, 3) momentum source for all three spatial directions
@@ -260,7 +228,7 @@ class ValenciaReferenceMetric:
         bar_A_LL = get_bar_A_LL(r, bssn_vars, background)
         K_LL = e4phi[:, None, None] * bar_A_LL + (K / 3.0)[:, None, None] * gamma_LL
 
-        # Lapse derivatives ∂_i α (all three spatial directions)
+        # Lapse derivatives ∂_i alpha (all three spatial directions)
         dalpha_dx = np.asarray(bssn_d1.lapse)
 
         # Term 1: K_ij contraction
@@ -274,7 +242,7 @@ class ValenciaReferenceMetric:
         term1_tau = np.einsum('xij,xij->x', K_LL, tensor_block)
 
         # Term 2: lapse derivative term ( line 352-357)
-        # -(T^{00} β^i + T^{0i}) ∂_i α
+        # -(T^{00} β^i + T^{0i}) ∂_i alpha
         term2_tau = -(
             np.einsum('x,xi,xi->x', TUU_00, beta_U, dalpha_dx)
             + np.einsum('xi,xi->x', TUU_0i, dalpha_dx)
@@ -313,7 +281,7 @@ class ValenciaReferenceMetric:
             + np.transpose(hat_D_bar_gamma, (0, 3, 1, 2))
         )
 
-        # Term 1: -T^{00} α ∂_i α ( line 418)
+        # Term 1: -T^{00} alpha ∂_i alpha ( line 418)
         # All three spatial components
         first_term = -TUU_00[:, None] * alpha[:, None] * dalpha_dx
 
@@ -376,31 +344,19 @@ class ValenciaReferenceMetric:
         This is a static method that can be called from both Valencia class
         and external modules (e.g., riemann.py).
 
-        Fluxes are densitized by e^{6φ}. vtilde^j = v^i - β^i/α.
+        Fluxes are densitized by e^{6φ}. vtilde^j = v^i - β^i/alpha.
 
         Flux definitions:
             F̃D^j    =  e^{6φ} ( rho0 * W * vtilde^j )    
-            F̃_S^j_i =  e^{6φ} ( α * T^j_i)                
-            F̃τ^j    =  e^{6φ} ( α^2 * T^{0j} - α * rho0 * W * vtilde^j )
-
-        Args:
-            rho0: (N,) rest-mass density
-            v_U: (N, 3) contravariant velocity
-            pressure: (N,) fluid pressure
-            W: (N,) Lorentz factor
-            h: (N,) specific enthalpy
-            alpha: (N,) lapse function
-            e6phi: (N,) conformal factor e^{6φ}
-            gamma_LL: (N, 3, 3) covariant metric
-            gamma_UU: (N, 3, 3) contravariant metric
-            beta_U: (N, 3) shift vector
+            F̃_S^j_i =  e^{6φ} ( alpha * T^j_i)                
+            F̃τ^j    =  e^{6φ} ( alpha^2 * T^{0j} - alpha * rho0 * W * vtilde^j )
 
         Returns:
             fD_U: (N, 3) density partial flux vector
             fTau_U: (N, 3) energy partial flux vector
             fS_D: (N, 3, 3) momentum partial flux tensor
         """
-        # Compute 4-velocity: u^0 = W/α, u^i = W (v^i - β^i/α )
+        # Compute 4-velocity: u^0 = W/alpha, u^i = W (v^i - β^i/alpha )
         u0U = W / alpha
         VUtilde_i = v_U - beta_U / alpha[:, None]
         uiU = W[:, None] * VUtilde_i
@@ -423,13 +379,13 @@ class ValenciaReferenceMetric:
         # Conservative density: D = ρ₀ W
         D = rho0 * W
 
-        # Density partial flux vector: F̃^j_D = e^6φ ρW (v^i - β^i/α )
+        # Density partial flux vector: F̃^j_D = e^6φ ρW (v^i - β^i/alpha )
         fD_U = (e6phi * alpha * D)[:, None] * VUtilde_i
 
-        # Energy (tau) partial flux vector: F̃^j_τ = e^6φ ( α² T^{0j} - α * rho_0 W v^j )
+        # Energy (tau) partial flux vector: F̃^j_τ = e^6φ ( alpha² T^{0j} - alpha * rho_0 W v^j )
         fTau_U = (alpha ** 2 * e6phi)[:, None] * TUU_0i -  (alpha * e6phi)[:, None] * D[:, None] * VUtilde_i 
 
-        # Momentum partial flux tensor: F̃^j_i = α e^6φ T^j_i
+        # Momentum partial flux tensor: F̃^j_i = alpha e^6φ T^j_i
         fS_UD = (alpha * e6phi)[:, None, None] * TUD_ij
 
         return fD_U, fTau_U, fS_UD
@@ -465,7 +421,6 @@ class ValenciaReferenceMetric:
         # Compute partial flux vectors (densitized) 
         fD_U, fTau_U, fS_D = self._get_fluxes(rho0, v_U, pressure, W, h, bssn_vars)
 
-        # Contract with Christoffel symbols
         # Reference metric Christoffel symbols Γ̂^i_{jk}
         hat_chris = background.hat_christoffel  # (N, 3, 3, 3)
 
@@ -527,12 +482,7 @@ class ValenciaReferenceMetric:
         v_U = to_3d(v_U, N)
         S = to_3d(S, N)
 
-        # NOTE: Do NOT force v^r = 0 at the first interior cell!
-        # The parity boundary conditions in fill_boundaries() already ensure that
-        # Sr (momentum) is antisymmetric, which naturally produces v^r -> 0 at r=0.
-        # Forcing v=0 here breaks the balance when there are physical oscillations.
-
-        # Extract geometry (α, β^i, γ_ij, √γ, √ĝ, dr, etc.) early, as W may need γ_ij
+        # Extract geometry (alpha, β^i, γ_ij, √γ, √ĝ, dr, etc.) early, as W may need γ_ij
         self._extract_geometry(r, bssn_vars, spacetime_mode, background, grid)
 
         # Copy conservatives
@@ -563,11 +513,11 @@ class ValenciaReferenceMetric:
         interior_mask = np.zeros(N, dtype=bool)
         interior_mask[NUM_GHOSTS:N-NUM_GHOSTS] = True
 
-        rhs_D[interior_mask] = (div_D[interior_mask]+ conn_D[interior_mask])
+        rhs_D[interior_mask]    = (div_D[interior_mask]    + conn_D[interior_mask])
 
         rhs_S[interior_mask, :] = (div_S[interior_mask, :] + conn_S[interior_mask, :] + src_S[interior_mask, :])
 
-        rhs_tau[interior_mask] = (div_tau[interior_mask] + conn_tau[interior_mask] + src_tau[interior_mask])
+        rhs_tau[interior_mask]  = (div_tau[interior_mask]  + conn_tau[interior_mask]  + src_tau[interior_mask])
 
 
         # Preserve backward-compatible shape: if input momentum was 1D, return RHS radial as (N,)
@@ -584,7 +534,7 @@ class ValenciaReferenceMetric:
     def _compute_interface_fluxes(self, rho0, v_U, pressure, r,
                                 eos, reconstructor, riemann_solver, bssn_vars):
         """
-        Compute partial fluxes at cell interfaces: F̃_face = α_face √γ_face F_phys.
+        Compute partial fluxes at cell interfaces: F̃_face = alpha_face √γ_face F_phys.
 
         GENERAL 3D STRUCTURE, 1D EVOLUTION:
         ====================================
@@ -642,17 +592,9 @@ class ValenciaReferenceMetric:
         gamma_LL_f = 0.5 * (self.gamma_LL[:-1] + self.gamma_LL[1:])  # (N-1, 3, 3)
         
         # For 1D Riemann solver, extract first spatial components
-        beta_r_f = beta_U_f[:, 0]  # β^r or β^ρ or β^x
-        gamma_r_r_f = gamma_LL_f[:, 0, 0]  # γ_rr or γ_ρρ or γ_xx
+        beta_r_f = beta_U_f[:, 0]  # β^r 
+        gamma_r_r_f = gamma_LL_f[:, 0, 0]  # γ_rr
         
-        # NOTE: The reflecting boundary condition is enforced through:
-        # 1. fill_boundaries() applies parity to conservative variables (Sr has parity -1)
-        # 2. Reconstruction uses these ghost cell values which are antisymmetric for Sr
-        # 3. This naturally produces v^r ≈ 0 at the r=0 interface
-        #
-        # Do NOT force additional values here as it creates inconsistencies with
-        # the reconstruction stencil and breaks the discrete equilibrium.
-
         # Apply physical limiters if available
         if hasattr(reconstructor, "apply_physical_limiters"):
             (rhoL, vL, pL), (rhoR, vR, pR) = reconstructor.apply_physical_limiters(
@@ -680,25 +622,12 @@ class ValenciaReferenceMetric:
         # Returns: [F_D, F_S_r, F_tau] in r spatial direction
         F_phys_batch = riemann_solver.solve_batch(UL_batch, UR_batch, primL_batch, primR_batch,gamma_r_r_f, alpha_f, beta_r_f, eos, e6phi_f)
         
-        # Densitization strictly α e^{6φ} at faces
-        #dens_factor =  e6phi_f
 
         F_batch = F_phys_batch
 
-        # NOTE: Do NOT force F_Sr = 0 at the r≈0 interface!
-        # In hydrostatic equilibrium, the momentum flux is F^r_Sr = P (pressure), not zero.
-        # Forcing F = 0 breaks the balance between flux divergence and connection terms,
-        # creating artificial acceleration at the origin.
-        #
-        # The reflecting boundary is correctly enforced by setting v=0 in the reconstructed
-        # states (done above), which ensures the Riemann solver computes the correct
-        # equilibrium flux F = P from the pressure term.
-
         # Construct 3D momentum flux array
         # In 1D evolution: only r direction has flux, others are zero
-        # This is correct because:
-        # - No transverse Riemann problems solved
-        # - Transverse momenta evolve via connection/source terms only
+
         N_faces = len(F_batch)
         F_S_face = np.zeros((N_faces, SPACEDIM))
         F_S_face[:, 0] = F_batch[:, 1]  # r direction flux
