@@ -5,7 +5,7 @@ Paper: "General relativistic hydrodynamics in curvilinear coordinates"
 
 Verifica que:
     T^a_b (4)Γ^a_{bi} - T^k_j Γ̂^k_{ji} 
-    = -T^{00} α ∂_i α + T^0_k D̂_i β^k + (1/2)(T^{00}β^jβ^k + 2T^{0j}β^k + T^{jk}) D̂_i γ_{jk}
+    = -T^{00} alpha ∂_i alpha + T^0_k D̂_i β^k + (1/2)(T^{00}β^jβ^k + 2T^{0j}β^k + T^{jk}) D̂_i γ_{jk}
 
 Siguiendo las ecuaciones (29)-(33) del paper.
 """
@@ -87,7 +87,7 @@ for k in range(1, 4):
     T0_down[k] = symbols(f'T^0_{k}', real=True)
 
 print("✓ Símbolos definidos:")
-print(f"  • Lapse α, factor conforme φ")
+print(f"  • Lapse alpha, factor conforme φ")
 print(f"  • Shift β^j para j=1,2,3")
 print(f"  • Métrica γ̄_{{jk}}, derivadas D̂_i γ̄_{{jk}}")
 print(f"  • Tensor T^{{00}}, T^{{0j}}, T^{{jk}}")
@@ -102,12 +102,12 @@ print("="*80)
 
 # -----------------------------------------------------------------------------
 # Ecuación (30): Contribución T^{00}(4)Γ_{00i}
-# T^{00}(4)Γ_{00i} = (1/2) T^{00} ∂_i g_{00} = (1/2) T^{00} ∂_i(-α² + γ_{jk}β^j β^k)
+# T^{00}(4)Γ_{00i} = (1/2) T^{00} ∂_i g_{00} = (1/2) T^{00} ∂_i(-alpha² + γ_{jk}β^j β^k)
 # -----------------------------------------------------------------------------
 print("\n--- Ecuación (30): Término T^{00}(4)Γ_{00i} ---")
-print("T^{00}(4)Γ_{00i} = (1/2) T^{00} ∂_i(-α² + γ_{jk}β^jβ^k)")
+print("T^{00}(4)Γ_{00i} = (1/2) T^{00} ∂_i(-alpha² + γ_{jk}β^jβ^k)")
 
-# ∂_i(-α²) = -2α ∂_i α
+# ∂_i(-alpha²) = -2alpha ∂_i alpha
 term_alpha_sq = -2 * alpha * d_i_alpha
 
 # ∂_i(γ_{jk}β^j β^k) = β^j β^k ∂_i γ_{jk} + 2 γ_{jk} β^j ∂_i β^k
@@ -116,11 +116,11 @@ term_alpha_sq = -2 * alpha * d_i_alpha
 
 # El término de (30) contribuye al resultado pero se combina con (31)
 eq30_raw = Rational(1,2) * T00 * term_alpha_sq
-print(f"  Parte de α: (1/2) T^{{00}} × (-2α ∂_i α) = {eq30_raw}")
+print(f"  Parte de alpha: (1/2) T^{{00}} × (-2alpha ∂_i alpha) = {eq30_raw}")
 
 # -----------------------------------------------------------------------------
 # Ecuación (31): T^{00} g_{a0} (4)Γ^a_{0i}
-# = (1/2) T^{00} (β^j β^k D̂_i γ_{jk} + 2β^k D̂_i β_k - 2α D̂_i α)
+# = (1/2) T^{00} (β^j β^k D̂_i γ_{jk} + 2β^k D̂_i β_k - 2alpha D̂_i alpha)
 # -----------------------------------------------------------------------------
 print("\n--- Ecuación (31): Término T^{00} g_{a0} (4)Γ^a_{0i} ---")
 
@@ -133,12 +133,12 @@ term_beta_beta_gamma = sum(
 # Término 2β^k D̂_i β_k (se cancela con término de ec. 32)
 term_beta_Di_beta = 2 * sum(beta[k-1] * Di_beta[k-1] for k in range(1,4))
 
-# Término -2α D̂_i α
+# Término -2alpha D̂_i alpha
 term_alpha = -2 * alpha * d_i_alpha
 
 eq31 = Rational(1,2) * T00 * (term_beta_beta_gamma + term_beta_Di_beta + term_alpha)
 
-print("  (1/2) T^{00} [β^jβ^k D̂_i γ_{jk} + 2β^k D̂_i β_k - 2α D̂_i α]")
+print("  (1/2) T^{00} [β^jβ^k D̂_i γ_{jk} + 2β^k D̂_i β_k - 2alpha D̂_i alpha]")
 
 # -----------------------------------------------------------------------------
 # Ecuación (32): Términos mixtos T^{0j}
@@ -199,7 +199,7 @@ print("\n" + "="*80)
 print("SECCIÓN 3: LADO DERECHO - Expresión de la Ecuación (34)")
 print("="*80)
 
-# -T^{00} α ∂_i α
+# -T^{00} alpha ∂_i alpha
 RHS_term1 = -T00 * alpha * d_i_alpha
 
 # T^0_k D̂_i β^k  
@@ -214,7 +214,7 @@ RHS_term3 = Rational(1,2) * sum(
 lado_derecho = RHS_term1 + RHS_term2 + RHS_term3
 lado_derecho = expand(lado_derecho)
 
-print("-T^{00} α ∂_i α + T^0_k D̂_i β^k + (1/2)(T^{00}β^jβ^k + 2T^{0j}β^k + T^{jk}) D̂_i γ_{jk}")
+print("-T^{00} alpha ∂_i alpha + T^0_k D̂_i β^k + (1/2)(T^{00}β^jβ^k + 2T^{0j}β^k + T^{jk}) D̂_i γ_{jk}")
 
 # =============================================================================
 # SECCIÓN 4: COMPARACIÓN ALGEBRAICA
@@ -253,8 +253,8 @@ print("="*80)
 
 # Expandimos ambos lados y comparamos coeficientes
 
-print("\n--- Término con ∂_i α ---")
-# Del lado izquierdo (ec. 31): (1/2) T^{00} × (-2α ∂_i α) = -T^{00} α ∂_i α
+print("\n--- Término con ∂_i alpha ---")
+# Del lado izquierdo (ec. 31): (1/2) T^{00} × (-2alpha ∂_i alpha) = -T^{00} alpha ∂_i alpha
 coef_LHS_alpha = lado_izquierdo.coeff(d_i_alpha)
 coef_RHS_alpha = lado_derecho.coeff(d_i_alpha)
 print(f"  LHS coef: {coef_LHS_alpha}")
@@ -317,7 +317,7 @@ if diferencia == 0:
 ║                                                                              ║
 ║  T^a_b (4)Γ^a_{bi} - T^k_j Γ̂^k_{ji}                                          ║
 ║                                                                              ║
-║  = -T^{00} α ∂_i α + T^0_k D̂_i β^k                                           ║
+║  = -T^{00} alpha ∂_i alpha + T^0_k D̂_i β^k                                           ║
 ║    + (1/2)(T^{00}β^jβ^k + 2T^{0j}β^k + T^{jk}) D̂_i γ_{jk}                    ║
 ║                                                                              ║
 ║  Usando la ecuación (35):                                                    ║
