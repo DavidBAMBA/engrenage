@@ -34,11 +34,11 @@ if not os.path.exists(plots_dir):
 # DATA MANAGEMENT
 # =============================================================================
 
-def get_star_folder_name(rho_central, num_points, K, Gamma, evolution_mode="cowling"):
+def get_star_folder_name(rho_central, num_points, K, Gamma, evolution_mode="cowling", reconstructor="wenoz"):
     """
-    Generate folder name based on star parameters and evolution mode.
+    Generate folder name based on star parameters, evolution mode, and reconstructor.
 
-    Format: tov_star_rhoc{rho}_N{N}_K{K}_G{Gamma}_{mode}
+    Format: tov_star_rhoc{rho}_N{N}_K{K}_G{Gamma}_{mode}_{recon}
 
     Args:
         rho_central: Central density (e.g., 1.28e-3)
@@ -46,9 +46,10 @@ def get_star_folder_name(rho_central, num_points, K, Gamma, evolution_mode="cowl
         K: Polytropic constant
         Gamma: Adiabatic index
         evolution_mode: "cowling" or "dynamic"
+        reconstructor: "wenoz", "weno5", "mp5", or "minmod"
 
     Returns:
-        str: Folder name like "tov_star_rhoc1p28em3_N100_K100_G2_cow"
+        str: Folder name like "tov_star_rhoc1p28em3_N100_K100_G2_cow_wz"
     """
     # Format rho_central: 1.28e-3 -> "1p28em3"
     rho_str = f"{rho_central:.2e}"
@@ -62,7 +63,16 @@ def get_star_folder_name(rho_central, num_points, K, Gamma, evolution_mode="cowl
     # Mode suffix: cow for cowling, dyn for dynamic
     mode_suffix = "cow" if evolution_mode == "cowling" else "dyn"
 
-    return f"tov_star_rhoc{rho_str}_N{num_points}_K{K_str}_G{G_str}_{mode_suffix}"
+    # Reconstructor suffix mapping
+    recon_map = {
+        "wenoz": "wz",
+        "weno5": "w5",
+        "mp5": "mp5",
+        "minmod": "md"
+    }
+    recon_suffix = recon_map.get(reconstructor.lower(), "wz")
+
+    return f"tov_star_rhoc{rho_str}_N{num_points}_K{K_str}_G{G_str}_{mode_suffix}_{recon_suffix}"
 
 
 class SimulationDataManager:

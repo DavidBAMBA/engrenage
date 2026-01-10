@@ -276,6 +276,9 @@ def main():
     rho_central = 1.28e-3
     t_final = 8000.0  # Final evolution time
 
+    # Reconstructor: "wenoz" (wz), "weno5" (w5), "mp5" (mp5), "minmod" (md)
+    RECONSTRUCTOR_NAME = "wenoz"
+
     # ==================================================================
     # EVOLUTION MODE SELECTION
     # ==================================================================
@@ -305,8 +308,8 @@ def main():
     ENABLE_DATA_SAVING = True  # Set to True to save data to files
     DATA_ROOT_DIR = os.path.join(script_dir, "tov_evolution_data")  # Root directory for all data
 
-    # Create star-specific folder based on parameters (includes evolution mode)
-    star_folder = get_star_folder_name(rho_central, num_points, K, Gamma, EVOLUTION_MODE)
+    # Create star-specific folder based on parameters (includes evolution mode and reconstructor)
+    star_folder = get_star_folder_name(rho_central, num_points, K, Gamma, EVOLUTION_MODE, RECONSTRUCTOR_NAME)
     OUTPUT_DIR = os.path.join(DATA_ROOT_DIR, star_folder)
 
     SNAPSHOT_INTERVAL = 1000  # Save full domain every N timesteps (None to disable)
@@ -356,8 +359,8 @@ def main():
     spacing = LinearSpacing(num_points, r_max)
     eos = IdealGasEOS(gamma=Gamma)
     
-    # 1. RECONSTRUCTOR BASE (Usa WENO-Z, es más preciso que minmod para el interior)
-    base_recon = create_reconstruction("wenoz")
+    # 1. RECONSTRUCTOR BASE (uses RECONSTRUCTOR_NAME from configuration)
+    base_recon = create_reconstruction(RECONSTRUCTOR_NAME)
     
     # 3. PASAR EL WRAPPER 
     hydro = PerfectFluid(
