@@ -37,14 +37,20 @@ def find_star_folders(data_dir):
     return sorted(star_folders)
 
 
-def load_latest_snapshots(data_dir, suffix=""):
+def load_latest_snapshots(data_dir, suffix="", force_folder=None):
     """Carga los snapshots más recientes."""
     # Primero buscar en carpetas de estrellas (nueva estructura)
     star_folders = find_star_folders(data_dir)
 
     if star_folders:
-        # Usar la carpeta más reciente (por fecha de modificación)
-        star_folder = max(star_folders, key=os.path.getmtime)
+        # Usar carpeta forzada si se especifica, sino la más reciente
+        if force_folder:
+            star_folder = os.path.join(data_dir, force_folder)
+            if not os.path.exists(star_folder):
+                print(f"ERROR: Carpeta forzada no existe: {star_folder}")
+                return None
+        else:
+            star_folder = max(star_folders, key=os.path.getmtime)
         snapshot_file = os.path.join(star_folder, f'tov_snapshots{suffix}.h5')
 
         if not os.path.exists(snapshot_file):
@@ -103,14 +109,17 @@ def load_latest_snapshots(data_dir, suffix=""):
         print("Asegúrate de que la simulación no esté corriendo o espera a que termine.")
         return None
 
-def load_metadata(data_dir, suffix=""):
+def load_metadata(data_dir, suffix="", force_folder=None):
     """Carga metadatos de la simulación."""
     # Primero buscar en carpetas de estrellas (nueva estructura)
     star_folders = find_star_folders(data_dir)
 
     if star_folders:
-        # Usar la carpeta más reciente
-        star_folder = max(star_folders, key=os.path.getmtime)
+        # Usar carpeta forzada si se especifica, sino la más reciente
+        if force_folder:
+            star_folder = os.path.join(data_dir, force_folder)
+        else:
+            star_folder = max(star_folders, key=os.path.getmtime)
         metadata_file = os.path.join(star_folder, f'tov_metadata{suffix}.json')
 
         if not os.path.exists(metadata_file):
@@ -456,9 +465,19 @@ def main():
     print("QUICK DENSITY PROFILE PLOTTER")
     print("="*70)
 
+    # ============================================================
+    # CONFIGURACIÓN: Forzar carpeta específica
+    # ============================================================
+    FORCE_FOLDER = "tov_star_rhoc1p28em03_N1000_K100_G2_dyn"
+    SUFFIX = "_dyn"  # Sufijo para archivos (_dyn para dinámico, "" para cowling)
+    # ============================================================
+
+    print(f"\n>>> Usando carpeta: {FORCE_FOLDER}")
+    print(f">>> Sufijo de archivos: '{SUFFIX}'")
+
     # Cargar metadata
     print("\nCargando metadatos...")
-    metadata = load_metadata(data_dir)
+    metadata = load_metadata(data_dir, suffix=SUFFIX, force_folder=FORCE_FOLDER)
     if metadata:
         print(f"  K = {metadata.get('K', '?')}")
         print(f"  Gamma = {metadata.get('Gamma', '?')}")
@@ -467,7 +486,7 @@ def main():
 
     # Cargar snapshots
     print("\nCargando snapshots...")
-    snapshots = load_latest_snapshots(data_dir)
+    snapshots = load_latest_snapshots(data_dir, suffix=SUFFIX, force_folder=FORCE_FOLDER)
 
     if not snapshots:
         print("\n¡No se pudieron cargar los snapshots!")

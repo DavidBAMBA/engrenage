@@ -270,11 +270,11 @@ def main():
     # CONFIGURATION
     # ==================================================================
     r_max = 16.0
-    num_points = 1000
+    num_points = 100
     K = 100.0
     Gamma = 2.0
     rho_central = 1.28e-3
-    t_final = 6000.0  # Final evolution time
+    t_final = 8000.0  # Final evolution time
 
     # ==================================================================
     # EVOLUTION MODE SELECTION

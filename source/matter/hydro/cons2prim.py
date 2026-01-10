@@ -1,7 +1,133 @@
 # cons2prim.py
 
 import numpy as np
+from numba import jit, prange
 from .atmosphere import FloorApplicator
+
+
+# ============================================================================
+# NUMBA-OPTIMIZED NEWTON-RAPHSON KERNEL FOR IDEAL GAS EOS
+# ============================================================================
+
+@jit(nopython=True, cache=True, fastmath=True)
+def _newton_kernel_ideal_gas(D, Sr, tau, gamma_rr, alpha, p_init,
+                              eos_gamma, p_floor, W_max, tol, max_iter):
+    """
+    NUMBA-optimized Newton-Raphson solver for ideal gas EOS.
+
+    Solves for pressure p such that f(p) = ρ₀ h W² - Q = 0.
+
+    Returns:
+        (rho0, vr, p, eps, W, h, converged) - all scalars
+    """
+    c_ideal = eos_gamma / (eos_gamma - 1.0)
+    gm1 = eos_gamma - 1.0
+
+    p = max(p_init, p_floor)
+    gamma_rr_safe = max(gamma_rr, 1e-30)
+    alpha_safe = max(alpha, 1e-30)
+
+    for iteration in range(max_iter):
+        # Evaluate pressure residual
+        Q = tau + D + p
+        vr = alpha_safe * Sr / (Q * gamma_rr_safe)
+        v2 = gamma_rr_safe * vr * vr
+
+        # Clamp v2 for safety
+        if v2 >= 1.0:
+            v2 = 1.0 - 1e-16
+        if v2 < 0.0:
+            v2 = 0.0
+
+        W = 1.0 / (1.0 - v2) ** 0.5
+
+        # Check Lorentz factor bounds
+        if W > W_max or W < 1.0:
+            p = max(p_floor, p * 1.5 + 1e-14)
+            continue
+
+        rho0 = D / max(W, 1e-30)
+        if rho0 <= 0.0:
+            p = max(p_floor, p * 1.5 + 1e-14)
+            continue
+
+        eps = p / (rho0 * gm1)
+        h = 1.0 + eps + p / rho0
+
+        # Residual
+        f = rho0 * h * W * W - Q
+
+        # Check convergence
+        tol_val = tol * max(1.0, abs(p))
+        if abs(f) <= tol_val:
+            return rho0, vr, p, eps, W, h, True
+
+        # Analytic derivative for ideal gas
+        E = tau + D
+        Q2 = (E + p) ** 2
+        Sr_sq = Sr * Sr
+        v2_deriv = Sr_sq / max(Q2 * gamma_rr_safe, 1e-30)
+        W_loc = 1.0 / max((1.0 - v2_deriv), 1e-16) ** 0.5
+        W_cubed = W_loc * W_loc * W_loc
+        Q_cubed = (E + p) ** 3
+        Wprime = -Sr_sq * W_cubed / max(Q_cubed * gamma_rr_safe, 1e-30)
+        W_sq = W_loc * W_loc
+        df = c_ideal * W_sq + (D + 2.0 * c_ideal * p * W_loc) * Wprime - 1.0
+
+        # Avoid small derivatives
+        if abs(df) < 1e-15:
+            p = max(p_floor, p * 1.5 + 1e-12)
+            continue
+
+        # Newton update with damping
+        p_new = p - f / df
+        if p_new <= 0.0 or p_new != p_new:  # check for NaN
+            p_new = max(p_floor, 0.5 * p)
+
+        p = 0.5 * p + 0.5 * p_new
+
+    # Did not converge - return best guess with converged=False
+    Q = tau + D + p
+    vr = alpha_safe * Sr / (Q * gamma_rr_safe)
+    v2 = gamma_rr_safe * vr * vr
+    if v2 >= 1.0:
+        v2 = 1.0 - 1e-16
+    W = 1.0 / (1.0 - v2) ** 0.5
+    rho0 = D / max(W, 1e-30)
+    eps = p / max(rho0 * gm1, 1e-30)
+    h = 1.0 + eps + p / max(rho0, 1e-30)
+
+    return rho0, vr, p, eps, W, h, False
+
+
+@jit(nopython=True, cache=True, fastmath=True, parallel=True)
+def _solve_newton_batch_ideal_gas(D, Sr, tau, gamma_rr, alpha, p_guess,
+                                   eos_gamma, p_floor, W_max, tol, max_iter):
+    """
+    NUMBA-optimized batch Newton-Raphson for ideal gas EOS.
+
+    Parallelized over all points - each point solved independently.
+    """
+    N = len(D)
+
+    # Output arrays
+    rho0 = np.zeros(N)
+    vr = np.zeros(N)
+    p_out = np.zeros(N)
+    eps = np.zeros(N)
+    W = np.ones(N)
+    h = np.ones(N)
+    converged = np.zeros(N, dtype=np.bool_)
+
+    # Parallel loop over all points
+    for i in prange(N):
+        rho0[i], vr[i], p_out[i], eps[i], W[i], h[i], converged[i] = \
+            _newton_kernel_ideal_gas(
+                D[i], Sr[i], tau[i], gamma_rr[i], alpha[i], p_guess[i],
+                eos_gamma, p_floor, W_max, tol, max_iter
+            )
+
+    return rho0, vr, p_out, eps, W, h, converged
 
 
 # ============================================================================
@@ -219,19 +345,39 @@ class Cons2PrimSolver:
         for key in self.stats:
             self.stats[key] = 0
 
-    def _solve_vectorized_points(self, D, Sr, tau, gamma_rr, p_guess=None, alpha=None):        
+    def _solve_vectorized_points(self, D, Sr, tau, gamma_rr, p_guess=None, alpha=None):
         """
         Vectorized solver for multiple points using Newton-Raphson.
+
+        OPTIMIZED: Uses Numba JIT-compiled kernel for ideal gas EOS.
         """
         N = len(D)
 
         # Initialize pressure guess
         if p_guess is not None:
-            p = np.maximum(p_guess, self.p_floor)
+            p_init = np.maximum(p_guess, self.p_floor)
         else:
-            p = np.maximum(self.p_floor, 0.1 * (tau + D))
+            p_init = np.maximum(self.p_floor, 0.1 * (tau + D))
 
-        # Track convergence
+        # Ensure alpha is an array
+        if alpha is None:
+            alpha = np.ones(N)
+
+        # =====================================================================
+        # FAST PATH: Use Numba kernel for ideal gas (most common case)
+        # =====================================================================
+        if self._is_ideal_gas:
+            rho0, vr, p, eps, W, h, converged = _solve_newton_batch_ideal_gas(
+                D, Sr, tau, gamma_rr, alpha, p_init,
+                self._eos_gamma, self.p_floor, self.W_max, self.tol, self.max_iter
+            )
+            self.stats["newton_successes"] += np.sum(converged)
+            return rho0, vr, p, eps, W, h, converged
+
+        # =====================================================================
+        # SLOW PATH: General EOS (fallback with np.any() reduction)
+        # =====================================================================
+        p = p_init.copy()
         converged = np.zeros(N, dtype=bool)
         active = np.ones(N, dtype=bool)
 
@@ -242,17 +388,11 @@ class Cons2PrimSolver:
         W = np.ones(N)
         h = np.ones(N)
 
-        # Pre-cache constants for ideal gas
-        _is_ideal = getattr(self.eos, "name", "").startswith("ideal_gas")
-        if _is_ideal and hasattr(self.eos, 'gamma'):
-            eos_gamma = float(self.eos.gamma)
-            c_ideal = eos_gamma / (eos_gamma - 1.0)
-        else:
-            c_ideal = None
-
-        # Newton-Raphson iterations
+        # Newton-Raphson iterations (reduced np.any calls)
         for iteration in range(self.max_iter):
-            if not np.any(active):
+            # Count active points once per iteration
+            n_active = np.sum(active)
+            if n_active == 0:
                 break
 
             # Evaluate function for active points
@@ -262,8 +402,9 @@ class Cons2PrimSolver:
                 alpha=alpha[active]
             )
 
-            # Handle evaluation failures
-            if not np.all(ok_active):
+            # Handle evaluation failures (use sum instead of any)
+            n_failed = np.sum(~ok_active)
+            if n_failed > 0:
                 failed_indices = np.where(active)[0][~ok_active]
                 p[failed_indices] = np.maximum(self.p_floor,
                                              p[failed_indices] * 1.5 + 1e-14)
@@ -274,8 +415,9 @@ class Cons2PrimSolver:
             # Check convergence
             tol_active = self.tol * np.maximum(1.0, np.abs(p_active))
             converged_now = np.abs(f_active) <= tol_active
+            n_converged = np.sum(converged_now)
 
-            if np.any(converged_now):
+            if n_converged > 0:
                 # Mark as converged and store results
                 conv_indices = np.where(active)[0][converged_now]
                 converged[conv_indices] = True
@@ -288,56 +430,43 @@ class Cons2PrimSolver:
                 # Remove from active set
                 active[conv_indices] = False
 
-            if not np.any(active):
-                break
+                if n_converged == n_active:
+                    break
 
             # Compute derivatives for remaining points
             still_active = active & ~converged
-            if not np.any(still_active):
+            n_still = np.sum(still_active)
+            if n_still == 0:
                 break
 
             p_still = p[still_active]
             # Residual aligned with still_active
-            f_still = f_active[~converged_now] if np.any(converged_now) else f_active
+            f_still = f_active[~converged_now] if n_converged > 0 else f_active
 
-            if _is_ideal and c_ideal is not None:
-                #print("Using ideal gas analytic derivative")    
-                # === Analytic df/dp for Ideal Gas EOS (optimized with cached constants) ===
-                E = tau[still_active] + D[still_active]
-                Q = E + p_still
-                g = np.maximum(gamma_rr[still_active], 1e-30)
-                Sr_sq = Sr[still_active] ** 2  
-                Q_sq = Q * Q
-                v2 =  Sr_sq / np.maximum(Q_sq * g, 1e-30)
-                W_loc = 1.0 / np.sqrt(np.maximum(1.0 - v2, 1e-16))
-                W_loc_cubed = W_loc * W_loc * W_loc  
-                Wprime = - Sr_sq * W_loc_cubed / np.maximum(Q_sq * Q * g, 1e-30)
-                W_loc_squared = W_loc * W_loc
-                df = c_ideal * W_loc_squared + (D[still_active] + 2.0 * c_ideal * p_still * W_loc) * Wprime - 1.0
-            else:
-                print("Using numerical derivative")
-                # Numerical derivative
-                dp = np.maximum(1e-3 * np.maximum(np.abs(p_still), 1.0), 1e-14)
-                ok2, states2 = self._evaluate_pressure_vectorized(
-                    D[still_active], Sr[still_active], tau[still_active],
-                    p_still + dp, gamma_rr[still_active],
-                    alpha=alpha[still_active]
-                )
-                if not np.all(ok2):
-                    failed_indices = np.where(still_active)[0][~ok2]
-                    p[failed_indices] = np.maximum(self.p_floor,
-                                                 p[failed_indices] * 1.5 + 1e-12)
-                    continue
+            # Numerical derivative for general EOS
+            dp = np.maximum(1e-3 * np.maximum(np.abs(p_still), 1.0), 1e-14)
+            ok2, states2 = self._evaluate_pressure_vectorized(
+                D[still_active], Sr[still_active], tau[still_active],
+                p_still + dp, gamma_rr[still_active],
+                alpha=alpha[still_active]
+            )
+            n_ok2 = np.sum(ok2)
+            if n_ok2 < n_still:
+                failed_indices = np.where(still_active)[0][~ok2]
+                p[failed_indices] = np.maximum(self.p_floor,
+                                             p[failed_indices] * 1.5 + 1e-12)
+                continue
 
-                num = states2[5] - f_still
-                num = np.where(np.isfinite(num), num, np.inf)
-                dp_safe = np.where(np.abs(dp) > 0, dp, 1e-12)
-                df = num / dp_safe
-                df = np.where(np.isfinite(df), df, 0.0)
+            num = states2[5] - f_still
+            num = np.where(np.isfinite(num), num, np.inf)
+            dp_safe = np.where(np.abs(dp) > 0, dp, 1e-12)
+            df = num / dp_safe
+            df = np.where(np.isfinite(df), df, 0.0)
 
-            # Avoid small derivatives
+            # Avoid small derivatives (use sum instead of any)
             small_deriv = (np.abs(df) < 1e-15)
-            if np.any(small_deriv):
+            n_small = np.sum(small_deriv)
+            if n_small > 0:
                 bad_indices = np.where(still_active)[0][small_deriv]
                 p[bad_indices] = np.maximum(self.p_floor,
                                           p[bad_indices] * 1.5 + 1e-12)
