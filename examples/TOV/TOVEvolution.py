@@ -33,7 +33,7 @@ from source.matter.hydro.cons2prim import prim_to_cons
 from source.matter.hydro.atmosphere import AtmosphereParams
 
 # Local TOV modules (isotropic coordinates)
-from examples.TOV.tov_solver import load_or_solve_tov_iso
+from examples.TOV.tov_solver import load_or_solve_tov
 import examples.TOV.tov_initial_data_interpolated as tov_id
 
 # TOV utilities and plotting
@@ -274,7 +274,7 @@ def main():
     K = 100.0
     Gamma = 2.0
     rho_central = 1.28e-3
-    t_final = 8000.0  # Final evolution time
+    t_final = 10000 # Final evolution time
 
     # Reconstructor: "wenoz" (wz), "weno5" (w5), "mp5" (mp5), "minmod" (md)
     RECONSTRUCTOR_NAME = "wenoz"
@@ -312,8 +312,8 @@ def main():
     star_folder = get_star_folder_name(rho_central, num_points, K, Gamma, EVOLUTION_MODE, RECONSTRUCTOR_NAME)
     OUTPUT_DIR = os.path.join(DATA_ROOT_DIR, star_folder)
 
-    SNAPSHOT_INTERVAL = 1000  # Save full domain every N timesteps (None to disable)
-    EVOLUTION_INTERVAL = 1000  # Save time series every N timesteps (None to disable)
+    SNAPSHOT_INTERVAL = 100  # Save full domain every N timesteps (None to disable)
+    EVOLUTION_INTERVAL = 100  # Save time series every N timesteps (None to disable)
 
     # Time series saving (density profiles and central density evolution)
     SAVE_TIMESERIES = True  # Set to True to save time series data to .npz file
@@ -362,7 +362,7 @@ def main():
     # 1. RECONSTRUCTOR BASE (uses RECONSTRUCTOR_NAME from configuration)
     base_recon = create_reconstruction(RECONSTRUCTOR_NAME)
     
-    # 3. PASAR EL WRAPPER 
+    # 3. PASAR 
     hydro = PerfectFluid(
         eos=eos,
         spacetime_mode="dynamic",
@@ -384,13 +384,13 @@ def main():
     # ==================================================================
     print("Solving TOV equations...")
 
-    tov_solution = load_or_solve_tov_iso(
+    tov_solution = load_or_solve_tov(
         K=K, Gamma=Gamma, rho_central=rho_central,
         r_max=r_max, accuracy="high"
     )
     print(f"TOV Solution: M={tov_solution.M_star:.6f}, R_iso={tov_solution.R_iso:.3f}, R_schw={tov_solution.R_schw:.3f}, C={tov_solution.C:.4f}\n")
 
-    utils.plot_tov_diagnostics(tov_solution, r_max, suffix=PLOT_SUFFIX)
+    #utils.plot_tov_diagnostics(tov_solution, r_max, suffix=PLOT_SUFFIX)
 
     # ==================================================================
     # INITIAL DATA (HIGH-ORDER INTERPOLATION)
@@ -416,8 +416,8 @@ def main():
                                    output_dir=plots_dir, suffix=PLOT_SUFFIX)
 
     # Zoom comparison: TOV solution vs interpolated initial data 
-    utils.plot_tov_vs_initial_data_zoom(tov_solution, initial_state_2d, grid, prim_tuple,
-                                        window=0.1, suffix=PLOT_SUFFIX)
+    #utils.plot_tov_vs_initial_data_zoom(tov_solution, initial_state_2d, grid, prim_tuple,
+     #                                   window=0.1, suffix=PLOT_SUFFIX)
 
     # ==================================================================
     # EVOLUTION
@@ -476,12 +476,12 @@ def main():
         t_1 = dt
 
         # Plot only the first step changes
-        utils.plot_first_step(initial_state_2d, state_t1, grid, hydro, tov_solution,
-                             suffix=PLOT_SUFFIX)
-        utils.plot_surface_zoom(tov_solution, initial_state_2d, state_t1, grid, hydro,
-                               primitives_t0=prim_tuple, window=0.1, suffix=PLOT_SUFFIX)
-        utils.plot_center_zoom(initial_state_2d, state_t1, grid, hydro,
-                              window=0.5, suffix=PLOT_SUFFIX)
+        #utils.plot_first_step(initial_state_2d, state_t1, grid, hydro, tov_solution,
+        #                     suffix=PLOT_SUFFIX)
+        #utils.plot_surface_zoom(tov_solution, initial_state_2d, state_t1, grid, hydro,
+        #                       primitives_t0=prim_tuple, window=0.1, suffix=PLOT_SUFFIX)
+        #utils.plot_center_zoom(initial_state_2d, state_t1, grid, hydro,
+        #                      window=0.5, suffix=PLOT_SUFFIX)
 
         # Define checkpoints at 1/3, 2/3, and final of total steps
         checkpoint_1 = max(1, num_steps_total // 3)

@@ -206,8 +206,8 @@ class FloorApplicator:
         # RHS of inequality
         RHS = self.atm.conservative_floor_safety * tau_floor * (tau_floor + 2.0 * D_floor)
 
-        # Check violation
-        S_violated = S2 > RHS
+        # Check violation (only where RHS > 0 to avoid sqrt of negative)
+        S_violated = (S2 > RHS) & (RHS > 0)
         if np.any(S_violated):
             # Rescale Sr to satisfy constraint
             rescale_factor = np.sqrt(RHS[S_violated] / np.maximum(S2[S_violated], 1e-30))

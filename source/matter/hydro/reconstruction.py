@@ -62,6 +62,57 @@ def minmod_reconstruct_vectorized(u, u_L, u_R, dx):
     u_R[N-1] = u[-1]
 
 
+@jit(nopython=True, cache=True, fastmath=True, parallel=True)
+def minmod_reconstruct_3vars(rho, vr, p, dx,
+                              rho_L, rho_R, vr_L, vr_R, p_L, p_R):
+    """
+    OPTIMIZED: Reconstruct 3 primitive variables (rho, vr, p) in ONE pass.
+
+    This avoids 3 separate function calls and improves cache locality.
+    All 6 output arrays are modified in-place.
+    """
+    N = rho.shape[0]
+
+    # Parallel loop - process all 3 variables per cell
+    for i in prange(1, N-1):
+        # Load values for rho
+        rho_im1 = rho[i-1]; rho_i = rho[i]; rho_ip1 = rho[i+1]
+        # Load values for vr
+        vr_im1 = vr[i-1]; vr_i = vr[i]; vr_ip1 = vr[i+1]
+        # Load values for p
+        p_im1 = p[i-1]; p_i = p[i]; p_ip1 = p[i+1]
+
+        # Compute slopes for rho
+        slope_L_rho = (rho_i - rho_im1) / dx
+        slope_R_rho = (rho_ip1 - rho_i) / dx
+        slope_rho = minmod_scalar(slope_L_rho, slope_R_rho)
+
+        # Compute slopes for vr
+        slope_L_vr = (vr_i - vr_im1) / dx
+        slope_R_vr = (vr_ip1 - vr_i) / dx
+        slope_vr = minmod_scalar(slope_L_vr, slope_R_vr)
+
+        # Compute slopes for p
+        slope_L_p = (p_i - p_im1) / dx
+        slope_R_p = (p_ip1 - p_i) / dx
+        slope_p = minmod_scalar(slope_L_p, slope_R_p)
+
+        # Reconstruct interface states for all 3 variables
+        rho_R[i] = rho_i - 0.5 * slope_rho * dx
+        rho_L[i+1] = rho_i + 0.5 * slope_rho * dx
+
+        vr_R[i] = vr_i - 0.5 * slope_vr * dx
+        vr_L[i+1] = vr_i + 0.5 * slope_vr * dx
+
+        p_R[i] = p_i - 0.5 * slope_p * dx
+        p_L[i+1] = p_i + 0.5 * slope_p * dx
+
+    # Near-boundary cells (piecewise constant)
+    rho_L[1] = rho[0]; rho_R[N-1] = rho[-1]
+    vr_L[1] = vr[0]; vr_R[N-1] = vr[-1]
+    p_L[1] = p[0]; p_R[N-1] = p[-1]
+
+
 # ==============================================================================
 # MP5 RECONSTRUCTION KERNELS (5TH ORDER MONOTONICITY-PRESERVING)
 # ==============================================================================
@@ -176,6 +227,52 @@ def mp5_reconstruct_vectorized(u, u_L, u_R):
     u_R[N-1] = u[-1]
 
 
+@jit(nopython=True, cache=True, fastmath=True, parallel=True)
+def mp5_reconstruct_3vars(rho, vr, p,
+                          rho_L, rho_R, vr_L, vr_R, p_L, p_R):
+    """
+    OPTIMIZED: Reconstruct 3 primitive variables (rho, vr, p) in ONE pass.
+
+    This avoids 3 separate function calls and improves cache locality.
+    All 6 output arrays are modified in-place.
+    """
+    N = rho.shape[0]
+
+    # Parallel loop - process all 3 variables per cell
+    for i in prange(2, N-2):
+        # Load stencil for rho
+        rho_m2 = rho[i-2]; rho_m1 = rho[i-1]; rho_0 = rho[i]
+        rho_p1 = rho[i+1]; rho_p2 = rho[i+2]
+
+        # Load stencil for vr
+        vr_m2 = vr[i-2]; vr_m1 = vr[i-1]; vr_0 = vr[i]
+        vr_p1 = vr[i+1]; vr_p2 = vr[i+2]
+
+        # Load stencil for p
+        p_m2 = p[i-2]; p_m1 = p[i-1]; p_0 = p[i]
+        p_p1 = p[i+1]; p_p2 = p[i+2]
+
+        # Reconstruct all 3 variables at once
+        rho_uL, rho_uR = mp5_face_kernel(rho_m2, rho_m1, rho_0, rho_p1, rho_p2)
+        vr_uL, vr_uR = mp5_face_kernel(vr_m2, vr_m1, vr_0, vr_p1, vr_p2)
+        p_uL, p_uR = mp5_face_kernel(p_m2, p_m1, p_0, p_p1, p_p2)
+
+        # Store results
+        rho_L[i+1] = rho_uL; rho_R[i] = rho_uR
+        vr_L[i+1] = vr_uL; vr_R[i] = vr_uR
+        p_L[i+1] = p_uL; p_R[i] = p_uR
+
+    # Near-boundary cells (piecewise constant)
+    rho_L[1] = rho[0]; rho_L[2] = rho[1]
+    rho_R[1] = rho[0]; rho_R[N-2] = rho[-2]; rho_R[N-1] = rho[-1]
+
+    vr_L[1] = vr[0]; vr_L[2] = vr[1]
+    vr_R[1] = vr[0]; vr_R[N-2] = vr[-2]; vr_R[N-1] = vr[-1]
+
+    p_L[1] = p[0]; p_L[2] = p[1]
+    p_R[1] = p[0]; p_R[N-2] = p[-2]; p_R[N-1] = p[-1]
+
+
 # ==============================================================================
 # WENO5 RECONSTRUCTION KERNELS (5TH ORDER WENO)
 # ==============================================================================
@@ -244,6 +341,53 @@ def weno5_reconstruct_vectorized(u, u_L, u_R):
     u_R[1] = u[0]
     u_R[N-2] = u[-2]
     u_R[N-1] = u[-1]
+
+
+@jit(nopython=True, cache=True, fastmath=True, parallel=True)
+def weno5_reconstruct_3vars(rho, vr, p,
+                            rho_L, rho_R, vr_L, vr_R, p_L, p_R):
+    """
+    OPTIMIZED: Reconstruct 3 primitive variables (rho, vr, p) in ONE pass.
+
+    This avoids 3 separate function calls and improves cache locality.
+    All 6 output arrays are modified in-place.
+    """
+    N = rho.shape[0]
+
+    # Parallel loop - process all 3 variables per cell
+    for i in prange(2, N-2):
+        # Load stencil for rho
+        rho_m2 = rho[i-2]; rho_m1 = rho[i-1]; rho_0 = rho[i]
+        rho_p1 = rho[i+1]; rho_p2 = rho[i+2]
+
+        # Load stencil for vr
+        vr_m2 = vr[i-2]; vr_m1 = vr[i-1]; vr_0 = vr[i]
+        vr_p1 = vr[i+1]; vr_p2 = vr[i+2]
+
+        # Load stencil for p
+        p_m2 = p[i-2]; p_m1 = p[i-1]; p_0 = p[i]
+        p_p1 = p[i+1]; p_p2 = p[i+2]
+
+        # Reconstruct all 3 variables at once
+        # Left states at i+1/2
+        rho_L[i+1] = weno5_face_kernel(rho_m2, rho_m1, rho_0, rho_p1, rho_p2)
+        vr_L[i+1] = weno5_face_kernel(vr_m2, vr_m1, vr_0, vr_p1, vr_p2)
+        p_L[i+1] = weno5_face_kernel(p_m2, p_m1, p_0, p_p1, p_p2)
+
+        # Right states at i-1/2 (reversed stencil)
+        rho_R[i] = weno5_face_kernel(rho_p2, rho_p1, rho_0, rho_m1, rho_m2)
+        vr_R[i] = weno5_face_kernel(vr_p2, vr_p1, vr_0, vr_m1, vr_m2)
+        p_R[i] = weno5_face_kernel(p_p2, p_p1, p_0, p_m1, p_m2)
+
+    # Near-boundary cells (piecewise constant)
+    rho_L[1] = rho[0]; rho_L[2] = rho[1]
+    rho_R[1] = rho[0]; rho_R[N-2] = rho[-2]; rho_R[N-1] = rho[-1]
+
+    vr_L[1] = vr[0]; vr_L[2] = vr[1]
+    vr_R[1] = vr[0]; vr_R[N-2] = vr[-2]; vr_R[N-1] = vr[-1]
+
+    p_L[1] = p[0]; p_L[2] = p[1]
+    p_R[1] = p[0]; p_R[N-2] = p[-2]; p_R[N-1] = p[-1]
 
 
 # ==============================================================================
@@ -460,7 +604,8 @@ class Reconstruction:
         """
         Reconstruct primitive variables (rho0, v^r, p) to interfaces.
 
-        OPTIMIZED: For WENO-Z, uses single-pass 3-variable reconstruction.
+        OPTIMIZED: All methods use single-pass 3-variable reconstruction
+        for better cache locality and reduced function call overhead.
 
         Args:
             rho0: Rest-mass density
@@ -474,53 +619,50 @@ class Reconstruction:
             left:  (rho0_L, vr_L, p_L)
             right: (rho0_R, vr_R, p_R)
         """
-        # OPTIMIZATION: Use single-pass reconstruction for WENO-Z (all boundary types)
+        # Convert inputs to float64 arrays
+        rho0 = np.asarray(rho0, dtype=np.float64)
+        vr_arr = np.asarray(vr, dtype=np.float64)
+        pressure = np.asarray(pressure, dtype=np.float64)
+        N = rho0.size
+
+        # Allocate all 6 output arrays
+        rL = np.empty(N + 1, dtype=np.float64)
+        rR = np.empty(N + 1, dtype=np.float64)
+        vL = np.empty(N + 1, dtype=np.float64)
+        vR = np.empty(N + 1, dtype=np.float64)
+        pL = np.empty(N + 1, dtype=np.float64)
+        pR = np.empty(N + 1, dtype=np.float64)
+
+        # OPTIMIZED: Single call to method-specific 3-variable kernel
         if self.method == "wenoz":
-            rho0 = np.asarray(rho0, dtype=np.float64)
-            vr_arr = np.asarray(vr, dtype=np.float64)
-            pressure = np.asarray(pressure, dtype=np.float64)
-            N = rho0.size
-
-            # Allocate all 6 output arrays
-            rL = np.empty(N + 1, dtype=np.float64)
-            rR = np.empty(N + 1, dtype=np.float64)
-            vL = np.empty(N + 1, dtype=np.float64)
-            vR = np.empty(N + 1, dtype=np.float64)
-            pL = np.empty(N + 1, dtype=np.float64)
-            pR = np.empty(N + 1, dtype=np.float64)
-
-            # Single call to optimized 3-variable kernel
             wenoz_reconstruct_3vars(rho0, vr_arr, pressure,
                                     rL, rR, vL, vR, pL, pR)
+        elif self.method == "weno5":
+            weno5_reconstruct_3vars(rho0, vr_arr, pressure,
+                                    rL, rR, vL, vR, pL, pR)
+        elif self.method == "mp5":
+            mp5_reconstruct_3vars(rho0, vr_arr, pressure,
+                                  rL, rR, vL, vR, pL, pR)
+        else:  # minmod
+            # Get dx for minmod
+            if dx is None:
+                if x is not None:
+                    dx = x[1] - x[0]
+                else:
+                    dx = 1.0
+            minmod_reconstruct_3vars(rho0, vr_arr, pressure, dx,
+                                     rL, rR, vL, vR, pL, pR)
 
-            # Fill boundaries (outflow first, then apply parity if needed)
-            self._fill_boundaries(rho0, rL, rR, "outflow")
-            self._fill_boundaries(vr_arr, vL, vR, "outflow")
-            self._fill_boundaries(pressure, pL, pR, "outflow")
+        # Fill boundaries (outflow first, then apply parity if needed)
+        self._fill_boundaries(rho0, rL, rR, "outflow")
+        self._fill_boundaries(vr_arr, vL, vR, "outflow")
+        self._fill_boundaries(pressure, pL, pR, "outflow")
 
-            # Apply reflecting/parity conditions at r≈0
-            if boundary_type == "reflecting":
-                rL[0], rR[0] = rho0[0], rho0[0]
-                vL[0], vR[0] = 0.0, 0.0  # v^r is odd
-                pL[0], pR[0] = pressure[0], pressure[0]
-
-            return (rL, vL, pL), (rR, vR, pR)
-
-        # Fallback for other methods
+        # Apply reflecting/parity conditions at r≈0
         if boundary_type == "reflecting":
-            # Build with outflow, then enforce parity
-            rL, rR = self.reconstruct(rho0, dx=dx, x=x, boundary_type="outflow")
-            vL, vR = self.reconstruct(vr, dx=dx, x=x, boundary_type="outflow")
-            pL, pR = self.reconstruct(pressure, dx=dx, x=x, boundary_type="outflow")
-
-            # Parities at r≈0: rho0, p even; v^r odd
             rL[0], rR[0] = rho0[0], rho0[0]
-            vL[0], vR[0] = 0.0, 0.0
+            vL[0], vR[0] = 0.0, 0.0  # v^r is odd
             pL[0], pR[0] = pressure[0], pressure[0]
-        else:
-            rL, rR = self.reconstruct(rho0, dx=dx, x=x, boundary_type=boundary_type)
-            vL, vR = self.reconstruct(vr, dx=dx, x=x, boundary_type=boundary_type)
-            pL, pR = self.reconstruct(pressure, dx=dx, x=x, boundary_type=boundary_type)
 
         return (rL, vL, pL), (rR, vR, pR)
 
@@ -590,12 +732,24 @@ def create_reconstruction(method: str = "wenoz"):
     """
     Create reconstruction object.
 
+    Automatically selects JAX or Numba backend based on ENGRENAGE_BACKEND env var.
+
     Args:
         method: "minmod", "mp5", "weno5", or "wenoz" (default: wenoz)
 
     Returns:
-        Reconstruction instance
+        Reconstruction instance (JAX or Numba version)
     """
+    from .tests.advance.backend import BACKEND
+
+    if 'jax' in BACKEND:
+        # JAX backend (note: MP5 not available in JAX)
+        if method.lower() == "mp5":
+            print("[reconstruction] WARNING: MP5 not available in JAX, using WENO-Z instead")
+            method = "wenoz"
+        from .reconstruction_jax import ReconstructionJAX
+        return ReconstructionJAX(method=method)
+
     return Reconstruction(method=method)
 
 

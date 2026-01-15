@@ -7,9 +7,15 @@ from source.bssn.tensoralgebra import SPACEDIM, EMTensor
 from source.backgrounds.sphericalbackground import i_r
 
 from .valencia_reference_metric import ValenciaReferenceMetric
-from .cons2prim import Cons2PrimSolver
 from .eos import IdealGasEOS
 from .atmosphere import AtmosphereParams
+
+# Backend-aware import for Cons2PrimSolver
+from .tests.advance.backend import BACKEND
+if 'jax' in BACKEND:
+    from .cons2prim_jax import Cons2PrimSolverJAX as Cons2PrimSolver
+else:
+    from .cons2prim import Cons2PrimSolver
 
 
 class PerfectFluid:

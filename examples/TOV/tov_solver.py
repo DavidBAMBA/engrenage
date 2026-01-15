@@ -2061,10 +2061,10 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     print("="*70)
-    print("TOV Solver in Isotropic Coordinates (Improved Version)")
+    print("TOV Solver in Isotropic Coordinates")
     print("="*70)
 
-    # Check if we can show plots interactively
+    # Check if we can show plots interactively+
     can_show = 'DISPLAY' in os.environ and os.environ.get('DISPLAY')
 
     # Run convergence test if requested

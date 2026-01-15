@@ -136,3 +136,10 @@ CLAUDE.md
 # Large data files
 examples/TOV/tov_evolution_data/
 examples/TOV/tov_iso_cache/
+check_h5.py
+
+# Data files
+*.h5
+*.json
+*.npz
+*.png
