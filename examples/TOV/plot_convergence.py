@@ -10,13 +10,15 @@ import os
 
 # Data paths (exact paths)
 FOLDERS = {
-    'N=1600': '/home/davidbamba/repositories/engrenage/examples/TOV/tov_evolution_data2/tov_star_rhoc1p28em03_N1600_K100_G2_cow',
-    'N=200': '/home/davidbamba/repositories/engrenage/examples/TOV/tov_evolution_data2/tov_star_rhoc1p28em03_N200_K100_G2_cow',
+    'N=100': '/home/davidbamba/repositories/engrenage/examples/TOV/tov_evolution_data/tov_star_rhoc1p28em03_N100_K100_G2_cow_wz',
+    'N=200': '/home/davidbamba/repositories/engrenage/examples/TOV/tov_evolution_data/tov_star_rhoc1p28em03_N200_K100_G2_cow_wz',
+    #'N=300': '/home/davidbamba/repositories/engrenage/examples/TOV/tov_evolution_data/tov_star_rhoc1p28em03_N300_K100_G2_cow_wz',    
     'N=400': '/home/davidbamba/repositories/engrenage/examples/TOV/tov_evolution_data/tov_star_rhoc1p28em03_N400_K100_G2_cow_wz',
-    'N=800': '/home/davidbamba/repositories/engrenage/examples/TOV/tov_evolution_data2/tov_star_rhoc1p28em03_N800_K100_G2_cow',
+    #'N=800': '/home/davidbamba/repositories/engrenage/examples/TOV/tov_evolution_data2/tov_star_rhoc1p28em03_N800_K100_G2_cow',
+    #'N=1600': '/home/davidbamba/repositories/engrenage/examples/TOV/tov_evolution_data2/tov_star_rhoc1p28em03_N1600_K100_G2_cow',
 }
 
-COLORS = ['#1f77b4', '#ff7f0e', '#2ca02c', '#d62728']
+COLORS = ['#1f77b4', "#000000", '#2ca02c', "#DBFF12", "#BE17F1", "#F11717"]
 
 def load_timeseries(folder_path):
     # Try npz first
@@ -36,7 +38,7 @@ def load_timeseries(folder_path):
 def main():
     fig, ax = plt.subplots(figsize=(10, 6))
 
-    t_max = 7000.0
+    t_max = 3000.0
 
     for (label, folder_path), color in zip(FOLDERS.items(), COLORS):
         t, rho_c = load_timeseries(folder_path)

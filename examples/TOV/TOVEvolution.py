@@ -26,14 +26,14 @@ from source.core.rhsevolution import get_rhs
 
 # Hydro
 from source.matter.hydro.perfect_fluid import PerfectFluid
-from source.matter.hydro.eos import IdealGasEOS
+from source.matter.hydro.eos import PolytropicEOS
 from source.matter.hydro.reconstruction import create_reconstruction
-from source.matter.hydro.riemann import HLLRiemannSolver#, HLLCRiemannSolver
+from source.matter.hydro.riemann import HLLRiemannSolver, LLFRiemannSolver
 from source.matter.hydro.cons2prim import prim_to_cons
 from source.matter.hydro.atmosphere import AtmosphereParams
 
 # Local TOV modules (isotropic coordinates)
-from examples.TOV.tov_solver import load_or_solve_tov
+from examples.TOV.tov_solver import load_or_solve_tov_iso
 import examples.TOV.tov_initial_data_interpolated as tov_id
 
 # TOV utilities and plotting
@@ -203,7 +203,6 @@ def rk4_step(state_flat, dt, grid, background, hydro, bssn_fixed, bssn_d1_fixed,
     # --- Stage 2 ---
     state_2 = state_flat + 0.5 * dt * k1
     s2 = state_2.reshape((grid.NUM_VARS, grid.N))
-    #s2 = _apply_atmosphere_reset(s2, grid, hydro, atmosphere)
     state_2 = s2.flatten()
 
     k2 = get_rhs_cowling(0, state_2, grid, background, hydro, bssn_fixed, bssn_d1_fixed)
@@ -270,25 +269,57 @@ def main():
     # CONFIGURATION
     # ==================================================================
     r_max = 16.0
-    num_points = 100
+    num_points = 400
     K = 100.0
     Gamma = 2.0
     rho_central = 1.28e-3
     t_final = 10000 # Final evolution time
 
     # Reconstructor: "wenoz" (wz), "weno5" (w5), "mp5" (mp5), "minmod" (md)
-    RECONSTRUCTOR_NAME = "wenoz"
+    RECONSTRUCTOR_NAME = "mc"
 
     # ==================================================================
     # EVOLUTION MODE SELECTION
     # ==================================================================
     # Options: "cowling" or "dynamic"
     #   - "cowling": Fixed spacetime (BSSN variables frozen at t=0)
-    #                Only hydro variables evolve. Faster, good for testing.
-    #   - "dynamic": Full BSSN + hydro evolution. Metric responds to matter,
-    #                allows gravitational wave generation. Uses 1+log slicing
-    #                and gamma-driver shift conditions.
-    EVOLUTION_MODE = "cowling"  # Change to "dynamic" for full BSSN evolution
+    #   - "dynamic": Full BSSN + hydro evolution. 
+    EVOLUTION_MODE = "cowling" 
+
+    # ==================================================================
+    # ATMOSPHERE CONFIGURATION (Centralized floor management)
+    # ==================================================================
+    ATMOSPHERE = AtmosphereParams(
+        rho_floor=1.0e-10,  # Rest mass density floor
+        p_floor=K*(1.0e-10)**Gamma,     # Pressure floor
+        v_max=0.999,           # Maximum velocity
+        W_max=100.0,            # Maximum Lorentz factor
+        conservative_floor_safety=0.999  # Safety factor for S^2 constraint
+    )
+
+    # ==================================================================
+    # SETUP
+    # ==================================================================
+    spacing = LinearSpacing(num_points, r_max)
+    eos = PolytropicEOS(K=K, gamma=Gamma)
+    
+    # 1. RECONSTRUCTOR BASE (uses RECONSTRUCTOR_NAME from configuration)
+    base_recon = create_reconstruction(RECONSTRUCTOR_NAME)
+    
+    # 3. PASAR 
+    hydro = PerfectFluid(
+        eos=eos,
+        spacetime_mode="dynamic",
+        atmosphere=ATMOSPHERE,
+        reconstructor=base_recon,
+        riemann_solver=LLFRiemannSolver(atmosphere=ATMOSPHERE)
+    )
+
+    state_vector = StateVector(hydro)
+    grid = Grid(spacing, state_vector)
+    background = FlatSphericalBackground(grid.r)
+    hydro.background = background
+
 
     # Create suffix for plot filenames based on evolution mode
     PLOT_SUFFIX = "_cow" if EVOLUTION_MODE == "cowling" else "_dyn"
@@ -329,17 +360,6 @@ def main():
         print()
 
     # ==================================================================
-    # ATMOSPHERE CONFIGURATION (Centralized floor management)
-    # ==================================================================
-    # Define atmosphere parameters ONCE - all subsystems will use these
-    ATMOSPHERE = AtmosphereParams(
-        rho_floor=1.0e-10,  # Rest mass density floor
-        p_floor=K*(1.0e-10)**Gamma,     # Pressure floor
-        v_max=0.999,           # Maximum velocity
-        W_max=100.0,            # Maximum Lorentz factor
-        conservative_floor_safety=0.999  # Safety factor for S^2 constraint
-    )
-
     print("=" * 70)
     print("ATMOSPHERE CONFIGURATION")
     print("=" * 70)
@@ -353,28 +373,7 @@ def main():
     # 'fixed': RK4 with fixed timestep 
     integration_method = 'fixed'  # 'fixed' 
 
-    # ==================================================================
-    # SETUP
-    # ==================================================================
-    spacing = LinearSpacing(num_points, r_max)
-    eos = IdealGasEOS(gamma=Gamma)
-    
-    # 1. RECONSTRUCTOR BASE (uses RECONSTRUCTOR_NAME from configuration)
-    base_recon = create_reconstruction(RECONSTRUCTOR_NAME)
-    
-    # 3. PASAR 
-    hydro = PerfectFluid(
-        eos=eos,
-        spacetime_mode="dynamic",
-        atmosphere=ATMOSPHERE,
-        reconstructor=base_recon,
-        riemann_solver=HLLRiemannSolver(atmosphere=ATMOSPHERE)
-    )
 
-    state_vector = StateVector(hydro)
-    grid = Grid(spacing, state_vector)
-    background = FlatSphericalBackground(grid.r)
-    hydro.background = background
 
     print(f"Grid: N={grid.N}, r_max={r_max}, dr_min={grid.min_dr}")
     print(f"EOS: K={K}, Gamma={Gamma}\n")
@@ -384,7 +383,7 @@ def main():
     # ==================================================================
     print("Solving TOV equations...")
 
-    tov_solution = load_or_solve_tov(
+    tov_solution = load_or_solve_tov_iso(
         K=K, Gamma=Gamma, rho_central=rho_central,
         r_max=r_max, accuracy="high"
     )
@@ -568,32 +567,37 @@ def main():
         t_10000 = checkpoint_times[3]
         num_steps = steps_final
 
-        # Build full-series arrays for mass and central density
+        # Build full-series arrays for mass, central density, and central velocity
         try:
             if len(all_series) == 3:
                 # All three segments completed
                 times_full = np.concatenate([all_series[0]['t'], all_series[1]['t'][1:], all_series[2]['t'][1:]])
                 Mb_full = np.concatenate([all_series[0]['Mb'], all_series[1]['Mb'][1:], all_series[2]['Mb'][1:]])
                 rho_c_full = np.concatenate([all_series[0]['rho_c'], all_series[1]['rho_c'][1:], all_series[2]['rho_c'][1:]])
+                v_c_full = np.concatenate([all_series[0]['v_c'], all_series[1]['v_c'][1:], all_series[2]['v_c'][1:]])
             elif len(all_series) == 2:
                 # Only first two segments completed
                 times_full = np.concatenate([all_series[0]['t'], all_series[1]['t'][1:]])
                 Mb_full = np.concatenate([all_series[0]['Mb'], all_series[1]['Mb'][1:]])
                 rho_c_full = np.concatenate([all_series[0]['rho_c'], all_series[1]['rho_c'][1:]])
+                v_c_full = np.concatenate([all_series[0]['v_c'], all_series[1]['v_c'][1:]])
             elif len(all_series) == 1:
                 # Only first segment completed
                 times_full = all_series[0]['t']
                 Mb_full = all_series[0]['Mb']
                 rho_c_full = all_series[0]['rho_c']
+                v_c_full = all_series[0]['v_c']
             else:
                 times_full = np.array([])
                 Mb_full = np.array([])
                 rho_c_full = np.array([])
+                v_c_full = np.array([])
         except Exception as e:
             print(f"Warning: Failed to concatenate series: {e}")
             times_full = np.array([])
             Mb_full = np.array([])
             rho_c_full = np.array([])
+            v_c_full = np.array([])
 
         # ==================================================================
         # SAVE TIME SERIES TO FILE (optional)
@@ -610,6 +614,7 @@ def main():
             np.savez(timeseries_path,
                      times=times_full,
                      rho_central=rho_c_full,
+                     v_central=v_c_full,
                      Mb=Mb_full,
                      # Simulation parameters
                      num_points=num_points,

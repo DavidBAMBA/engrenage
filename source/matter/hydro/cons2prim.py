@@ -131,6 +131,132 @@ def _solve_newton_batch_ideal_gas(D, Sr, tau, gamma_rr, alpha, p_guess,
 
 
 # ============================================================================
+# NUMBA-OPTIMIZED NEWTON-RAPHSON KERNEL FOR POLYTROPIC EOS
+# ============================================================================
+
+@jit(nopython=True, cache=True, fastmath=True)
+def _newton_kernel_polytropic(D, Sr, tau, gamma_rr, alpha, rho_init,
+                               eos_K, eos_gamma, rho_floor, W_max, tol, max_iter):
+    """
+    NUMBA-optimized Newton-Raphson solver for polytropic EOS.
+
+    For barotropic EOS P = K ρ₀^Γ, solve for ρ₀ such that D = ρ₀ W.
+
+    Returns:
+        (rho0, vr, p, eps, W, h, converged) - all scalars
+    """
+    gm1 = eos_gamma - 1.0
+    K = eos_K
+
+    rho = max(rho_init, rho_floor)
+    gamma_rr_safe = max(gamma_rr, 1e-30)
+    alpha_safe = max(alpha, 1e-30)
+
+    for iteration in range(max_iter):
+        # Pressure and enthalpy from rho (barotropic: depends only on rho)
+        p = K * rho**eos_gamma
+        h = 1.0 + eos_gamma * K * rho**gm1 / gm1
+
+        # Compute Q = tau + D + p, then velocity
+        Q = tau + D + p
+        vr = alpha_safe * Sr / (Q * gamma_rr_safe)
+        v2 = gamma_rr_safe * vr * vr
+
+        # Clamp v2 for safety
+        if v2 >= 1.0:
+            v2 = 1.0 - 1e-16
+        if v2 < 0.0:
+            v2 = 0.0
+
+        W = 1.0 / (1.0 - v2)**0.5
+
+        # Check Lorentz factor bounds
+        if W > W_max or W < 1.0:
+            rho = max(rho_floor, rho * 0.5)
+            continue
+
+        # Residual: f = D - rho * W
+        f = D - rho * W
+
+        # Check convergence
+        tol_val = tol * max(1.0, D)
+        if abs(f) <= tol_val:
+            eps = K * rho**gm1 / gm1
+            return rho, vr, p, eps, W, h, True
+
+        # Numerical derivative df/drho
+        drho = 1e-8 * max(rho, 1e-10)
+        rho2 = rho + drho
+        p2 = K * rho2**eos_gamma
+        Q2 = tau + D + p2
+        vr2 = alpha_safe * Sr / (Q2 * gamma_rr_safe)
+        v2_2 = gamma_rr_safe * vr2 * vr2
+        if v2_2 >= 1.0:
+            v2_2 = 1.0 - 1e-16
+        if v2_2 < 0.0:
+            v2_2 = 0.0
+        W2 = 1.0 / (1.0 - v2_2)**0.5
+        f2 = D - rho2 * W2
+
+        df = (f2 - f) / drho
+
+        # Avoid small derivatives
+        if abs(df) < 1e-15:
+            rho = max(rho_floor, rho * 1.5 + 1e-12)
+            continue
+
+        # Newton update with damping
+        rho_new = rho - f / df
+        if rho_new <= 0.0 or rho_new != rho_new:  # check for NaN
+            rho_new = max(rho_floor, 0.5 * rho)
+
+        rho = 0.5 * rho + 0.5 * rho_new
+
+    # Did not converge - return best guess with converged=False
+    p = K * rho**eos_gamma
+    h = 1.0 + eos_gamma * K * rho**gm1 / gm1
+    Q = tau + D + p
+    vr = alpha_safe * Sr / (Q * gamma_rr_safe)
+    v2 = gamma_rr_safe * vr * vr
+    if v2 >= 1.0:
+        v2 = 1.0 - 1e-16
+    W = 1.0 / (1.0 - v2)**0.5
+    eps = K * rho**gm1 / gm1
+
+    return rho, vr, p, eps, W, h, False
+
+
+@jit(nopython=True, cache=True, fastmath=True, parallel=True)
+def _solve_newton_batch_polytropic(D, Sr, tau, gamma_rr, alpha, rho_guess,
+                                    eos_K, eos_gamma, rho_floor, W_max, tol, max_iter):
+    """
+    NUMBA-optimized batch Newton-Raphson for polytropic EOS.
+
+    Parallelized over all points - each point solved independently.
+    """
+    N = len(D)
+
+    # Output arrays
+    rho0 = np.zeros(N)
+    vr = np.zeros(N)
+    p_out = np.zeros(N)
+    eps = np.zeros(N)
+    W = np.ones(N)
+    h = np.ones(N)
+    converged = np.zeros(N, dtype=np.bool_)
+
+    # Parallel loop over all points
+    for i in prange(N):
+        rho0[i], vr[i], p_out[i], eps[i], W[i], h[i], converged[i] = \
+            _newton_kernel_polytropic(
+                D[i], Sr[i], tau[i], gamma_rr[i], alpha[i], rho_guess[i],
+                eos_K, eos_gamma, rho_floor, W_max, tol, max_iter
+            )
+
+    return rho0, vr, p_out, eps, W, h, converged
+
+
+# ============================================================================
 # MAIN SOLVER CLASS
 # ============================================================================
 
@@ -169,6 +295,15 @@ class Cons2PrimSolver:
                               hasattr(eos, 'gamma'))
 
         if self._is_ideal_gas:
+            self._eos_gamma = float(eos.gamma)
+
+        # Check if we can use optimized path for polytropic EOS
+        self._is_polytropic = (hasattr(eos, 'name') and
+                               eos.name.startswith('polytropic') and
+                               hasattr(eos, 'K') and hasattr(eos, 'gamma'))
+
+        if self._is_polytropic:
+            self._eos_K = float(eos.K)
             self._eos_gamma = float(eos.gamma)
 
         # Statistics tracking
@@ -370,6 +505,20 @@ class Cons2PrimSolver:
             rho0, vr, p, eps, W, h, converged = _solve_newton_batch_ideal_gas(
                 D, Sr, tau, gamma_rr, alpha, p_init,
                 self._eos_gamma, self.p_floor, self.W_max, self.tol, self.max_iter
+            )
+            self.stats["newton_successes"] += np.sum(converged)
+            return rho0, vr, p, eps, W, h, converged
+
+        # =====================================================================
+        # FAST PATH: Use Numba kernel for polytropic EOS
+        # =====================================================================
+        if self._is_polytropic:
+            # For polytropic EOS, use rho as the unknown (not pressure)
+            # Initial guess: rho ~ D (since D = rho * W and W ~ 1 for low velocities)
+            rho_init = np.maximum(D, self.rho_floor)
+            rho0, vr, p, eps, W, h, converged = _solve_newton_batch_polytropic(
+                D, Sr, tau, gamma_rr, alpha, rho_init,
+                self._eos_K, self._eos_gamma, self.rho_floor, self.W_max, self.tol, self.max_iter
             )
             self.stats["newton_successes"] += np.sum(converged)
             return rho0, vr, p, eps, W, h, converged

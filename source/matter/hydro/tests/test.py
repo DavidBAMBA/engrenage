@@ -460,25 +460,31 @@ def test_conservation_short():
     return ok
 
 
-def test_riemann_sod():
-    """Sod shock tube test with MP5 reconstruction."""
-    print("\n" + "="*60)
-    print("TEST 4: Sod shock tube (Minkowski, engrenage infrastructure)")
-    print("="*60)
+def run_sod_simulation(n_interior, reconstructor_name, Tfinal=0.35, gamma=1.4, r_max=1.0):
+    """
+    Run a single Sod shock tube simulation with given parameters.
 
-    # Create grid and hydro with MP5
+    Returns:
+        r_interior: radial coordinates (interior only)
+        rho_final: final density (interior only)
+        p_final: final pressure (interior only)
+        v_final: final velocity (interior only)
+        t_final: final simulation time
+        steps: number of timesteps taken
+    """
     grid, hydro, background, eos = create_hydro_and_grid(
-        n_interior=100, r_max=1.0, gamma=1.4,
-        reconstructor_name="mp5",
+        n_interior=n_interior, r_max=r_max, gamma=gamma,
+        reconstructor_name=reconstructor_name,
         spacetime_mode="fixed_minkowski"
     )
 
     r = grid.r
+    ng = NUM_GHOSTS
 
     # Sod initial conditions
-    r_mid = 0.5 * (r[NUM_GHOSTS] + r[-NUM_GHOSTS-1])
+    r_mid = 0.5 * (r[ng] + r[-ng-1])
     rho0 = np.where(r < r_mid, 10.0, 1.0).astype(float)
-    p = np.where(r < r_mid, 4000.0/3.0, 1.0e-6).astype(float)
+    p = np.where(r < r_mid, 40.0/3.0, 1.0e-6).astype(float)
     v = np.zeros(grid.N)
 
     # Create initial state
@@ -488,13 +494,9 @@ def test_riemann_sod():
     bssn_fixed = state_2d[:NUM_BSSN_VARS, :].copy()
     bssn_d1_fixed = grid.get_d1_metric_quantities(state_2d)
 
-    # Store initial for plotting
-    rho_init = rho0.copy()
-
     # Time evolution
-    t, Tfinal = 0.0, 0.35
-    steps = 0
-    while t < Tfinal and steps < 5000:
+    t, steps = 0.0, 0
+    while t < Tfinal and steps < 10000:
         dt = compute_dt(rho0, v, p, eos, grid, cfl=0.3)
         state_2d = rk3_step(state_2d, dt, grid, background, hydro, bssn_fixed, bssn_d1_fixed)
 
@@ -506,47 +508,215 @@ def test_riemann_sod():
         t += dt
         steps += 1
 
-    print(f"Sod test: t={t:.3f}, steps={steps}")
+    return r[ng:-ng], rho0[ng:-ng], p[ng:-ng], v[ng:-ng], t, steps
 
-    # Plot results
+
+def test_riemann_sod():
+    """Sod shock tube test comparing all reconstructors with convergence analysis."""
+    print("\n" + "="*60)
+    print("TEST 4: Sod shock tube - Reconstructor comparison & Convergence")
+    print("="*60)
+
+    # Test parameters
+    resolutions = [100, 200, 400]  # For convergence test
+    n_interior_ref = 2000          # High-resolution reference
+    n_interior_plot = 400          # Resolution for plotting
+    Tfinal = 0.35
+    gamma = 1.4
+    r_max = 1.0
+
+    # All available reconstructors
+    reconstructors = ["minmod", "mc", "mp5", "weno5", "wenoz"]
+
+    # Colors for plotting
+    colors = {
+        "minmod": "blue",
+        "mc": "green",
+        "mp5": "red",
+        "weno5": "purple",
+        "wenoz": "orange"
+    }
+
+    # ------------------------------------------------------------------
+    # Step 1: Run high-resolution reference simulation with MP5
+    # ------------------------------------------------------------------
+    print(f"\nRunning high-resolution reference (n={n_interior_ref}, MP5)...")
+    r_ref, rho_ref, p_ref, v_ref, t_ref, steps_ref = run_sod_simulation(
+        n_interior=n_interior_ref,
+        reconstructor_name="mp5",
+        Tfinal=Tfinal,
+        gamma=gamma,
+        r_max=r_max
+    )
+    print(f"  Reference: t={t_ref:.4f}, steps={steps_ref}")
+
+    # ------------------------------------------------------------------
+    # Step 2: Run convergence test for each reconstructor
+    # ------------------------------------------------------------------
+    # Structure: convergence_data[recon_name][resolution] = {"rho": L2, "p": L2, "v": L2}
+    convergence_data = {recon: {} for recon in reconstructors}
+    plot_results = {}  # Store results at plot resolution for visualization
+
+    for recon_name in reconstructors:
+        print(f"\n{recon_name}:")
+        for n_interior in resolutions:
+            r_test, rho_test, p_test, v_test, t_test, steps_test = run_sod_simulation(
+                n_interior=n_interior,
+                reconstructor_name=recon_name,
+                Tfinal=Tfinal,
+                gamma=gamma,
+                r_max=r_max
+            )
+            print(f"  n={n_interior}: t={t_test:.4f}, steps={steps_test}")
+
+            # Store for plotting (finest resolution)
+            if n_interior == n_interior_plot:
+                plot_results[recon_name] = {
+                    "r": r_test,
+                    "rho": rho_test,
+                    "p": p_test,
+                    "v": v_test,
+                    "t": t_test
+                }
+
+            # Interpolate reference to test grid
+            rho_ref_interp = np.interp(r_test, r_ref, rho_ref)
+            p_ref_interp = np.interp(r_test, r_ref, p_ref)
+            v_ref_interp = np.interp(r_test, r_ref, v_ref)
+
+            # Calculate L2 errors (normalized)
+            dr = r_test[1] - r_test[0]
+            l2_rho = np.sqrt(np.sum((rho_test - rho_ref_interp)**2) * dr)
+            l2_p = np.sqrt(np.sum((p_test - p_ref_interp)**2) * dr)
+            l2_v = np.sqrt(np.sum((v_test - v_ref_interp)**2) * dr)
+
+            # Normalize by reference L2 norm
+            l2_rho_ref = np.sqrt(np.sum(rho_ref_interp**2) * dr)
+            l2_p_ref = np.sqrt(np.sum(p_ref_interp**2) * dr)
+            l2_v_ref = np.sqrt(np.sum(v_ref_interp**2) * dr)
+
+            convergence_data[recon_name][n_interior] = {
+                "rho": l2_rho / l2_rho_ref if l2_rho_ref > 0 else l2_rho,
+                "p": l2_p / l2_p_ref if l2_p_ref > 0 else l2_p,
+                "v": l2_v / l2_v_ref if l2_v_ref > 0 else l2_v
+            }
+
+    # ------------------------------------------------------------------
+    # Step 3: Print L2 errors and convergence rates
+    # ------------------------------------------------------------------
+    print("\n" + "="*80)
+    print("L2 ERRORS (relative to high-resolution MP5 reference, n=2000)")
+    print("="*80)
+
+    for var_name in ["rho", "p", "v"]:
+        print(f"\n--- L2({var_name}) ---")
+        header = f"{'Reconstructor':<12}"
+        for n in resolutions:
+            header += f" {'n='+str(n):<12}"
+        header += f" {'Rate 1->2':<10} {'Rate 2->3':<10}"
+        print(header)
+        print("-"*80)
+
+        for recon_name in reconstructors:
+            line = f"{recon_name:<12}"
+            errors = []
+            for n in resolutions:
+                err = convergence_data[recon_name][n][var_name]
+                errors.append(err)
+                line += f" {err:<12.4e}"
+
+            # Compute convergence rates: rate = log2(err_coarse / err_fine)
+            if len(errors) >= 2 and errors[1] > 0:
+                rate1 = np.log2(errors[0] / errors[1])
+                line += f" {rate1:<10.2f}"
+            else:
+                line += f" {'N/A':<10}"
+
+            if len(errors) >= 3 and errors[2] > 0:
+                rate2 = np.log2(errors[1] / errors[2])
+                line += f" {rate2:<10.2f}"
+            else:
+                line += f" {'N/A':<10}"
+
+            print(line)
+
+    print("\n" + "="*80)
+
+    # ------------------------------------------------------------------
+    # Step 4: Plot all reconstructors together (at finest resolution)
+    # ------------------------------------------------------------------
+    # Get initial conditions for reference
+    grid_init, _, _, _ = create_hydro_and_grid(
+        n_interior=n_interior_plot, r_max=r_max, gamma=gamma,
+        reconstructor_name="minmod",
+        spacetime_mode="fixed_minkowski"
+    )
+    r_init = grid_init.r
     ng = NUM_GHOSTS
-    rin = r[ng:-ng]
+    r_mid = 0.5 * (r_init[ng] + r_init[-ng-1])
+    rho_init = np.where(r_init < r_mid, 10.0, 1.0).astype(float)
 
-    fig, axes = plt.subplots(1, 3, figsize=(15, 5))
+    fig, axes = plt.subplots(1, 3, figsize=(18, 6))
 
-    # Density
-    axes[0].plot(rin, rho_init[ng:-ng], 'k:', label='Initial', linewidth=2)
-    axes[0].plot(rin, rho0[ng:-ng], 'b-', label='Final', linewidth=2)
+    # Plot initial condition
+    r_plot = plot_results["minmod"]["r"]
+    axes[0].plot(r_plot, rho_init[ng:-ng], 'k:', label='Initial', linewidth=2, alpha=0.5)
+
+    # Plot each reconstructor
+    for recon_name in reconstructors:
+        res = plot_results[recon_name]
+        err = convergence_data[recon_name][n_interior_plot]
+        label = f"{recon_name} (L2={err['rho']:.2e})"
+
+        axes[0].plot(res["r"], res["rho"], color=colors[recon_name],
+                     label=label, linewidth=1.5, alpha=0.8)
+        axes[1].plot(res["r"], res["p"], color=colors[recon_name],
+                     label=f"{recon_name} (L2={err['p']:.2e})", linewidth=1.5, alpha=0.8)
+        axes[2].plot(res["r"], res["v"], color=colors[recon_name],
+                     label=f"{recon_name} (L2={err['v']:.2e})", linewidth=1.5, alpha=0.8)
+
+    # Plot high-resolution reference
+    axes[0].plot(r_ref, rho_ref, 'k--', label=f'Reference (MP5 n={n_interior_ref})', linewidth=1.0, alpha=0.7)
+    axes[1].plot(r_ref, p_ref, 'k--', label=f'Reference (MP5 n={n_interior_ref})', linewidth=1.0, alpha=0.7)
+    axes[2].plot(r_ref, v_ref, 'k--', label=f'Reference (MP5 n={n_interior_ref})', linewidth=1.0, alpha=0.7)
+
+    # Labels and titles
     axes[0].set_xlabel('r')
     axes[0].set_ylabel('Density')
-    axes[0].legend()
-    axes[0].set_title(f'Sod: Density (t={t:.3f})')
+    axes[0].legend(fontsize=8)
+    axes[0].set_title(f'Sod: Density (t={t_ref:.3f}, n={n_interior_plot})')
 
-    # Pressure
-    axes[1].plot(rin, p[ng:-ng], 'b-', linewidth=2)
     axes[1].set_xlabel('r')
     axes[1].set_ylabel('Pressure')
+    axes[1].legend(fontsize=8)
     axes[1].set_title('Pressure')
+    axes[1].set_yscale('log')
 
-    # Velocity
-    axes[2].plot(rin, v[ng:-ng], 'b-', linewidth=2)
     axes[2].set_xlabel('r')
     axes[2].set_ylabel('Velocity')
+    axes[2].legend(fontsize=8)
     axes[2].set_title('Velocity')
 
     plt.tight_layout()
     plt.savefig("test_sod_engrenage.png", dpi=150, bbox_inches="tight")
-    print("Plot saved: test_sod_engrenage.png")
+    print("\nPlot saved: test_sod_engrenage.png")
 
-    # Check for shock structure
-    grad = np.gradient(rho0[ng:-ng], rin)
-    contact = np.any(np.abs(grad) > 0.5)
-    variation = np.std(rho0[ng:-ng]) / np.mean(rho0[ng:-ng])
+    # ------------------------------------------------------------------
+    # Step 5: Check test pass/fail criteria
+    # ------------------------------------------------------------------
+    all_ok = True
+    for recon_name in reconstructors:
+        res = plot_results[recon_name]
+        grad = np.gradient(res["rho"], res["r"])
+        contact = np.any(np.abs(grad) > 0.5)
+        variation = np.std(res["rho"]) / np.mean(res["rho"])
+        recon_ok = (variation > 0.1) and contact
+        if not recon_ok:
+            all_ok = False
+            print(f"WARNING: {recon_name} may have issues (variation={variation:.3f}, contact={contact})")
 
-    ok = (variation > 0.1) and contact
-    print(f"Variation: {variation:.3f}, Contact detected: {contact}")
-    print("PASS" if ok else "FAIL")
-    return ok
+    print("PASS" if all_ok else "FAIL")
+    return all_ok
 
 
 def test_blast_wave(case='weak'):

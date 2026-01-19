@@ -19,7 +19,10 @@ FREQ_CONVERSION = 1.0 / (M_SUN_SECONDS * 1e3)
 
 # Scaling factor: Valencia uses α in characteristic speeds, Font et al. does not
 # Measured ratio f_sim/f_Font ≈ 0.889 → scale by 1/0.889 to compare
-VALENCIA_TO_FONT_SCALE = 1.0 / 0.889  # ≈ 1.125
+VALENCIA_TO_FONT_SCALE = 1.0 #/ 0.889  # ≈ 1.125
+
+# Analysis variable selection: 1 = rho_central (density), 2 = v_central (velocity)
+ANALYSIS_VAR = 1
 
 # Theoretical frequencies (Font et al. 2002)
 FREQUENCIES_COWLING_KHZ = {
@@ -27,7 +30,7 @@ FREQUENCIES_COWLING_KHZ = {
     'H4': 9.971, 'H5': 11.806, 'H6': 13.605,
 }
 
-def subsample_to_delta_t(t, rho_c, delta_t):
+def subsample_to_delta_t(t, signal_data, delta_t):
     """Efficiently subsample data to integer time intervals using searchsorted."""
     target_times = np.arange(0, t.max() + delta_t, delta_t)
     # Use searchsorted for O(log n) lookup per target
@@ -41,37 +44,104 @@ def subsample_to_delta_t(t, rho_c, delta_t):
     # Remove duplicates while preserving order
     _, unique_idx = np.unique(indices, return_index=True)
     indices = indices[np.sort(unique_idx)]
-    return t[indices], rho_c[indices]
+    return t[indices], signal_data[indices]
 
 
-def load_timeseries_npz(npz_file, delta_t=None):
+def load_timeseries_npz(npz_file, delta_t=None, var=1):
     """Load timeseries data, optionally subsampling to integer time intervals.
 
     Args:
         npz_file: Path to the npz file
         delta_t: If specified, subsample to this time interval (e.g., delta_t=1 for t=1,2,3,...)
+        var: 1 = rho_central, 2 = v_central
     """
     npz = np.load(npz_file)
     t = npz['times']
-    rho_c = npz['rho_central']
+
+    if var == 2:
+        if 'v_central' in npz.files:
+            signal_data = npz['v_central']
+            var_name = 'v_central'
+        else:
+            print("  Warning: v_central not found in npz, falling back to rho_central")
+            signal_data = npz['rho_central']
+            var_name = 'rho_central'
+    else:
+        signal_data = npz['rho_central']
+        var_name = 'rho_central'
 
     if delta_t is not None:
-        t, rho_c = subsample_to_delta_t(t, rho_c, delta_t)
+        t, signal_data = subsample_to_delta_t(t, signal_data, delta_t)
         print(f"  Subsampled to delta_t={delta_t}: {len(t)} points (t: {t[0]:.1f} to {t[-1]:.1f})")
 
-    return {'t': t, 'rho_c': rho_c}
+    return {'t': t, 'signal': signal_data, 'var_name': var_name}
 
-def load_evolution_data(h5_file, delta_t=None):
-    """Load evolution data from HDF5 file, optionally subsampling."""
+def load_evolution_data(h5_file, delta_t=None, var=1):
+    """Load evolution data from HDF5 file, optionally subsampling.
+
+    Args:
+        h5_file: Path to the HDF5 file
+        delta_t: If specified, subsample to this time interval
+        var: 1 = rho_central, 2 = v_central
+    """
     with h5py.File(h5_file, 'r') as f:
         t = f['time'][:]
-        rho_c = f['rho_central'][:]
+        if var == 2:
+            if 'v_central' in f.keys():
+                signal_data = f['v_central'][:]
+                var_name = 'v_central'
+            else:
+                print("  Warning: v_central not found in h5, falling back to rho_central")
+                signal_data = f['rho_central'][:]
+                var_name = 'rho_central'
+        else:
+            signal_data = f['rho_central'][:]
+            var_name = 'rho_central'
 
     if delta_t is not None:
-        t, rho_c = subsample_to_delta_t(t, rho_c, delta_t)
+        t, signal_data = subsample_to_delta_t(t, signal_data, delta_t)
         print(f"  Subsampled to delta_t={delta_t}: {len(t)} points (t: {t[0]:.1f} to {t[-1]:.1f})")
 
-    return {'t': t, 'rho_c': rho_c}
+    return {'t': t, 'signal': signal_data, 'var_name': var_name}
+
+def load_v_central_from_snapshots(snapshot_file, delta_t=None):
+    """Load central velocity from snapshots HDF5 file.
+
+    This allows using v_central even from old data that doesn't have it in timeseries.
+    """
+    NUM_GHOSTS = 3  # Ghost points at boundary
+
+    times = []
+    v_central = []
+
+    with h5py.File(snapshot_file, 'r') as f:
+        if 'snapshots' not in f:
+            print(f"  Warning: No snapshots group in {snapshot_file}")
+            return None
+
+        snap_names = sorted(f['snapshots'].keys())
+        print(f"  Loading v_central from {len(snap_names)} snapshots...")
+
+        for snap_name in snap_names:
+            snap = f['snapshots'][snap_name]
+            t = snap.attrs['time']
+            if 'primitives' in snap and 'vr' in snap['primitives']:
+                vr = snap['primitives/vr'][:]
+                times.append(t)
+                v_central.append(vr[NUM_GHOSTS])  # Central point
+
+    if len(times) == 0:
+        return None
+
+    t = np.array(times)
+    signal_data = np.array(v_central)
+
+    if delta_t is not None:
+        t, signal_data = subsample_to_delta_t(t, signal_data, delta_t)
+        print(f"  Subsampled to delta_t={delta_t}: {len(t)} points (t: {t[0]:.1f} to {t[-1]:.1f})")
+
+    return {'t': t, 'signal': signal_data, 'var_name': 'v_central'}
+
 
 def compute_power_spectrum(t, signal_data, t_start=None, window='hann'):
     if t_start is not None:
@@ -127,32 +197,50 @@ def find_all_peaks(freq_khz, power, min_freq=1.5, max_freq=14.0, max_peaks=8):
     
     return freq_sel[peaks], power_sel[peaks]
 
-def plot_qnm_v3(t, rho_c, freq_khz, power, peak_freqs, peak_powers,
-                theoretical_freqs, output_path=None, title=None, scale_factor=1.0):
+def plot_qnm_v3(t, signal_data, freq_khz, power, peak_freqs, peak_powers,
+                theoretical_freqs, output_path=None, title=None, scale_factor=1.0, var_name='rho_central'):
     from mpl_toolkits.axes_grid1.inset_locator import inset_axes
 
-    fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+    fig, axes = plt.subplots(1, 2, figsize=(14, 4))
     if title:
-        fig.suptitle(title, fontsize=16, fontweight='bold')
+        fig.suptitle(title, fontsize=14, fontweight='bold', y=0.98)
 
-    # Left: density evolution
+    # Left: signal evolution
     ax1 = axes[0]
-    rho_c_0 = rho_c[0]
-    delta_rho_rel = (rho_c - rho_c_0) / rho_c_0
-    ax1.plot(t, delta_rho_rel, color='darkred', linewidth=0.8)
-    ax1.set_xlabel(r'$t$ [M$_\odot$]', fontsize=12)
-    ax1.set_ylabel(r'$(\rho_c - \rho_{c,0})/\rho_{c,0}$', fontsize=12)
-    ax1.set_title('Central Density Relative Change', fontsize=14)
-    ax1.grid(True, alpha=0.3)
+    if var_name == 'v_central':
+        # Velocity: plot directly or subtract mean
+        signal_0 = np.mean(signal_data)
+        delta_signal = signal_data - signal_0
+        ax1.plot(t, delta_signal, color='darkblue', linewidth=0.8)
+        ax1.set_xlabel(r'$t$ [M$_\odot$]', fontsize=12)
+        ax1.set_ylabel(r'$v_c - \bar{v}_c$', fontsize=12)
+        ax1.set_title('Central Radial Velocity', fontsize=14)
+        # Inset
+        ax_inset = inset_axes(ax1, width="30%", height="25%", loc='lower right')
+        mask_zoom = t <= min(1000, t[-1]/10)
+        if np.sum(mask_zoom) > 10:
+            ax_inset.plot(t[mask_zoom], signal_data[mask_zoom], 'k-', linewidth=0.6)
+            ax_inset.set_xlabel('Time', fontsize=8)
+            ax_inset.set_ylabel(r'$v_c$', fontsize=8)
+            ax_inset.tick_params(labelsize=7)
+    else:
+        # Density: relative change
+        signal_0 = signal_data[0]
+        delta_signal = (signal_data - signal_0) / signal_0
+        ax1.plot(t, delta_signal, color='darkred', linewidth=0.8)
+        ax1.set_xlabel(r'$t$ [M$_\odot$]', fontsize=12)
+        ax1.set_ylabel(r'$(\rho_c - \rho_{c,0})/\rho_{c,0}$', fontsize=12)
+        ax1.set_title('Central Density Relative Change', fontsize=14)
+        # Inset
+        ax_inset = inset_axes(ax1, width="30%", height="25%", loc='lower right')
+        mask_zoom = t <= min(1000, t[-1]/10)
+        if np.sum(mask_zoom) > 10:
+            ax_inset.plot(t[mask_zoom], signal_data[mask_zoom]/signal_0, 'k-', linewidth=0.6)
+            ax_inset.set_xlabel('Time', fontsize=8)
+            ax_inset.set_ylabel(r'$\rho_c/\rho_{c,0}$', fontsize=8)
+            ax_inset.tick_params(labelsize=7)
 
-    # Inset
-    ax_inset = inset_axes(ax1, width="40%", height="35%", loc='upper right')
-    mask_zoom = t <= min(1000, t[-1]/10)
-    if np.sum(mask_zoom) > 10:
-        ax_inset.plot(t[mask_zoom], rho_c[mask_zoom]/rho_c_0, 'k-', linewidth=0.6)
-        ax_inset.set_xlabel('Time', fontsize=8)
-        ax_inset.set_ylabel(r'$\rho_c/\rho_{c,0}$', fontsize=8)
-        ax_inset.tick_params(labelsize=7)
+    ax1.grid(True, alpha=0.3)
 
     # Right: spectrum
     ax2 = axes[1]
@@ -192,38 +280,71 @@ def plot_qnm_v3(t, rho_c, freq_khz, power, peak_freqs, peak_powers,
         pv = power[valid]
         ax2.set_ylim(np.min(pv[pv > 0]) * 0.1, np.max(pv) * 10)
     
-    plt.tight_layout()
+    plt.subplots_adjust(top=0.88, bottom=0.15, left=0.08, right=0.95, wspace=0.25)
     if output_path:
-        plt.savefig(output_path, dpi=150, bbox_inches='tight')
+        plt.savefig(output_path, dpi=150)
         print(f"Saved: {output_path}")
     return fig
 
-def load_data_from_folder(folder_path, delta_t=None):
+def load_data_from_folder(folder_path, delta_t=None, var=1):
     """Load data from a specific folder.
 
     Args:
         folder_path: Path to the data folder
         delta_t: If specified, subsample to this time interval (e.g., delta_t=1 for t=1,2,3,...)
+        var: 1 = rho_central, 2 = v_central
     """
-    for f in os.listdir(folder_path):
+    files = os.listdir(folder_path)
+
+    # For v_central, try snapshots first (works with old data)
+    if var == 2:
+        for f in files:
+            if f.endswith('.h5') and 'snapshot' in f:
+                filepath = os.path.join(folder_path, f)
+                data = load_v_central_from_snapshots(filepath, delta_t=delta_t)
+                if data is not None:
+                    return data
+
+    # Try standard files
+    for f in files:
         filepath = os.path.join(folder_path, f)
         if f == 'timeseries.npz':
-            return load_timeseries_npz(filepath, delta_t=delta_t)
+            data = load_timeseries_npz(filepath, delta_t=delta_t, var=var)
+            # If we got the variable we wanted, return it
+            if data['var_name'] == ('v_central' if var == 2 else 'rho_central'):
+                return data
+            elif var == 1:  # For rho_central, always return
+                return data
         elif f.endswith('.h5') and 'evolution' in f:
-            return load_evolution_data(filepath, delta_t=delta_t)
+            data = load_evolution_data(filepath, delta_t=delta_t, var=var)
+            if data['var_name'] == ('v_central' if var == 2 else 'rho_central'):
+                return data
+            elif var == 1:
+                return data
+
     return None
 
 def analyze_and_plot(data, folder_name, plot_dir):
     """Analyze data and generate plot for a single dataset."""
-    t, rho_c = data['t'], data['rho_c']
+    t = data['t']
+    signal_data = data['signal']
+    var_name = data.get('var_name', 'rho_central')
+
     print(f"\n{'='*70}")
-    print(f"ANALYSIS: {folder_name}")
+    print(f"ANALYSIS: {folder_name} (variable: {var_name})")
     print(f"{'='*70}")
     print(f"Time: {t[0]:.1f} to {t[-1]:.1f} M_sun ({t[-1]*M_SUN_SECONDS*1e3:.2f} ms)")
     print(f"Points: {len(t)}, dt = {np.mean(np.diff(t)):.4f}")
 
-    delta_rho = (rho_c - rho_c[0]) / rho_c[0]
-    freq_khz, power = compute_power_spectrum(t, delta_rho, t_start=100)
+    # For velocity, use signal directly; for density, use relative change
+    if var_name == 'v_central':
+        # Velocity oscillates around 0, use directly
+        delta_signal = signal_data - np.mean(signal_data)
+    else:
+        # Density: use relative change
+        delta_signal = (signal_data - signal_data[0]) / signal_data[0]
+
+    freq_khz, power = compute_power_spectrum(t, delta_signal, t_start=0.0)
     peak_freqs, peak_powers = find_all_peaks(freq_khz, power)
 
     print(f"\nDETECTED PEAKS (with Valencia→Font scaling = {VALENCIA_TO_FONT_SCALE:.3f}):")
@@ -243,10 +364,10 @@ def analyze_and_plot(data, folder_name, plot_dir):
         ratios = [f/theo[i] for i, f in enumerate(scaled_freqs[:min(4, len(theo))])]
         print(f"\nAfter scaling: Average ratio = {np.mean(ratios):.3f} (difference from Font: {(np.mean(ratios)-1)*100:.1f}%)")
 
-    output_path = os.path.join(plot_dir, f'qnm_{folder_name}.png')
-    plot_qnm_v3(t, rho_c, freq_khz, power, peak_freqs, peak_powers,
-               FREQUENCIES_COWLING_KHZ, output_path, title=folder_name,
-               scale_factor=VALENCIA_TO_FONT_SCALE)
+    output_path = os.path.join(plot_dir, f'qnm_{folder_name}_{var_name}.png')
+    plot_qnm_v3(t, signal_data, freq_khz, power, peak_freqs, peak_powers,
+               FREQUENCIES_COWLING_KHZ, output_path, title=f"{folder_name} ({var_name})",
+               scale_factor=VALENCIA_TO_FONT_SCALE, var_name=var_name)
     return output_path
 
 
@@ -264,8 +385,8 @@ Examples:
     )
     parser.add_argument('--delta-t', type=float, default=None,
                         help='Time interval for subsampling (e.g., 1 for t=0,1,2,...). Default: None (use all data)')
-    parser.add_argument('--data-dir', type=str, default='tov_evolution_data4',
-                        help='Data directory name (relative to script). Default: tov_evolution_data2')
+    parser.add_argument('--data-dir', type=str, default='tov_evolution_data',
+                        help='Data directory name (relative to script). Default: tov_evolution_data')
     args = parser.parse_args()
 
     script_dir = os.path.dirname(os.path.abspath(__file__))
@@ -299,9 +420,12 @@ Examples:
     else:
         print(f"\nUsing all data points (no subsampling)")
 
+    var_name = "rho_central" if ANALYSIS_VAR == 1 else "v_central"
+    print(f"Analysis variable: {var_name} (ANALYSIS_VAR = {ANALYSIS_VAR})")
+
     generated_plots = []
     for folder_name, folder_path in data_folders:
-        data = load_data_from_folder(folder_path, delta_t=delta_t)
+        data = load_data_from_folder(folder_path, delta_t=delta_t, var=ANALYSIS_VAR)
         if data is not None:
             output_path = analyze_and_plot(data, folder_name, plot_dir)
             generated_plots.append(output_path)

@@ -116,6 +116,7 @@ class SimulationDataManager:
             'step': [],
             'time': [],
             'rho_central': [],
+            'v_central': [],
             'p_central': [],
             'max_rho_error': [],
             'max_p_error': [],
@@ -274,6 +275,7 @@ class SimulationDataManager:
         self.evolution_buffer['step'].append(step)
         self.evolution_buffer['time'].append(time)
         self.evolution_buffer['rho_central'].append(rho0[NUM_GHOSTS])
+        self.evolution_buffer['v_central'].append(vr[NUM_GHOSTS])
         self.evolution_buffer['p_central'].append(p[NUM_GHOSTS])
         self.evolution_buffer['max_rho_error'].append(np.max(rel_delta_rho))
         self.evolution_buffer['max_p_error'].append(np.max(rel_delta_p))
@@ -404,12 +406,14 @@ def evolve_fixed_timestep(state_initial, dt, num_steps, grid, background, hydro,
                                         rho0_initial, vr_initial, p_initial, eps_initial, W_initial, h_initial, success_initial,
                                         rho0_initial, vr_initial, p_initial, eps_initial, W_initial, h_initial, success_initial)
 
-    # Timeseries for mass and central density
+    # Timeseries for mass, central density, and central velocity
     times_series = [t_start]
     Mb0 = compute_baryon_mass(grid, s_initial, rho0_initial, vr_initial, p_initial, eps_initial, W_initial, h_initial)
     Mb_series = [Mb0]
     rho_c0 = rho0_initial[NUM_GHOSTS]
     rho_c_series = [rho_c0]
+    v_c0 = vr_initial[NUM_GHOSTS]
+    v_c_series = [v_c0]
 
 
     print("\n===== Evolution diagnostics (per step) =====")
@@ -493,11 +497,12 @@ def evolve_fixed_timestep(state_initial, dt, num_steps, grid, background, hydro,
             if snapshot_interval and step_num % snapshot_interval == 0:
                 data_manager.save_snapshot(step_num, t_curr, s_next, rho0_next, vr_next, p_next, eps_next, W_next, h_next)
 
-        # Append to time series (mass and central density)
+        # Append to time series (mass, central density, and central velocity)
         Mb_next = compute_baryon_mass(grid, s_next, rho0_next, vr_next, p_next, eps_next, W_next, h_next)
         times_series.append(t_curr)
         Mb_series.append(Mb_next)
         rho_c_series.append(float(rho0_next[NUM_GHOSTS]))
+        v_c_series.append(float(vr_next[NUM_GHOSTS]))
 
         # Detect first signs of instability / non-physical values
         issues = []
@@ -547,6 +552,7 @@ def evolve_fixed_timestep(state_initial, dt, num_steps, grid, background, hydro,
                 't': np.array(times_series),
                 'Mb': np.array(Mb_series),
                 'rho_c': np.array(rho_c_series),
+                'v_c': np.array(v_c_series),
             }
 
         # Prepare next step
@@ -562,6 +568,7 @@ def evolve_fixed_timestep(state_initial, dt, num_steps, grid, background, hydro,
         't': np.array(times_series),
         'Mb': np.array(Mb_series),
         'rho_c': np.array(rho_c_series),
+        'v_c': np.array(v_c_series),
     }
 
 

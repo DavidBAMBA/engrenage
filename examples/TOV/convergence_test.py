@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """
 Convergence Test for TOV Star Evolution
 
@@ -56,19 +55,18 @@ def plot_convergence(data, t_common, output_path=None):
     - Bottom: Point-wise convergence factor Q(t)
     """
     fig, axes = plt.subplots(2, 1, figsize=(10, 8))
-    fig.suptitle('TOV Star Convergence Test (N=100, 200, 400, 800)', fontsize=14, fontweight='bold')
+    fig.suptitle('TOV Star Convergence Test (N=100, 200, 400)', fontsize=14, fontweight='bold')
 
-    colors = {'N=100': 'blue', 'N=200': 'orange', 'N=400': 'green', 'N=800': 'red'}
+    colors = {'N=100': 'blue', 'N=200': 'orange', 'N=400': 'green'}
 
     # Extract densities for Q calculation (use 3 consecutive resolutions)
     rho_100 = data['N=100']['rho_central']
     rho_200 = data['N=200']['rho_central']
     rho_400 = data['N=400']['rho_central']
-    rho_800 = data['N=800']['rho_central']
 
     # --- Top panel: Normalized central density evolution ---
     ax = axes[0]
-    for name in ['N=100', 'N=200', 'N=400', 'N=800']:
+    for name in ['N=100', 'N=200', 'N=400']:
         rho_c = data[name]['rho_central']
         rho_c_0 = data[name]['rho_central'][0]
         delta_rho_rel = (rho_c - rho_c_0) / rho_c_0
@@ -87,20 +85,13 @@ def plot_convergence(data, t_common, output_path=None):
     eps = 1e-20
     diff_100_200 = rho_100 - rho_200
     diff_200_400 = rho_200 - rho_400
-    Q_t_1 = diff_100_200 / (diff_200_400 + eps * np.sign(diff_200_400 + eps))
-
-    # Compute Q(t) for N200-N400-N800
-    diff_200_400 = rho_200 - rho_400
-    diff_400_800 = rho_400 - rho_800
-    Q_t_2 = diff_200_400 / (diff_400_800 + eps * np.sign(diff_400_800 + eps))
+    Q_t = diff_100_200 / (diff_200_400 + eps * np.sign(diff_200_400 + eps))
 
     # Smooth Q(t) with moving average for cleaner visualization
     window = 15
-    Q_smooth_1 = np.convolve(Q_t_1, np.ones(window)/window, mode='same')
-    Q_smooth_2 = np.convolve(Q_t_2, np.ones(window)/window, mode='same')
+    Q_smooth = np.convolve(Q_t, np.ones(window)/window, mode='same')
 
-    ax.plot(t_common, Q_smooth_1, 'b-', linewidth=1.2, label=r'$Q$ (N100-200-400)')
-    ax.plot(t_common, Q_smooth_2, 'r-', linewidth=1.2, label=r'$Q$ (N200-400-800)')
+    ax.plot(t_common, Q_smooth, 'b-', linewidth=1.2, label=r'$Q$ (N100-200-400)')
 
     # Expected Q values for different orders (resolution ratio 1:2:4)
     # dr_l = 2*dr_m, dr_h = 0.5*dr_m (relative to medium)
@@ -122,12 +113,10 @@ def plot_convergence(data, t_common, output_path=None):
     # Add statistics text box
     # Skip first 10% for transient
     t_start_idx = len(t_common) // 10
-    Q_mean_1 = np.mean(Q_smooth_1[t_start_idx:])
-    Q_std_1 = np.std(Q_smooth_1[t_start_idx:])
-    Q_mean_2 = np.mean(Q_smooth_2[t_start_idx:])
-    Q_std_2 = np.std(Q_smooth_2[t_start_idx:])
+    Q_mean = np.mean(Q_smooth[t_start_idx:])
+    Q_std = np.std(Q_smooth[t_start_idx:])
 
-    textstr = f'Q(100-200-400) = {Q_mean_1:.2f} ± {Q_std_1:.2f}\nQ(200-400-800) = {Q_mean_2:.2f} ± {Q_std_2:.2f}'
+    textstr = f'Q(100-200-400) = {Q_mean:.2f} ± {Q_std:.2f}'
     props = dict(boxstyle='round', facecolor='wheat', alpha=0.8)
     ax.text(0.02, 0.95, textstr, transform=ax.transAxes, fontsize=10,
             verticalalignment='top', bbox=props)
@@ -138,7 +127,7 @@ def plot_convergence(data, t_common, output_path=None):
         plt.savefig(output_path, dpi=150, bbox_inches='tight')
         print(f"Saved: {output_path}")
 
-    return fig, Q_mean_2, Q_std_2
+    return fig, Q_mean, Q_std
 
 
 def main():
@@ -148,10 +137,9 @@ def main():
 
     # Define paths for each resolution
     data_paths = {
-    'N=100': '/home/davidbamba/repositories/engrenage/examples/TOV/tov_evolution_data2/tov_star_rhoc1p28em03_N100_K100_G2_cow',
-    'N=200': '/home/davidbamba/repositories/engrenage/examples/TOV/tov_evolution_data2/tov_star_rhoc1p28em03_N200_K100_G2_cow',
+    'N=100': '/home/davidbamba/repositories/engrenage/examples/TOV/tov_evolution_data/tov_star_rhoc1p28em03_N100_K100_G2_cow_wz',
+    'N=200': '/home/davidbamba/repositories/engrenage/examples/TOV/tov_evolution_data/tov_star_rhoc1p28em03_N200_K100_G2_cow_wz',
     'N=400': '/home/davidbamba/repositories/engrenage/examples/TOV/tov_evolution_data/tov_star_rhoc1p28em03_N400_K100_G2_cow_wz',
-    'N=800': '/home/davidbamba/repositories/engrenage/examples/TOV/tov_evolution_data2/tov_star_rhoc1p28em03_N800_K100_G2_cow',
 }
     # Load data for each resolution
     raw_data = {}

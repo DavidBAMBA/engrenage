@@ -1,11 +1,12 @@
 """
 High-Order Reconstruction Methods - Fully Optimized with Numba JIT.
 
-Provides four reconstruction schemes with optimal performance:
+Provides five reconstruction schemes with optimal performance:
     1. Minmod   - 2nd order TVD (robust, stable)
-    2. MP5      - 5th order monotonicity-preserving
-    3. WENO5    - 5th order WENO (industry standard)
-    4. WENO-Z   - 5th order WENO-Z (best overall, recommended)
+    2. MC       - 2nd order TVD (less diffusive than Minmod)
+    3. MP5      - 5th order monotonicity-preserving
+    4. WENO5    - 5th order WENO (industry standard)
+    5. WENO-Z   - 5th order WENO-Z (best overall, recommended)
 
 All methods are fully vectorized and JIT-compiled with Numba.
 """
@@ -26,40 +27,6 @@ def minmod_scalar(a, b):
     if abs(a) < abs(b):
         return a
     return b
-
-
-@jit(nopython=True, cache=True, fastmath=True, parallel=True)
-def minmod_reconstruct_vectorized(u, u_L, u_R, dx):
-    """
-    Vectorized Minmod TVD reconstruction with Numba.
-
-    Second-order accurate, total variation diminishing (TVD).
-    Most robust and stable, good for shocks.
-
-    Args:
-        u: Input array (cell centers, length N)
-        u_L: Output left states (interfaces, length N+1) - modified in place
-        u_R: Output right states (interfaces, length N+1) - modified in place
-        dx: Grid spacing (scalar)
-    """
-    N = u.shape[0]
-
-    # Parallel loop over interior cells
-    for i in prange(1, N-1):
-        # Backward and forward slopes
-        slope_L = (u[i] - u[i-1]) / dx
-        slope_R = (u[i+1] - u[i]) / dx
-
-        # Limited slope
-        slope = minmod_scalar(slope_L, slope_R)
-
-        # Reconstruct interface states
-        u_R[i] = u[i] - 0.5 * slope * dx      # Right state at i-1/2
-        u_L[i+1] = u[i] + 0.5 * slope * dx    # Left state at i+1/2
-
-    # Near-boundary cells (piecewise constant)
-    u_L[1] = u[0]
-    u_R[N-1] = u[-1]
 
 
 @jit(nopython=True, cache=True, fastmath=True, parallel=True)
@@ -96,6 +63,99 @@ def minmod_reconstruct_3vars(rho, vr, p, dx,
         slope_L_p = (p_i - p_im1) / dx
         slope_R_p = (p_ip1 - p_i) / dx
         slope_p = minmod_scalar(slope_L_p, slope_R_p)
+
+        # Reconstruct interface states for all 3 variables
+        rho_R[i] = rho_i - 0.5 * slope_rho * dx
+        rho_L[i+1] = rho_i + 0.5 * slope_rho * dx
+
+        vr_R[i] = vr_i - 0.5 * slope_vr * dx
+        vr_L[i+1] = vr_i + 0.5 * slope_vr * dx
+
+        p_R[i] = p_i - 0.5 * slope_p * dx
+        p_L[i+1] = p_i + 0.5 * slope_p * dx
+
+    # Near-boundary cells (piecewise constant)
+    rho_L[1] = rho[0]; rho_R[N-1] = rho[-1]
+    vr_L[1] = vr[0]; vr_R[N-1] = vr[-1]
+    p_L[1] = p[0]; p_R[N-1] = p[-1]
+
+
+# ==============================================================================
+# MC (MONOTONIZED CENTRAL) RECONSTRUCTION KERNELS (2ND ORDER TVD)
+# ==============================================================================
+
+@jit(nopython=True, cache=True, fastmath=True)
+def minmod3_scalar(a, b, c):
+    """
+    Three-argument minmod function for scalars.
+    Returns the value with smallest absolute magnitude if all have same sign, else 0.
+    """
+    # All must have same sign
+    if a * b <= 0.0 or a * c <= 0.0:
+        return 0.0
+    
+    # Return the one with smallest absolute value
+    abs_a = abs(a)
+    abs_b = abs(b)
+    abs_c = abs(c)
+    
+    if abs_a <= abs_b and abs_a <= abs_c:
+        return a
+    elif abs_b <= abs_c:
+        return b
+    else:
+        return c
+
+
+@jit(nopython=True, cache=True, fastmath=True)
+def mc_scalar(a, b):
+    """
+    MC (Monotonized Central) limiter for two slopes.
+    
+    MC(a, b) = minmod(2a, 2b, (a+b)/2)
+    
+    Less diffusive than minmod, more robust than others.
+    Args:
+        a: backward slope
+        b: forward slope
+    """
+    return minmod3_scalar(2.0 * a, 2.0 * b, 0.5 * (a + b))
+
+
+@jit(nopython=True, cache=True, fastmath=True, parallel=True)
+def mc_reconstruct_3vars(rho, vr, p, dx,
+                         rho_L, rho_R, vr_L, vr_R, p_L, p_R):
+    """
+    OPTIMIZED: Reconstruct 3 primitive variables (rho, vr, p) with MC limiter in ONE pass.
+
+    This avoids 3 separate function calls and improves cache locality.
+    All 6 output arrays are modified in-place.
+    """
+    N = rho.shape[0]
+
+    # Parallel loop - process all 3 variables per cell
+    for i in prange(1, N-1):
+        # Load values for rho
+        rho_im1 = rho[i-1]; rho_i = rho[i]; rho_ip1 = rho[i+1]
+        # Load values for vr
+        vr_im1 = vr[i-1]; vr_i = vr[i]; vr_ip1 = vr[i+1]
+        # Load values for p
+        p_im1 = p[i-1]; p_i = p[i]; p_ip1 = p[i+1]
+
+        # Compute slopes for rho
+        slope_L_rho = (rho_i - rho_im1) / dx
+        slope_R_rho = (rho_ip1 - rho_i) / dx
+        slope_rho = mc_scalar(slope_L_rho, slope_R_rho)
+
+        # Compute slopes for vr
+        slope_L_vr = (vr_i - vr_im1) / dx
+        slope_R_vr = (vr_ip1 - vr_i) / dx
+        slope_vr = mc_scalar(slope_L_vr, slope_R_vr)
+
+        # Compute slopes for p
+        slope_L_p = (p_i - p_im1) / dx
+        slope_R_p = (p_ip1 - p_i) / dx
+        slope_p = mc_scalar(slope_L_p, slope_R_p)
 
         # Reconstruct interface states for all 3 variables
         rho_R[i] = rho_i - 0.5 * slope_rho * dx
@@ -198,36 +258,6 @@ def mp5_face_kernel(um2, um1, u0, up1, up2):
 
 
 @jit(nopython=True, cache=True, fastmath=True, parallel=True)
-def mp5_reconstruct_vectorized(u, u_L, u_R):
-    """
-    Vectorized MP5 reconstruction using Numba.
-
-    Fifth-order monotonicity-preserving scheme.
-    """
-    N = u.shape[0]
-
-    # Parallel loop over cells where 5-point stencil fits
-    for i in prange(2, N-2):
-        um2 = u[i-2]
-        um1 = u[i-1]
-        u0 = u[i]
-        up1 = u[i+1]
-        up2 = u[i+2]
-
-        uL, uR = mp5_face_kernel(um2, um1, u0, up1, up2)
-
-        u_L[i+1] = uL  # Left state at i+1/2
-        u_R[i] = uR    # Right state at i-1/2
-
-    # Near-boundary cells
-    u_L[1] = u[0]
-    u_L[2] = u[1]
-    u_R[1] = u[0]
-    u_R[N-2] = u[-2]
-    u_R[N-1] = u[-1]
-
-
-@jit(nopython=True, cache=True, fastmath=True, parallel=True)
 def mp5_reconstruct_3vars(rho, vr, p,
                           rho_L, rho_R, vr_L, vr_R, p_L, p_R):
     """
@@ -310,37 +340,6 @@ def weno5_face_kernel(um2, um1, u0, up1, up2):
     p2 = (2.0*u0 + 5.0*up1 - up2) / 6.0
 
     return w0*p0 + w1*p1 + w2*p2
-
-
-@jit(nopython=True, cache=True, fastmath=True, parallel=True)
-def weno5_reconstruct_vectorized(u, u_L, u_R):
-    """
-    Vectorized WENO5 reconstruction using Numba.
-
-    Fifth-order WENO scheme - standard for relativistic hydro.
-    """
-    N = u.shape[0]
-
-    # Parallel loop over cells where 5-point stencil fits
-    for i in prange(2, N-2):
-        um2 = u[i-2]
-        um1 = u[i-1]
-        u0 = u[i]
-        up1 = u[i+1]
-        up2 = u[i+2]
-
-        # Left state at i+1/2
-        u_L[i+1] = weno5_face_kernel(um2, um1, u0, up1, up2)
-
-        # Right state at i-1/2 (reversed stencil)
-        u_R[i] = weno5_face_kernel(up2, up1, u0, um1, um2)
-
-    # Near-boundary cells
-    u_L[1] = u[0]
-    u_L[2] = u[1]
-    u_R[1] = u[0]
-    u_R[N-2] = u[-2]
-    u_R[N-1] = u[-1]
 
 
 @jit(nopython=True, cache=True, fastmath=True, parallel=True)
@@ -434,37 +433,6 @@ def wenoz_face_kernel(um2, um1, u0, up1, up2):
 
 
 @jit(nopython=True, cache=True, fastmath=True, parallel=True)
-def wenoz_reconstruct_vectorized(u, u_L, u_R):
-    """
-    Vectorized WENO-Z reconstruction using Numba.
-
-    Fifth-order WENO-Z scheme - recommended for best results.
-    """
-    N = u.shape[0]
-
-    # Parallel loop over cells where 5-point stencil fits
-    for i in prange(2, N-2):
-        um2 = u[i-2]
-        um1 = u[i-1]
-        u0 = u[i]
-        up1 = u[i+1]
-        up2 = u[i+2]
-
-        # Left state at i+1/2
-        u_L[i+1] = wenoz_face_kernel(um2, um1, u0, up1, up2)
-
-        # Right state at i-1/2 (reversed stencil)
-        u_R[i] = wenoz_face_kernel(up2, up1, u0, um1, um2)
-
-    # Near-boundary cells
-    u_L[1] = u[0]
-    u_L[2] = u[1]
-    u_R[1] = u[0]
-    u_R[N-2] = u[-2]
-    u_R[N-1] = u[-1]
-
-
-@jit(nopython=True, cache=True, fastmath=True, parallel=True)
 def wenoz_reconstruct_3vars(rho, vr, p,
                             rho_L, rho_R, vr_L, vr_R, p_L, p_R):
     """
@@ -521,15 +489,16 @@ class Reconstruction:
 
     Available methods:
         - "minmod": 2nd order TVD (most robust)
+        - "mc":     2nd order TVD (less diffusive than minmod)
         - "mp5":    5th order monotonicity-preserving
         - "weno5":  5th order WENO (standard)
         - "wenoz":  5th order WENO-Z (recommended, best overall)
 
     All methods are fully optimized with Numba JIT compilation.
+    Uses single-pass 3-variable reconstruction for best cache locality.
 
     Usage:
-        >>> recon = Reconstruction(method="wenoz")
-        >>> u_L, u_R = recon.reconstruct(u, dx=dx)
+        >>> recon = Reconstruction(method="mc")
         >>> left, right = recon.reconstruct_primitive_variables(rho, vr, p, dx=dx)
     """
 
@@ -538,67 +507,14 @@ class Reconstruction:
         Initialize reconstruction object.
 
         Args:
-            method: "minmod", "mp5", "weno5", or "wenoz"
+            method: "minmod", "mc", "mp5", "weno5", or "wenoz"
         """
         method = method.lower()
-        if method not in {"minmod", "mp5", "weno5", "wenoz"}:
-            raise ValueError(f"Unknown method: {method}. Use: minmod, mp5, weno5, wenoz")
+        if method not in {"minmod", "mc", "mp5", "weno5", "wenoz"}:
+            raise ValueError(f"Unknown method: {method}. Use: minmod, mc, mp5, weno5, wenoz")
 
         self.method = method
         self.name = f"reconstruction_{method}"
-
-        # Select reconstruction kernel
-        if method == "minmod":
-            self._reconstruct_kernel = minmod_reconstruct_vectorized
-            self._needs_dx = True
-        elif method == "mp5":
-            self._reconstruct_kernel = mp5_reconstruct_vectorized
-            self._needs_dx = False
-        elif method == "weno5":
-            self._reconstruct_kernel = weno5_reconstruct_vectorized
-            self._needs_dx = False
-        else:  # wenoz
-            self._reconstruct_kernel = wenoz_reconstruct_vectorized
-            self._needs_dx = False
-
-    def reconstruct(self, u, dx=None, x=None, boundary_type: str = "outflow"):
-        """
-        Reconstruct left/right states at all interfaces.
-
-        Args:
-            u: 1D array of cell-centered values (length N, includes ghost cells)
-            dx: Scalar grid spacing
-            x: 1D array of coordinates (unused, kept for API compatibility)
-            boundary_type: "outflow", "reflecting", or "periodic"
-
-        Returns:
-            (u_L, u_R): Tuple of arrays
-                - u_L: Left states at interfaces (length N+1)
-                - u_R: Right states at interfaces (length N+1)
-        """
-        u = np.asarray(u, dtype=np.float64)
-        N = u.size
-
-
-        # Allocate output arrays
-        u_L = np.empty(N + 1, dtype=np.float64)
-        u_R = np.empty(N + 1, dtype=np.float64)
-
-        # Apply reconstruction kernel
-        if self._needs_dx:
-            if dx is None:
-                if x is not None:
-                    dx = x[1] - x[0]  # Assume uniform for simplicity
-                else:
-                    dx = 1.0
-            self._reconstruct_kernel(u, u_L, u_R, dx)
-        else:
-            self._reconstruct_kernel(u, u_L, u_R)
-
-        # Boundary conditions
-        self._fill_boundaries(u, u_L, u_R, boundary_type)
-
-        return u_L, u_R
 
     def reconstruct_primitive_variables(self, rho0, vr, pressure, dx=None, x=None, boundary_type="outflow"):
         """
@@ -643,6 +559,15 @@ class Reconstruction:
         elif self.method == "mp5":
             mp5_reconstruct_3vars(rho0, vr_arr, pressure,
                                   rL, rR, vL, vR, pL, pR)
+        elif self.method == "mc":
+            # Get dx for MC
+            if dx is None:
+                if x is not None:
+                    dx = x[1] - x[0]
+                else:
+                    dx = 1.0
+            mc_reconstruct_3vars(rho0, vr_arr, pressure, dx,
+                                 rL, rR, vL, vR, pL, pR)
         else:  # minmod
             # Get dx for minmod
             if dx is None:
@@ -735,7 +660,7 @@ def create_reconstruction(method: str = "wenoz"):
     Automatically selects JAX or Numba backend based on ENGRENAGE_BACKEND env var.
 
     Args:
-        method: "minmod", "mp5", "weno5", or "wenoz" (default: wenoz)
+        method: "minmod", "mc", "mp5", "weno5", or "wenoz" (default: wenoz)
 
     Returns:
         Reconstruction instance (JAX or Numba version)
@@ -743,9 +668,9 @@ def create_reconstruction(method: str = "wenoz"):
     from .tests.advance.backend import BACKEND
 
     if 'jax' in BACKEND:
-        # JAX backend (note: MP5 not available in JAX)
-        if method.lower() == "mp5":
-            print("[reconstruction] WARNING: MP5 not available in JAX, using WENO-Z instead")
+        # JAX backend (note: MP5 and MC not available in JAX)
+        if method.lower() in ["mp5", "mc"]:
+            print(f"[reconstruction] WARNING: {method.upper()} not available in JAX, using WENO-Z instead")
             method = "wenoz"
         from .reconstruction_jax import ReconstructionJAX
         return ReconstructionJAX(method=method)
@@ -757,6 +682,10 @@ def create_reconstruction(method: str = "wenoz"):
 def get_reconstruction_minmod():
     """Get minmod reconstruction."""
     return Reconstruction(method="minmod")
+
+def get_reconstruction_mc():
+    """Get MC reconstruction."""
+    return Reconstruction(method="mc")
 
 def get_reconstruction_mp5():
     """Get MP5 reconstruction."""

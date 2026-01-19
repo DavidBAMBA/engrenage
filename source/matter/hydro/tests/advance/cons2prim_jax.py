@@ -21,7 +21,22 @@ from jax import jit, vmap, lax
 from functools import partial
 import numpy as np
 
-from .atmosphere import FloorApplicator
+# Import atmosphere module - handle both relative and absolute imports
+try:
+    # Try relative import (when used as part of package)
+    from ...atmosphere import FloorApplicator
+except ImportError:
+    try:
+        # Try absolute import (when source is in path)
+        from source.matter.hydro.atmosphere import FloorApplicator
+    except ImportError:
+        # Fallback: Add parent directories to path
+        import sys
+        import os
+        _hydro_path = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..'))
+        if _hydro_path not in sys.path:
+            sys.path.insert(0, _hydro_path)
+        from atmosphere import FloorApplicator
 
 
 # ============================================================================
@@ -194,6 +209,158 @@ def _solve_newton_batch_jax(D, Sr, tau, gamma_rr, alpha, p_guess,
 
 
 # ============================================================================
+# JAX-OPTIMIZED NEWTON-RAPHSON KERNEL FOR POLYTROPIC EOS
+# ============================================================================
+
+@partial(jit, static_argnums=(6, 7, 8, 9, 10, 11))
+def _newton_kernel_polytropic_jax(D, Sr, tau, gamma_rr, alpha, rho_init,
+                                   eos_K, eos_gamma, rho_floor, W_max, tol, max_iter):
+    """
+    JAX Newton-Raphson solver for polytropic EOS (single point).
+
+    For barotropic EOS P = K ρ₀^Γ, solve for ρ₀ such that D = ρ₀ W.
+
+    Returns:
+        tuple: (rho0, vr, p, eps, W, h, converged)
+    """
+    gm1 = eos_gamma - 1.0
+    K = eos_K
+
+    rho_start = jnp.maximum(rho_init, rho_floor)
+    gamma_rr_safe = jnp.maximum(gamma_rr, 1e-30)
+    alpha_safe = jnp.maximum(alpha, 1e-30)
+
+    # State for while loop: (iteration, rho, converged)
+    def cond_fn(state):
+        iteration, rho, converged = state
+        return (iteration < max_iter) & (~converged)
+
+    def body_fn(state):
+        iteration, rho, converged = state
+
+        # Pressure and enthalpy from rho (barotropic: depends only on rho)
+        p = K * rho**eos_gamma
+        h = 1.0 + eos_gamma * K * rho**gm1 / gm1
+
+        # Compute Q = tau + D + p, then velocity
+        Q = tau + D + p
+        vr = alpha_safe * Sr / (Q * gamma_rr_safe)
+        v2 = gamma_rr_safe * vr * vr
+
+        # Clamp v2 for safety
+        v2 = jnp.clip(v2, 0.0, 1.0 - 1e-16)
+        W = 1.0 / jnp.sqrt(1.0 - v2)
+
+        # Check Lorentz factor bounds
+        W_valid = (W <= W_max) & (W >= 1.0)
+
+        # Residual: f = D - rho * W
+        f = D - rho * W
+
+        # Check convergence
+        tol_val = tol * jnp.maximum(1.0, D)
+        is_converged = jnp.abs(f) <= tol_val
+
+        # Numerical derivative df/drho
+        drho = 1e-8 * jnp.maximum(rho, 1e-10)
+        rho2 = rho + drho
+        p2 = K * rho2**eos_gamma
+        Q2 = tau + D + p2
+        vr2 = alpha_safe * Sr / (Q2 * gamma_rr_safe)
+        v2_2 = gamma_rr_safe * vr2 * vr2
+        v2_2 = jnp.clip(v2_2, 0.0, 1.0 - 1e-16)
+        W2 = 1.0 / jnp.sqrt(1.0 - v2_2)
+        f2 = D - rho2 * W2
+
+        df = (f2 - f) / drho
+
+        # Check if derivative is too small
+        small_df = jnp.abs(df) < 1e-15
+
+        # Newton update
+        df_safe = jnp.where(small_df, 1.0, df)
+        rho_newton = rho - f / df_safe
+
+        # Handle invalid Newton update
+        rho_newton = jnp.where(
+            (rho_newton <= 0.0) | ~jnp.isfinite(rho_newton),
+            jnp.maximum(rho_floor, 0.5 * rho),
+            rho_newton
+        )
+
+        # Apply damped Newton step
+        rho_damped = 0.5 * rho + 0.5 * rho_newton
+
+        # Final rho update
+        rho_new = jnp.where(
+            W_valid & ~small_df,
+            rho_damped,
+            jnp.maximum(rho_floor, rho * 0.5)
+        )
+
+        # Update convergence flag
+        new_converged = is_converged & W_valid
+
+        return (iteration + 1, rho_new, new_converged)
+
+    # Run Newton iterations
+    init_state = (0, rho_start, False)
+    final_iter, final_rho, converged = lax.while_loop(cond_fn, body_fn, init_state)
+
+    # Compute final primitives
+    rho = final_rho
+    p = K * rho**eos_gamma
+    h = 1.0 + eos_gamma * K * rho**gm1 / gm1
+    Q = tau + D + p
+    vr = alpha_safe * Sr / (Q * gamma_rr_safe)
+    v2 = gamma_rr_safe * vr * vr
+    v2 = jnp.clip(v2, 0.0, 1.0 - 1e-16)
+    W = 1.0 / jnp.sqrt(1.0 - v2)
+    eps = K * rho**gm1 / gm1
+
+    # Recompute convergence flag with FINAL values
+    f_final = D - rho * W
+    tol_final = tol * jnp.maximum(1.0, D)
+    W_valid = (W <= W_max) & (W >= 1.0)
+    converged_final = (jnp.abs(f_final) <= tol_final) & W_valid
+
+    return rho, vr, p, eps, W, h, converged_final
+
+
+# Vectorized version using vmap
+@partial(jit, static_argnums=(6, 7, 8, 9, 10, 11))
+def _solve_newton_batch_polytropic_jax(D, Sr, tau, gamma_rr, alpha, rho_guess,
+                                        eos_K, eos_gamma, rho_floor, W_max, tol, max_iter):
+    """
+    JAX batch Newton-Raphson solver for polytropic EOS.
+
+    Vectorized over all points using vmap - runs in parallel on GPU.
+
+    Args:
+        D, Sr, tau: Conservative variable arrays (N,)
+        gamma_rr: Metric component array (N,)
+        alpha: Lapse function array (N,)
+        rho_guess: Initial density guess array (N,)
+        eos_K: Polytropic constant (static)
+        eos_gamma: Adiabatic index (static)
+        rho_floor: Density floor (static)
+        W_max: Maximum Lorentz factor (static)
+        tol: Convergence tolerance (static)
+        max_iter: Maximum iterations (static)
+
+    Returns:
+        tuple: (rho0, vr, p, eps, W, h, converged) - all arrays (N,)
+    """
+    newton_vmapped = vmap(
+        lambda d, sr, t, grr, a, rg: _newton_kernel_polytropic_jax(
+            d, sr, t, grr, a, rg, eos_K, eos_gamma, rho_floor, W_max, tol, max_iter
+        )
+    )
+
+    return newton_vmapped(D, Sr, tau, gamma_rr, alpha, rho_guess)
+
+
+# ============================================================================
 # MAIN SOLVER CLASS (JAX VERSION)
 # ============================================================================
 
@@ -232,6 +399,15 @@ class Cons2PrimSolverJAX:
                               hasattr(eos, 'gamma'))
 
         if self._is_ideal_gas:
+            self._eos_gamma = float(eos.gamma)
+
+        # Check if we can use optimized path for polytropic EOS
+        self._is_polytropic = (hasattr(eos, 'name') and
+                               eos.name.startswith('polytropic') and
+                               hasattr(eos, 'K') and hasattr(eos, 'gamma'))
+
+        if self._is_polytropic:
+            self._eos_K = float(eos.K)
             self._eos_gamma = float(eos.gamma)
 
         # Statistics tracking
@@ -328,7 +504,7 @@ class Cons2PrimSolverJAX:
             p_init_jax = jnp.array(p_init)
 
             if self._is_ideal_gas:
-                # JAX-accelerated Newton solver
+                # JAX-accelerated Newton solver for ideal gas
                 result = _solve_newton_batch_jax(
                     D_jax, Sr_jax, tau_jax, gamma_rr_jax, alpha_jax, p_init_jax,
                     self._eos_gamma, self.p_floor, self.W_max, self.tol, self.max_iter
@@ -342,6 +518,28 @@ class Cons2PrimSolverJAX:
                 W_solved = np.asarray(result[4])
                 h_solved = np.asarray(result[5])
                 success_solved = np.asarray(result[6])
+
+            elif self._is_polytropic:
+                # JAX-accelerated Newton solver for polytropic EOS
+                # For polytropic EOS, use rho as the unknown (not pressure)
+                # Initial guess: rho ~ D (since D = rho * W and W ~ 1 for low velocities)
+                rho_init = np.maximum(np.asarray(D[solve_mask]), self.rho_floor)
+                rho_init_jax = jnp.array(rho_init)
+
+                result = _solve_newton_batch_polytropic_jax(
+                    D_jax, Sr_jax, tau_jax, gamma_rr_jax, alpha_jax, rho_init_jax,
+                    self._eos_K, self._eos_gamma, self.rho_floor, self.W_max, self.tol, self.max_iter
+                )
+
+                # Convert back to numpy
+                rho0_solved = np.asarray(result[0])
+                vr_solved = np.asarray(result[1])
+                p_solved = np.asarray(result[2])
+                eps_solved = np.asarray(result[3])
+                W_solved = np.asarray(result[4])
+                h_solved = np.asarray(result[5])
+                success_solved = np.asarray(result[6])
+
             else:
                 # Fall back to CPU solver for general EOS
                 # Import the Numba version for this case
