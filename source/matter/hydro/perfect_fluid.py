@@ -164,38 +164,26 @@ class PerfectFluid:
                    success is a boolean array indicating which points converged
         """
 
-        # Build metric for cons2prim
-        # Use geometry from valencia (eliminate duplication)
+        # Build geometry from BSSN variables (creates self.valencia._geom)
         self.valencia._extract_geometry(r, bssn_vars, self.spacetime_mode, self.background, self.grid)
-        # Map general 3D geometry to 1D radial metric expected by cons2prim
-        alpha = self.valencia.alpha
-        beta_r = self.valencia.beta_U[:, 0]  # Radial shift component
-        # Get spatial components from valencia
-        gamma_rr = self.valencia.gamma_LL[:, 0, 0]
 
-        # Extract densitization factor: √γ = e^{6φ}
-        # State vector contains DENSITIZED conservatives: Ũ = e^{6φ} U
-        # We must de-densitize them to PHYSICAL conservatives for cons2prim
-        phi = np.asarray(bssn_vars.phi, dtype=float)
-        e6phi = np.exp(6.0 * phi)
+        # Get GeometryState from valencia (bundles alpha, beta_r, gamma_rr, e6phi)
+        geom = self.valencia._geom
 
         # De-densitify conservative variables: U = Ũ / e^{6φ}
-        D_phys = self.D / e6phi
-        Sr_phys = self.Sr / e6phi
-        tau_phys = self.tau / e6phi
+        D_phys = self.D / geom.e6phi
+        Sr_phys = self.Sr / geom.e6phi
+        tau_phys = self.tau / geom.e6phi
 
         # Use pressure cache if available
         p_guess = self.pressure_cache
 
         # Call cons2prim solver with PHYSICAL (non-densitized) conservatives
-        # Pass e6phi, alpha, and beta_r so cons2prim returns properly densitized conservatives
+        # GeometryState passed so cons2prim returns properly densitized conservatives
         result = self.cons2prim_solver.convert(
-            D_phys, Sr_phys, tau_phys, gamma_rr,
+            D_phys, Sr_phys, tau_phys, geom,
             p_guess=p_guess,
-            apply_conservative_floors=True,
-            e6phi=e6phi,
-            alpha=alpha,
-            beta_r=beta_r
+            apply_conservative_floors=True
         )
         rho0, vr, p, eps, W, h, success, D_new, Sr_new, tau_new = result
 

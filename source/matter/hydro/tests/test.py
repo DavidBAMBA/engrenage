@@ -45,6 +45,7 @@ from source.matter.hydro.eos import IdealGasEOS
 from source.matter.hydro.reconstruction import create_reconstruction
 from source.matter.hydro.riemann import HLLRiemannSolver
 from source.matter.hydro.cons2prim import Cons2PrimSolver, prim_to_cons
+from source.matter.hydro.geometry import GeometryState
 from source.matter.hydro.atmosphere import AtmosphereParams
 
 
@@ -166,10 +167,9 @@ def create_initial_state(grid, rho0, v, p, eos):
     # Set BSSN variables for Minkowski
     state_2d[:NUM_BSSN_VARS, :] = initialize_minkowski_bssn(N)
 
-    # Convert primitives to conservatives
-    # For Minkowski: gamma_rr = 1, e6phi = 1, alpha = 1
-    gamma_rr = np.ones(N)
-    D, Sr, tau = prim_to_cons(rho0, v, p, gamma_rr, eos)
+    # Convert primitives to conservatives (Minkowski spacetime)
+    geom = GeometryState.minkowski(N)
+    D, Sr, tau = prim_to_cons(rho0, v, p, geom, eos)
 
     # Set hydro variables (indices from PerfectFluid)
     idx_D = NUM_BSSN_VARS
@@ -379,15 +379,15 @@ def test_cons2prim_roundtrip():
     v = np.random.uniform(-0.8, 0.8, N)
     p = np.random.uniform(0.01, 1.0, N)
 
-    # For Minkowski: gamma_rr = 1
-    gamma_rr = np.ones(N)
+    # Minkowski spacetime
+    geom = GeometryState.minkowski(N)
 
     # Prim -> Cons
-    D, Sr, tau = prim_to_cons(rho0, v, p, gamma_rr, eos)
+    D, Sr, tau = prim_to_cons(rho0, v, p, geom, eos)
 
     # Cons -> Prim
     solver = Cons2PrimSolver(eos, atmosphere=atmosphere)
-    result = solver.convert(D, Sr, tau, gamma_rr, p_guess=p)
+    result = solver.convert(D, Sr, tau, geom, p_guess=p)
     rho0_rec, v_rec, p_rec = result[0], result[1], result[2]
 
     e_rho = np.max(np.abs(rho0_rec - rho0))
@@ -852,6 +852,9 @@ def test_blast_wave(case='weak'):
 # ============================================================================
 
 if __name__ == "__main__":
+    import time
+    start_time = time.perf_counter()
+
     np.set_printoptions(precision=3, suppress=True)
     print("="*60)
     print("SUITE - Valencia Reference-Metric (engrenage infrastructure)")
@@ -867,6 +870,8 @@ if __name__ == "__main__":
     results.append(("Blast weak", test_blast_wave(case="weak")))
     results.append(("Blast strong", test_blast_wave(case="strong")))
 
+    elapsed_time = time.perf_counter() - start_time
+
     print("\n" + "="*60)
     print("SUMMARY")
     print("="*60)
@@ -875,3 +880,4 @@ if __name__ == "__main__":
         print(f"{name:14s}: {'PASS' if ok else 'FAIL'}")
     print("-"*40)
     print(f"Total: {passed}/{len(results)}")
+    print(f"Time: {elapsed_time:.2f}s")

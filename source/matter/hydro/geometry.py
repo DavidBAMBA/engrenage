@@ -2,9 +2,82 @@
 """Geometry utilities for GRHD calculations.
 """
 
+from dataclasses import dataclass
+from typing import Optional
 import numpy as np
 
 SPACEDIM = 3
+
+
+# =============================================================================
+# GeometryState - Container for spacetime geometry
+# =============================================================================
+
+@dataclass
+class GeometryState:
+    """
+    Container for spacetime geometry at grid points.
+
+    Supports both 1D (radial) and 3D representations.
+    All arrays have shape (N,) for scalars or (N,3) / (N,3,3) for tensors.
+
+    Required fields (always present):
+        alpha: Lapse function α
+        beta_r: Radial shift component β^r
+        gamma_rr: Radial metric component γ_rr
+        e6phi: Conformal factor e^{6φ}
+
+    Optional fields (for 3D):
+        beta_U: Full shift vector β^i (N,3)
+        gamma_LL: Full covariant metric γ_ij (N,3,3)
+        gamma_UU: Full contravariant metric γ^ij (N,3,3)
+    """
+    # Required: 1D components (always present)
+    alpha: np.ndarray
+    beta_r: np.ndarray
+    gamma_rr: np.ndarray
+    e6phi: np.ndarray
+
+    # Optional: 3D tensors
+    beta_U: Optional[np.ndarray] = None
+    gamma_LL: Optional[np.ndarray] = None
+    gamma_UU: Optional[np.ndarray] = None
+
+    @classmethod
+    def minkowski(cls, N: int) -> 'GeometryState':
+        """Factory for flat Minkowski spacetime."""
+        return cls(
+            alpha=np.ones(N),
+            beta_r=np.zeros(N),
+            gamma_rr=np.ones(N),
+            e6phi=np.ones(N)
+        )
+
+    @classmethod
+    def from_bssn_1d(cls, alpha: np.ndarray, beta_r: np.ndarray,
+                     phi: np.ndarray, gamma_rr: np.ndarray) -> 'GeometryState':
+        """Factory from 1D BSSN variables."""
+        return cls(
+            alpha=alpha,
+            beta_r=beta_r,
+            gamma_rr=gamma_rr,
+            e6phi=np.exp(6.0 * phi)
+        )
+
+    def __len__(self) -> int:
+        return len(self.alpha)
+
+    def at_indices(self, indices: np.ndarray) -> 'GeometryState':
+        """Extract geometry at specific indices (e.g., cell faces for Riemann)."""
+        return GeometryState(
+            alpha=self.alpha[indices],
+            beta_r=self.beta_r[indices],
+            gamma_rr=self.gamma_rr[indices],
+            e6phi=self.e6phi[indices],
+            beta_U=self.beta_U[indices] if self.beta_U is not None else None,
+            gamma_LL=self.gamma_LL[indices] if self.gamma_LL is not None else None,
+            gamma_UU=self.gamma_UU[indices] if self.gamma_UU is not None else None,
+        )
 
 
 # =============================================================================

@@ -13,6 +13,7 @@ from source.core.spacing import NUM_GHOSTS
 from source.matter.hydro.cons2prim import prim_to_cons
 from source.matter.hydro.atmosphere import AtmosphereParams
 from source.matter.hydro.geometry import (
+    GeometryState,
     compute_4velocity,
     compute_g4DD,
     compute_g4UU
@@ -48,6 +49,9 @@ class ValenciaReferenceMetric:
         self.sqrt_g_hat_face = None    # √ĝ at cell faces
         self.dx = None                 # Mesh spacing (computational coordinate)
 
+        # GeometryState container (bundles 1D components for passing to other modules)
+        self._geom = None
+
     def _extract_geometry(self, r, bssn_vars, spacetime_mode, background, grid):
         """
         Extract geometric quantities from BSSN variables and store as class attributes.
@@ -60,53 +64,43 @@ class ValenciaReferenceMetric:
 
         Stores all geometric quantities as class attributes, including mesh spacing.
         """
-        N = len(r)
-
         # Mesh spacing in computational coordinate (uniform)
         self.dx = float(grid.derivs.dx)
 
-        if spacetime_mode == "fixed_minkowski":
-            #print("WARNING [valencia._extract_geometry]: spacetime_mode='fixed_minkowski', using alpha=1 (Minkowski)")
-            self.alpha = np.ones(N)
+        # Lapse alpha
+        self.alpha = np.asarray(bssn_vars.lapse, dtype=float)
 
-            # All three shift components are zero
-            self.beta_U = np.zeros((N, SPACEDIM))
+        # Shift β^i (all three components)
+        self.beta_U = np.asarray(bssn_vars.shift_U, dtype=float) * background.inverse_scaling_vector
 
-            # Identity metric in 3D (broadcast eye matrix to all points)
-            self.gamma_LL = np.broadcast_to(np.eye(SPACEDIM), (N, SPACEDIM, SPACEDIM)).copy()
+        # Conformal factor e^{φ}
+        phi_arr = np.asarray(bssn_vars.phi, dtype=float)
+        e6phi = np.exp(6.0 * phi_arr)
+        e4phi = np.exp(4.0 * phi_arr)
 
-            # Inverse metric (also identity)
-            self.gamma_UU = self.gamma_LL.copy()
+        # Physical metric γ_ij = e^{4φ} γ̄_ij (full 3x3 tensor)
+        bar_gamma_LL = get_bar_gamma_LL(r, bssn_vars.h_LL, background)
+        self.gamma_LL = e4phi[:, None, None] * bar_gamma_LL
 
-            # Determinant and square root
-            self.sqrt_g_hat_cell = background.det_hat_gamma ** 0.5
-            self.sqrt_g_hat_face = 0.5 * (self.sqrt_g_hat_cell[:-1] + self.sqrt_g_hat_cell[1:])
+        # Inverse physical metric γ^{ij}
+        self.gamma_UU = np.linalg.inv(self.gamma_LL)
 
-        else:
-            # Lapse alpha
-            self.alpha = np.asarray(bssn_vars.lapse, dtype=float)
+        self.e6phi = e6phi
 
-            # Shift β^i (all three components)
-            self.beta_U = np.asarray(bssn_vars.shift_U, dtype=float) * background.inverse_scaling_vector
+        # √ĝ for reference metric
+        self.sqrt_g_hat_cell = np.sqrt(np.abs(background.det_hat_gamma) + 1e-30)
+        self.sqrt_g_hat_face = 0.5 * (self.sqrt_g_hat_cell[:-1] + self.sqrt_g_hat_cell[1:])
 
-
-            # Conformal factor e^{φ}
-            phi_arr = np.asarray(bssn_vars.phi, dtype=float)
-            e6phi = np.exp(6.0 * phi_arr)
-            e4phi = np.exp(4.0 * phi_arr)
-
-            # Physical metric γ_ij = e^{4φ} γ̄_ij (full 3x3 tensor)
-            bar_gamma_LL = get_bar_gamma_LL(r, bssn_vars.h_LL, background)
-            self.gamma_LL = e4phi[:, None, None] * bar_gamma_LL
-
-            # Inverse physical metric γ^{ij}
-            self.gamma_UU = np.linalg.inv(self.gamma_LL)
-
-            self.e6phi = e6phi 
-
-            # √ĝ for reference metric
-            self.sqrt_g_hat_cell = np.sqrt(np.abs(background.det_hat_gamma) + 1e-30)
-            self.sqrt_g_hat_face = 0.5 * (self.sqrt_g_hat_cell[:-1] + self.sqrt_g_hat_cell[1:])
+        # Create GeometryState container with 1D components (for cons2prim, riemann, etc.)
+        self._geom = GeometryState(
+            alpha=self.alpha,
+            beta_r=self.beta_U[:, 0],      # Radial component of shift
+            gamma_rr=self.gamma_LL[:, 0, 0],  # Radial component of metric
+            e6phi=self.e6phi,
+            beta_U=self.beta_U,
+            gamma_LL=self.gamma_LL,
+            gamma_UU=self.gamma_UU
+        )
 
     def _compute_T4UU(self, rho0, v_U, pressure, W, h):
         """
@@ -206,15 +200,15 @@ class ValenciaReferenceMetric:
         # Geometric quantities from class attributes
         alpha = self.alpha
         beta_U = self.beta_U  # (N, SPACEDIM) - all three components
-        
-        # Compute e^{6φ} 
+
+        # Compute e^{6φ}
         phi = np.asarray(bssn_vars.phi, dtype=float)
         e6phi = np.exp(6.0 * phi)
 
         e4phi = np.exp(4.0 * phi)
         bar_gamma_LL = get_bar_gamma_LL(r, bssn_vars.h_LL, background)
         gamma_LL = e4phi[:, None, None] * bar_gamma_LL
-        
+
         # Compute stress-energy tensors T^{μν} and T^μ_ν with all three velocity components
         TUU_00, TUU_0i, TUU_ij = self._compute_T4UU(rho0, v_U, pressure, W, h)
         _, TUD_0j, _ = self._compute_T4UD(TUU_00, TUU_0i, TUU_ij)
@@ -247,10 +241,10 @@ class ValenciaReferenceMetric:
             np.einsum('x,xi,xi->x', TUU_00, beta_U, dalpha_dx)
             + np.einsum('xi,xi->x', TUU_0i, dalpha_dx)
         )
-        
+
         # Combine with volume element ( line 358)
         src_tau = alpha * e6phi * (term1_tau + term2_tau)
-        
+
         # ====================================================================
         # MOMENTUM SOURCE TERM
         # ====================================================================
@@ -347,8 +341,8 @@ class ValenciaReferenceMetric:
         Fluxes are densitized by e^{6φ}. vtilde^j = v^i - β^i/alpha.
 
         Flux definitions:
-            F̃D^j    =  e^{6φ} ( rho0 * W * vtilde^j )    
-            F̃_S^j_i =  e^{6φ} ( alpha * T^j_i)                
+            F̃D^j    =  e^{6φ} ( rho0 * W * vtilde^j )
+            F̃_S^j_i =  e^{6φ} ( alpha * T^j_i)
             F̃τ^j    =  e^{6φ} ( alpha^2 * T^{0j} - alpha * rho0 * W * vtilde^j )
 
         Returns:
@@ -383,7 +377,7 @@ class ValenciaReferenceMetric:
         fD_U = (e6phi * alpha * D)[:, None] * VUtilde_i
 
         # Energy (tau) partial flux vector: F̃^j_τ = e^6φ ( alpha² T^{0j} - alpha * rho_0 W v^j )
-        fTau_U = (alpha ** 2 * e6phi)[:, None] * TUU_0i -  (alpha * e6phi)[:, None] * D[:, None] * VUtilde_i 
+        fTau_U = (alpha ** 2 * e6phi)[:, None] * TUU_0i -  (alpha * e6phi)[:, None] * D[:, None] * VUtilde_i
 
         # Momentum partial flux tensor: F̃^j_i = alpha e^6φ T^j_i
         fS_UD = (alpha * e6phi)[:, None, None] * TUD_ij
@@ -418,7 +412,7 @@ class ValenciaReferenceMetric:
             conn_S: (N, 3) connection contribution to S_i equation
             conn_tau: (N,) connection contribution to tau equation
         """
-        # Compute partial flux vectors (densitized) 
+        # Compute partial flux vectors (densitized)
         fD_U, fTau_U, fS_D = self._get_fluxes(rho0, v_U, pressure, W, h, bssn_vars)
 
         # Reference metric Christoffel symbols Γ̂^i_{jk}
@@ -436,10 +430,8 @@ class ValenciaReferenceMetric:
         # S_i equation: -Γ̂^k_{kj} F̃^j_i + Γ̂^l_{ji} F̃^j_l
         # First term: contract trace with momentum flux
         # Second term: full Christoffel contraction with momentum flux
-        conn_S = (
-            -np.einsum('xl,xli->xi', Gamma_trace, fS_D)
-            + np.einsum('xlji,xjl->xi', hat_chris, fS_D)
-        )
+        conn_S = (-np.einsum('xl,xli->xi', Gamma_trace, fS_D)
+                  + np.einsum('xlji,xjl->xi', hat_chris, fS_D))
 
         return conn_D, conn_S, conn_tau
 
@@ -454,9 +446,9 @@ class ValenciaReferenceMetric:
         S: (N,) or (N, 3) - densitized momentum (1D or 3D format)
         tau: (N,) - densitized energy
         v_U: (N,) or (N, 3) - spatial velocity (1D or 3D format)
-        W: (N,) or None - Lorentz factor 
-        h: (N,) or None - specific enthalpy 
-    
+        W: (N,) or None - Lorentz factor
+        h: (N,) or None - specific enthalpy
+
         Returns:
         rhs_D: (N,) - time derivative of D
         rhs_S: (N, 3) - time derivative of momentum vector
@@ -493,13 +485,13 @@ class ValenciaReferenceMetric:
         # Compute Fluxes at interfaces
         F_D_face, F_S_face, F_tau_face = self._compute_interface_fluxes(rho0, v_U, pressure, r, eos, reconstructor, riemann_solver, bssn_vars)
 
-        # FLUX DERIVATIVE 
+        # FLUX DERIVATIVE
         div_D, div_S, div_tau = self._compute_flux_derivative(F_D_face, F_S_face, F_tau_face)
 
         # CONNECTION TERMS FLUX derivative
         conn_D, conn_S, conn_tau = self._compute_connection_terms(rho0, v_U, pressure, W, h, bssn_vars, background)
 
-        # SOURCE TERMS 
+        # SOURCE TERMS
         src_S, src_tau = self._compute_source_terms(rho0, v_U, pressure, W, h, bssn_vars, bssn_d1,background, spacetime_mode, r)
 
         # ====================================================================
@@ -576,13 +568,13 @@ class ValenciaReferenceMetric:
         pR = np.maximum(pR, self.atmosphere.p_floor)
         # ============================================================
 
-        # Extract interior faces 
+        # Extract interior faces
         rhoL, vL, pL = rhoL[1:-1], vL[1:-1], pL[1:-1]
         rhoR, vR, pR = rhoR[1:-1], vR[1:-1], pR[1:-1]
 
         # Interpolate geometry to faces from class attributes
         alpha_f = 0.5 * (self.alpha[:-1] + self.alpha[1:])
-        # Exact e^{6phi} at faces from BSSN phi 
+        # Exact e^{6phi} at faces from BSSN phi
         phi_arr = np.asarray(bssn_vars.phi, dtype=float)
         phi_face = 0.5 * (phi_arr[:-1] + phi_arr[1:])
         e6phi_f = np.exp(6.0 * phi_face)
@@ -590,11 +582,19 @@ class ValenciaReferenceMetric:
         # Interpolate shift and metric to faces
         beta_U_f = 0.5 * (self.beta_U[:-1] + self.beta_U[1:])  # (N-1, 3)
         gamma_LL_f = 0.5 * (self.gamma_LL[:-1] + self.gamma_LL[1:])  # (N-1, 3, 3)
-        
+
         # For 1D Riemann solver, extract first spatial components
-        beta_r_f = beta_U_f[:, 0]  # β^r 
+        beta_r_f = beta_U_f[:, 0]  # β^r
         gamma_r_r_f = gamma_LL_f[:, 0, 0]  # γ_rr
-        
+
+        # Create GeometryState for cell faces (used by prim_to_cons and riemann solver)
+        geom_f = GeometryState(
+            alpha=alpha_f,
+            beta_r=beta_r_f,
+            gamma_rr=gamma_r_r_f,
+            e6phi=e6phi_f
+        )
+
         # Apply physical limiters if available
         if hasattr(reconstructor, "apply_physical_limiters"):
             (rhoL, vL, pL), (rhoR, vR, pR) = reconstructor.apply_physical_limiters(
@@ -605,23 +605,19 @@ class ValenciaReferenceMetric:
 
         # Convert primitives to conservatives at interfaces
         # prim_to_cons computes: D, S_r, τ where S_r is momentum
-        UL_D, UL_S_r, UL_tau = prim_to_cons(
-            rhoL, vL, pL, gamma_r_r_f, eos, alpha=alpha_f, beta_r=beta_r_f
-        )
-        UR_D, UR_S_r, UR_tau = prim_to_cons(
-            rhoR, vR, pR, gamma_r_r_f, eos, alpha=alpha_f, beta_r=beta_r_f
-        )
-        
+        UL_D, UL_S_r, UL_tau = prim_to_cons(rhoL, vL, pL, geom_f, eos)
+        UR_D, UR_S_r, UR_tau = prim_to_cons(rhoR, vR, pR, geom_f, eos)
+
         # Package for Riemann solver
         UL_batch = np.stack([UL_D, UL_S_r, UL_tau], axis=1)
         UR_batch = np.stack([UR_D, UR_S_r, UR_tau], axis=1)
         primL_batch = np.stack([rhoL, vL, pL], axis=1)
         primR_batch = np.stack([rhoR, vR, pR], axis=1)
-        
+
         # Solve Riemann problem to get physical fluxes
         # Returns: [F_D, F_S_r, F_tau] in r spatial direction
-        F_phys_batch = riemann_solver.solve_batch(UL_batch, UR_batch, primL_batch, primR_batch,gamma_r_r_f, alpha_f, beta_r_f, eos, e6phi_f)
-        
+        F_phys_batch = riemann_solver.solve_batch(UL_batch, UR_batch, primL_batch, primR_batch, geom_f, eos)
+
 
         F_batch = F_phys_batch
 

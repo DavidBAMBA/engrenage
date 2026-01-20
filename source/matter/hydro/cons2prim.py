@@ -3,6 +3,7 @@
 import numpy as np
 from numba import jit, prange
 from .atmosphere import FloorApplicator
+from .geometry import GeometryState
 
 
 # ============================================================================
@@ -25,19 +26,12 @@ def _newton_kernel_ideal_gas(D, Sr, tau, gamma_rr, alpha, p_init,
 
     p = max(p_init, p_floor)
     gamma_rr_safe = max(gamma_rr, 1e-30)
-    alpha_safe = max(alpha, 1e-30)
 
     for iteration in range(max_iter):
         # Evaluate pressure residual
         Q = tau + D + p
-        vr = alpha_safe * Sr / (Q * gamma_rr_safe)
+        vr =  Sr / (Q * gamma_rr_safe)
         v2 = gamma_rr_safe * vr * vr
-
-        # Clamp v2 for safety
-        if v2 >= 1.0:
-            v2 = 1.0 - 1e-16
-        if v2 < 0.0:
-            v2 = 0.0
 
         W = 1.0 / (1.0 - v2) ** 0.5
 
@@ -88,7 +82,7 @@ def _newton_kernel_ideal_gas(D, Sr, tau, gamma_rr, alpha, p_init,
 
     # Did not converge - return best guess with converged=False
     Q = tau + D + p
-    vr = alpha_safe * Sr / (Q * gamma_rr_safe)
+    vr = Sr / (Q * gamma_rr_safe)
     v2 = gamma_rr_safe * vr * vr
     if v2 >= 1.0:
         v2 = 1.0 - 1e-16
@@ -150,7 +144,6 @@ def _newton_kernel_polytropic(D, Sr, tau, gamma_rr, alpha, rho_init,
 
     rho = max(rho_init, rho_floor)
     gamma_rr_safe = max(gamma_rr, 1e-30)
-    alpha_safe = max(alpha, 1e-30)
 
     for iteration in range(max_iter):
         # Pressure and enthalpy from rho (barotropic: depends only on rho)
@@ -159,7 +152,7 @@ def _newton_kernel_polytropic(D, Sr, tau, gamma_rr, alpha, rho_init,
 
         # Compute Q = tau + D + p, then velocity
         Q = tau + D + p
-        vr = alpha_safe * Sr / (Q * gamma_rr_safe)
+        vr =  Sr / (Q * gamma_rr_safe)
         v2 = gamma_rr_safe * vr * vr
 
         # Clamp v2 for safety
@@ -189,7 +182,7 @@ def _newton_kernel_polytropic(D, Sr, tau, gamma_rr, alpha, rho_init,
         rho2 = rho + drho
         p2 = K * rho2**eos_gamma
         Q2 = tau + D + p2
-        vr2 = alpha_safe * Sr / (Q2 * gamma_rr_safe)
+        vr2 = Sr / (Q2 * gamma_rr_safe)
         v2_2 = gamma_rr_safe * vr2 * vr2
         if v2_2 >= 1.0:
             v2_2 = 1.0 - 1e-16
@@ -216,7 +209,7 @@ def _newton_kernel_polytropic(D, Sr, tau, gamma_rr, alpha, rho_init,
     p = K * rho**eos_gamma
     h = 1.0 + eos_gamma * K * rho**gm1 / gm1
     Q = tau + D + p
-    vr = alpha_safe * Sr / (Q * gamma_rr_safe)
+    vr = Sr / (Q * gamma_rr_safe)
     v2 = gamma_rr_safe * vr * vr
     if v2 >= 1.0:
         v2 = 1.0 - 1e-16
@@ -322,45 +315,38 @@ class Cons2PrimSolver:
  # =====================================================================
         self._solver_method = "newton"  
 
-    def convert(self, D, Sr, tau, gamma_rr, p_guess=None, apply_conservative_floors=True,
-                e6phi=None, alpha=None, beta_r=None):
+    def convert(self, D, Sr, tau, geom: GeometryState, p_guess=None, apply_conservative_floors=True):
         """
         Convert conservative to primitive variables using vectorized Newton-Raphson.
 
         IMPORTANT: Expects PHYSICAL (non-densitized) conservative variables:
             D  = ρ₀ W
-            Sʳ = ρ₀ h W² vʳ γᵣᵣ / alpha
+            Sʳ = ρ₀ h W² vʳ γᵣᵣ
             τ  = ρ₀ h - P - D
+
+        Args:
+            D, Sr, tau: Conservative variables
+            geom: GeometryState containing gamma_rr, e6phi, alpha, beta_r
+            p_guess: Initial pressure guess (optional)
+            apply_conservative_floors: Whether to apply conservative floors
 
         Returns:
             tuple: (rho0, vr, p, eps, W, h, success, D_out, Sr_out, tau_out)
                    Primitive variables, success mask, and updated conservatives.
-                   If e6phi not provided, D_out/Sr_out/tau_out are physical (non-densitized).
-                   If e6phi provided, they are densitized.
         """
         self.stats["total_calls"] += 1
+
+        # Extract geometry components
+        gamma_rr = np.atleast_1d(np.asarray(geom.gamma_rr, dtype=float))
+        e6phi = np.atleast_1d(np.asarray(geom.e6phi, dtype=float))
+        alpha = np.atleast_1d(np.asarray(geom.alpha, dtype=float))
+        beta_r = np.atleast_1d(np.asarray(geom.beta_r, dtype=float))
 
         # Ensure arrays
         D = np.atleast_1d(np.asarray(D, dtype=float))
         Sr = np.atleast_1d(np.asarray(Sr, dtype=float))
         tau = np.atleast_1d(np.asarray(tau, dtype=float))
-        gamma_rr = np.atleast_1d(np.asarray(gamma_rr, dtype=float))
         N = len(D)
-
-        # Prepare densitization factors (default to 1.0 for non-densitized output)
-        if e6phi is None:
-            e6phi = np.ones(N)
-        else:
-            e6phi = np.atleast_1d(np.asarray(e6phi, dtype=float))
-        if alpha is None:
-            #print("WARNING [cons2prim.convert]: alpha=None, using default alpha=1 (Minkowski)")
-            alpha = np.ones(N)
-        else:
-            alpha = np.atleast_1d(np.asarray(alpha, dtype=float))
-        if beta_r is None:
-            beta_r = np.zeros(N)
-        else:
-            beta_r = np.atleast_1d(np.asarray(beta_r, dtype=float))
 
         # Output conservative arrays (will be updated for atmosphere points)
         D_out = D.copy()
@@ -453,12 +439,15 @@ class Cons2PrimSolver:
         atm_points = rho0 <= 10.0 * self.rho_floor
         if np.any(atm_points):
             # Recompute conservatives from atmosphere primitives using prim_to_cons
+            geom_atm = GeometryState(
+                alpha=alpha[atm_points],
+                beta_r=beta_r[atm_points],
+                gamma_rr=gamma_rr[atm_points],
+                e6phi=e6phi[atm_points]
+            )
             D_atm, Sr_atm, tau_atm = prim_to_cons(
                 rho0[atm_points], vr[atm_points], p[atm_points],
-                gamma_rr[atm_points], self.eos,
-                e6phi=e6phi[atm_points],
-                alpha=alpha[atm_points],
-                beta_r=beta_r[atm_points]
+                geom_atm, self.eos
             )
             D_out[atm_points] = D_atm
             Sr_out[atm_points] = Sr_atm
@@ -493,10 +482,6 @@ class Cons2PrimSolver:
             p_init = np.maximum(p_guess, self.p_floor)
         else:
             p_init = np.maximum(self.p_floor, 0.1 * (tau + D))
-
-        # Ensure alpha is an array
-        if alpha is None:
-            alpha = np.ones(N)
 
         # =====================================================================
         # FAST PATH: Use Numba kernel for ideal gas (most common case)
@@ -640,25 +625,18 @@ class Cons2PrimSolver:
         Returns:
             tuple: (valid, (rho0, vr, eps, W, h, f))
         """
-        N = len(D)
         p = np.maximum(p, self.p_floor)
 
-        # Lapse (default = 1.0 for Minkowski or if not provided)
-        if alpha is None:
-            #print("WARNING [cons2prim._evaluate_pressure_vectorized]: alpha=None, using default alpha=1 (Minkowski)")
-            alpha = np.ones(N)
-        else:
-            alpha = np.atleast_1d(np.asarray(alpha, dtype=float))
+        alpha = np.atleast_1d(np.asarray(alpha, dtype=float))
         
         # Pre-compute all intermediate values (vectorized)
         Q = tau + D + p
         gamma_rr_safe = np.maximum(gamma_rr, 1e-30)
-        alpha_safe = np.maximum(alpha, 1e-30)
         
         # Compute velocity for all points
-        # vr = alpha * Sr / (Q * γrr)
-        # From: Sr = ρ h W² vr γrr / alpha
-        vr = alpha_safe * Sr / (Q * gamma_rr_safe)
+        # vr =  Sr / (Q * γrr)
+        # From: Sr = ρ h W² vr γrr => vr = Sr / (Q γrr)
+        vr = Sr / (Q * gamma_rr_safe)
         v2 = gamma_rr_safe * vr * vr
         
         # Compute Lorentz factor (safe sqrt)
@@ -721,50 +699,40 @@ class Cons2PrimSolver:
 # PRIMITIVE TO CONSERVATIVE CONVERSION
 # ============================================================================
 
-def prim_to_cons(rho0, vr, pressure, gamma_rr, eos, e6phi=None, alpha=None, beta_r=None):
+def prim_to_cons(rho0, vr, pressure, geom: GeometryState, eos):
     """
     Convert primitive to conservative variables.
 
     Following Valencia formulation:
-        Non-densitized (e6phi=None):
-            D  = W ρ₀
-            Sr = W² ρ₀ h vr γrr / alpha
-            τ  = W² ρ₀ h - P - D
+        D̃  = e^{6φ} W ρ₀
+        S̃r = e^{6φ} W² ρ₀ h vr γrr
+        τ̃  = e^{6φ} (W² ρ₀ h - P - W ρ₀)
 
-        Densitized (e6phi provided):
-            D̃  = e^{6φ} W ρ₀
-            S̃r = e^{6φ} W² ρ₀ h vr γrr
-            τ̃  = e^{6φ} (alpha² T^{00} - W ρ₀)
+    Args:
+        rho0: Rest mass density
+        vr: Radial velocity v^r
+        pressure: Pressure
+        geom: GeometryState containing alpha, beta_r, gamma_rr, e6phi
+        eos: Equation of state
 
     Returns:
-        tuple: (D, Sr, tau) conservative variables (densitized if e6phi provided)
+        tuple: (D, Sr, tau) conservative variables (densitized)
     """
+    # Extract geometry components
+    gamma_rr = geom.gamma_rr
+    e6phi = geom.e6phi
+
     # Convert inputs to arrays for unified handling
     rho0 = np.asarray(rho0)
     vr = np.asarray(vr)
     pressure = np.asarray(pressure)
     gamma_rr = np.asarray(gamma_rr)
+    e6phi = np.asarray(e6phi)
 
     # Broadcast to same shape
-    rho0, vr, pressure, gamma_rr = np.broadcast_arrays(rho0, vr, pressure, gamma_rr)
-
-    # Densitization factor (default = 1.0 for non-densitized)
-    if e6phi is None:
-        e6phi = np.ones_like(rho0)
-    else:
-        e6phi = np.broadcast_to(np.asarray(e6phi), rho0.shape)
-
-    # Lapse (default = 1.0)
-    if alpha is None:
-        #print("WARNING [prim_to_cons]: alpha=None, using default alpha=1 (Minkowski)")
-        alpha = np.ones_like(rho0)
-    else:
-        alpha = np.broadcast_to(np.asarray(alpha), rho0.shape)
-    
-    if beta_r is None:
-        beta_r = np.zeros_like(rho0)
-    else:
-        beta_r = np.broadcast_to(np.asarray(beta_r), rho0.shape)
+    rho0, vr, pressure, gamma_rr, e6phi = np.broadcast_arrays(
+        rho0, vr, pressure, gamma_rr, e6phi
+    )
 
     # Compute derived quantities
     v2 = gamma_rr * vr * vr

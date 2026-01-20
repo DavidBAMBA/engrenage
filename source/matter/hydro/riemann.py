@@ -9,7 +9,12 @@ Fully optimized with Numba JIT compilation for CPU performance.
 import numpy as np
 from numba import jit
 from .valencia_reference_metric import ValenciaReferenceMetric
-from .geometry import compute_4velocity_1d, compute_g4UU_1d, compute_lorentz_factor_1d
+from .geometry import (
+    GeometryState,
+    compute_4velocity_1d,
+    compute_g4UU_1d,
+    compute_lorentz_factor_1d
+)
 
 
 # ==============================================================================
@@ -309,7 +314,7 @@ class HLLRiemannSolver:
         self.atmosphere = atmosphere
 
     def solve_batch(self, UL_batch, UR_batch, primL_batch, primR_batch,
-                    gamma_rr_batch, alpha_batch, beta_r_batch, eos, e6phi_batch):
+                    geom: GeometryState, eos):
         """
         Fully optimized solver for multiple interfaces using JIT kernels.
 
@@ -322,15 +327,17 @@ class HLLRiemannSolver:
         """
         M = len(UL_batch)
 
+        # Extract geometry components
+        gamma_rr_batch = np.ascontiguousarray(geom.gamma_rr, dtype=np.float64)
+        alpha_batch = np.ascontiguousarray(geom.alpha, dtype=np.float64)
+        beta_r_batch = np.ascontiguousarray(geom.beta_r, dtype=np.float64)
+        e6phi_batch = np.ascontiguousarray(geom.e6phi, dtype=np.float64)
+
         # Convert inputs to contiguous float64 arrays for Numba
         UL_batch = np.ascontiguousarray(UL_batch, dtype=np.float64)
         UR_batch = np.ascontiguousarray(UR_batch, dtype=np.float64)
         primL_batch = np.ascontiguousarray(primL_batch, dtype=np.float64)
         primR_batch = np.ascontiguousarray(primR_batch, dtype=np.float64)
-        gamma_rr_batch = np.ascontiguousarray(gamma_rr_batch, dtype=np.float64)
-        alpha_batch = np.ascontiguousarray(alpha_batch, dtype=np.float64)
-        beta_r_batch = np.ascontiguousarray(beta_r_batch, dtype=np.float64)
-        e6phi_batch = np.ascontiguousarray(e6phi_batch, dtype=np.float64)
 
         # Unpack conservatives
         DL = UL_batch[:, 0]
@@ -516,7 +523,7 @@ class LLFRiemannSolver:
         self.atmosphere = atmosphere
 
     def solve_batch(self, UL_batch, UR_batch, primL_batch, primR_batch,
-                    gamma_rr_batch, alpha_batch, beta_r_batch, eos, e6phi_batch):
+                    geom: GeometryState, eos):
         """
         Compute LLF fluxes for multiple interfaces using JIT kernels.
 
@@ -526,15 +533,17 @@ class LLFRiemannSolver:
         """
         M = len(UL_batch)
 
+        # Extract geometry components
+        gamma_rr_batch = np.ascontiguousarray(geom.gamma_rr, dtype=np.float64)
+        alpha_batch = np.ascontiguousarray(geom.alpha, dtype=np.float64)
+        beta_r_batch = np.ascontiguousarray(geom.beta_r, dtype=np.float64)
+        e6phi_batch = np.ascontiguousarray(geom.e6phi, dtype=np.float64)
+
         # Convert inputs to contiguous float64 arrays for Numba
         UL_batch = np.ascontiguousarray(UL_batch, dtype=np.float64)
         UR_batch = np.ascontiguousarray(UR_batch, dtype=np.float64)
         primL_batch = np.ascontiguousarray(primL_batch, dtype=np.float64)
         primR_batch = np.ascontiguousarray(primR_batch, dtype=np.float64)
-        gamma_rr_batch = np.ascontiguousarray(gamma_rr_batch, dtype=np.float64)
-        alpha_batch = np.ascontiguousarray(alpha_batch, dtype=np.float64)
-        beta_r_batch = np.ascontiguousarray(beta_r_batch, dtype=np.float64)
-        e6phi_batch = np.ascontiguousarray(e6phi_batch, dtype=np.float64)
 
         # Unpack conservatives
         DL = UL_batch[:, 0]

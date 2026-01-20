@@ -269,14 +269,14 @@ def main():
     # CONFIGURATION
     # ==================================================================
     r_max = 16.0
-    num_points = 400
+    num_points = 100
     K = 100.0
     Gamma = 2.0
     rho_central = 1.28e-3
-    t_final = 10000 # Final evolution time
+    t_final = 10000
 
-    # Reconstructor: "wenoz" (wz), "weno5" (w5), "mp5" (mp5), "minmod" (md)
-    RECONSTRUCTOR_NAME = "mc"
+    # Reconstructor: "wenoz" (wz), "weno5" (w5), "mp5" (mp5), "minmod" (md), "mc" (mc)
+    RECONSTRUCTOR_NAME = "wenoz"
 
     # ==================================================================
     # EVOLUTION MODE SELECTION
