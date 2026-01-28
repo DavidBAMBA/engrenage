@@ -165,8 +165,29 @@ class SimulationDataManager:
                 f.create_dataset(key, shape=(0,), maxshape=(None,),
                                dtype=np.float64, chunks=True)
 
-    def save_metadata(self, tov_solution, atmosphere_params, dt, integration_method, K=None, Gamma=None, rho_central=None):
-        """Save simulation metadata."""
+    def save_metadata(self, tov_solution, atmosphere_params, dt, integration_method,
+                      K=None, Gamma=None, rho_central=None, r_max=None, num_points=None,
+                      t_final=None, reconstructor=None, solver_method=None,
+                      riemann_solver=None, evolution_mode=None, cfl_factor=None):
+        """Save simulation metadata.
+
+        Args:
+            tov_solution: TOV solution object or dict
+            atmosphere_params: AtmosphereParams object
+            dt: Timestep
+            integration_method: Integration method name
+            K: Polytropic constant
+            Gamma: Adiabatic index
+            rho_central: Central density
+            r_max: Maximum radius of domain
+            num_points: Number of grid points
+            t_final: Final simulation time
+            reconstructor: Reconstruction method name (e.g., "mp5", "wenoz")
+            solver_method: Cons2prim solver method (e.g., "newton", "kastaun")
+            riemann_solver: Riemann solver name (e.g., "hll", "llf")
+            evolution_mode: Evolution mode (e.g., "cowling", "dynamic")
+            cfl_factor: CFL number used for timestep
+        """
         if not self.enable_saving:
             return
 
@@ -207,6 +228,18 @@ class SimulationDataManager:
                 'integration_method': integration_method,
                 'grid_N': int(self.grid.N),
                 'grid_r_max': float(self.grid.r[-1])
+            },
+            'numerical_methods': {
+                'reconstructor': reconstructor,
+                'solver_method': solver_method,
+                'riemann_solver': riemann_solver,
+                'evolution_mode': evolution_mode,
+                'cfl_factor': float(cfl_factor) if cfl_factor is not None else None
+            },
+            'configuration': {
+                'r_max': float(r_max) if r_max is not None else float(self.grid.r[-1]),
+                'num_points': int(num_points) if num_points is not None else int(self.grid.N),
+                't_final': float(t_final) if t_final is not None else None
             },
             'timestamp': datetime.now().isoformat()
         }

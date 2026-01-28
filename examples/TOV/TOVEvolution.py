@@ -430,7 +430,14 @@ def main():
 
         # Save metadata now that we have dt
         if ENABLE_DATA_SAVING:
-            data_manager.save_metadata(tov_solution, ATMOSPHERE, dt, integration_method, K=K, Gamma=Gamma, rho_central=rho_central)
+            data_manager.save_metadata(
+                tov_solution, ATMOSPHERE, dt, integration_method,
+                K=K, Gamma=Gamma, rho_central=rho_central,
+                r_max=r_max, num_points=num_points, t_final=t_final,
+                reconstructor=RECONSTRUCTOR_NAME, solver_method=SOLVER_METHOD,
+                riemann_solver=RIEMANN_SOLVER, evolution_mode=EVOLUTION_MODE,
+                cfl_factor=cfl_factor
+            )
 
         # Single step for comparison
         state_t1 = selected_rk4_step(initial_state_2d.flatten(), dt, grid, background, hydro,
