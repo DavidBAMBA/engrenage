@@ -13,30 +13,14 @@ Usage:
 """
 
 import jax
-# Enable float64 precision (JAX defaults to float32)
-jax.config.update("jax_enable_x64", True)
-
 import jax.numpy as jnp
 from jax import jit, vmap, lax
 from functools import partial
 import numpy as np
 
-# Import atmosphere module - handle both relative and absolute imports
-try:
-    # Try relative import (when used as part of package)
-    from ...atmosphere import FloorApplicator
-except ImportError:
-    try:
-        # Try absolute import (when source is in path)
-        from source.matter.hydro.atmosphere import FloorApplicator
-    except ImportError:
-        # Fallback: Add parent directories to path
-        import sys
-        import os
-        _hydro_path = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..'))
-        if _hydro_path not in sys.path:
-            sys.path.insert(0, _hydro_path)
-        from atmosphere import FloorApplicator
+from source.matter.hydro.atmosphere import FloorApplicator
+from source.matter.hydro.geometry import GeometryState
+from source.matter.hydro.cons2prim import prim_to_cons
 
 
 # ============================================================================
@@ -419,38 +403,34 @@ class Cons2PrimSolverJAX:
             "conservative_floors_applied": 0
         }
 
-    def convert(self, D, Sr, tau, gamma_rr, p_guess=None, apply_conservative_floors=True,
-                e6phi=None, alpha=None, beta_r=None):
+    def convert(self, D, Sr, tau, geom, p_guess=None, apply_conservative_floors=True):
         """
         Convert conservative to primitive variables using JAX-accelerated Newton-Raphson.
 
         API-compatible with Cons2PrimSolver.convert().
+
+        Args:
+            D, Sr, tau: Conservative variables (physical, non-densitized)
+            geom: GeometryState containing gamma_rr, e6phi, alpha, beta_r
+            p_guess: Initial pressure guess (optional)
+            apply_conservative_floors: Whether to apply conservative floors
 
         Returns:
             tuple: (rho0, vr, p, eps, W, h, success, D_out, Sr_out, tau_out)
         """
         self.stats["total_calls"] += 1
 
-        # Convert to numpy for preprocessing (JAX arrays don't support in-place ops)
+        # Extract geometry components
+        gamma_rr = np.atleast_1d(np.asarray(geom.gamma_rr, dtype=np.float64))
+        e6phi = np.atleast_1d(np.asarray(geom.e6phi, dtype=np.float64))
+        alpha = np.atleast_1d(np.asarray(geom.alpha, dtype=np.float64))
+        beta_r = np.atleast_1d(np.asarray(geom.beta_r, dtype=np.float64))
+
+        # Convert to numpy for preprocessing
         D = np.atleast_1d(np.asarray(D, dtype=np.float64))
         Sr = np.atleast_1d(np.asarray(Sr, dtype=np.float64))
         tau = np.atleast_1d(np.asarray(tau, dtype=np.float64))
-        gamma_rr = np.atleast_1d(np.asarray(gamma_rr, dtype=np.float64))
         N = len(D)
-
-        # Prepare densitization factors
-        if e6phi is None:
-            e6phi = np.ones(N)
-        else:
-            e6phi = np.atleast_1d(np.asarray(e6phi, dtype=np.float64))
-        if alpha is None:
-            alpha = np.ones(N)
-        else:
-            alpha = np.atleast_1d(np.asarray(alpha, dtype=np.float64))
-        if beta_r is None:
-            beta_r = np.zeros(N)
-        else:
-            beta_r = np.atleast_1d(np.asarray(beta_r, dtype=np.float64))
 
         # Output conservative arrays
         D_out = D.copy()
@@ -587,15 +567,17 @@ class Cons2PrimSolverJAX:
             h[low_p_mask] = 1.0 + eps[low_p_mask] + self.p_floor / rho_lp
 
         # Update conservatives for atmosphere points
-        atm_points = rho0 <= 10.0 * self.rho_floor
+        atm_points = rho0 <= 100.0 * self.rho_floor
         if np.any(atm_points):
-            from .cons2prim import prim_to_cons
+            geom_atm = GeometryState(
+                alpha=alpha[atm_points],
+                beta_r=beta_r[atm_points],
+                gamma_rr=gamma_rr[atm_points],
+                e6phi=e6phi[atm_points]
+            )
             D_atm, Sr_atm, tau_atm = prim_to_cons(
                 rho0[atm_points], vr[atm_points], p[atm_points],
-                gamma_rr[atm_points], self.eos,
-                e6phi=e6phi[atm_points],
-                alpha=alpha[atm_points],
-                beta_r=beta_r[atm_points]
+                geom_atm, self.eos
             )
             D_out[atm_points] = D_atm
             Sr_out[atm_points] = Sr_atm

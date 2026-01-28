@@ -11,9 +11,9 @@ from .eos import IdealGasEOS
 from .atmosphere import AtmosphereParams
 
 # Backend-aware import for Cons2PrimSolver
-from .tests.advance.backend import BACKEND
-if 'jax' in BACKEND:
-    from .cons2prim_jax import Cons2PrimSolverJAX as Cons2PrimSolver
+from source.backend import is_jax_backend
+if is_jax_backend():
+    from .jax.cons2prim_jax import Cons2PrimSolverJAX as Cons2PrimSolver
 else:
     from .cons2prim import Cons2PrimSolver
 
@@ -28,7 +28,8 @@ class PerfectFluid:
     """
 
     def __init__(self, eos=None, spacetime_mode="dynamic",
-                 atmosphere=None, reconstructor=None, riemann_solver=None):
+                 atmosphere=None, reconstructor=None, riemann_solver=None,
+                 solver_method="newton"):
         """
         Initialize relativistic perfect fluid matter.
 
@@ -38,6 +39,7 @@ class PerfectFluid:
             atmosphere: AtmosphereParams object (required for evolution)
             reconstructor: Reconstruction method (optional)
             riemann_solver: Riemann solver (optional)
+            solver_method: "newton" or "kastaun" (default: "newton")
         """
 
         # engrenage BaseMatter interface requirements
@@ -63,8 +65,9 @@ class PerfectFluid:
         self.cons2prim_solver = Cons2PrimSolver(
             self.eos,
             atmosphere=self.atmosphere,
-            tol=1e-12,
-            max_iter=200
+            tol=1e-18,
+            max_iter=200,
+            solver_method=solver_method
         )
 
         # Numerical methods for Valencia evolution

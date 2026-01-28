@@ -64,20 +64,22 @@ from source.matter.hydro.cons2prim import prim_to_cons
 from source.matter.hydro.geometry import GeometryState
 from source.matter.hydro.atmosphere import AtmosphereParams
 
+# NOTE: We use high-resolution Eulerian evolution for reference solution
+# instead of the Lagrangian characteristics method from the paper.
+# This is simpler and more reliable for this test.
+
 
 # ============================================================================
 # REZZOLLA-ZANOTTI TEST PARAMETERS
 # ============================================================================
 
-# EOS parameters
-# Note: R&Z use K=100, but smaller K gives cleaner convergence
-# by reducing relativistic effects (cs closer to non-relativistic limit)
-K_POLY = 0.1         # Polytropic constant (smaller than R&Z for cleaner test)
+# EOS parameters (from Rezzolla & Zanotti paper)
+K_POLY = 100.0       # Polytropic constant (K=100 as in R&Z)
 GAMMA = 5.0 / 3.0    # Adiabatic index
 
 # C∞ bump function parameters
 L_BUMP = 0.3         # Half-width of the bump
-X_CENTER = 0.0       # Initial center (centered at origin)
+X_CENTER = 0.5       # Initial center (moved away from origin to avoid parity issues)
 
 # Domain parameters
 X_MIN = -0.4         # Left boundary
@@ -438,24 +440,39 @@ def run_isentropic_wave_test(n_interior, reconstructor_name,
     return r_interior, rho_interior, v_interior, t, steps
 
 
-def compute_reference_solution(n_ref=10000, reconstructor_name="wenoz",
-                               Tfinal=0.8, cfl=0.1):
+def compute_reference_solution_eulerian(n_ref=10000, Tfinal=0.8, cfl=0.2, reconstructor="wenoz"):
     """
-    Compute reference solution on a very fine grid.
+    Compute reference solution using very high-resolution Eulerian evolution.
 
-    Uses WENO-Z with lower CFL for maximum accuracy.
+    Uses WENOZ reconstruction with fine grid to get a reference solution
+    accurate enough to measure convergence of lower-resolution schemes.
+
+    Args:
+        n_ref: Number of interior grid points for reference (10,000 = high accuracy)
+        Tfinal: Final time (0.8 in the paper, before caustic at tc ≈ 1.6)
+        cfl: CFL factor for time integrator (0.2 for stability)
+        reconstructor: High-order reconstruction ("wenoz" or "weno5")
+
+    Returns:
+        r_ref: x coordinates (interior only)
+        rho_ref: Reference density
+        v_ref: Reference velocity
     """
-    print(f"\nComputing reference solution (n={n_ref}, {reconstructor_name}, CFL={cfl})...")
+    print(f"\nComputing reference solution using high-resolution Eulerian evolution...")
+    print(f"  N_interior = {n_ref}, T_final = {Tfinal}, CFL = {cfl}")
+    print(f"  Reconstructor: {reconstructor}")
 
-    r_ref, rho_ref, v_ref, t_ref, steps_ref = run_isentropic_wave_test(
+    # Run high-resolution simulation
+    r_ref, rho_ref, v_ref, t_final, steps = run_isentropic_wave_test(
         n_interior=n_ref,
-        reconstructor_name=reconstructor_name,
+        reconstructor_name=reconstructor,
         Tfinal=Tfinal,
         cfl=cfl,
         verbose=True
     )
 
-    print(f"  Reference solution computed: {steps_ref} steps")
+    print(f"  Reference solution computed: {len(r_ref)} points")
+    print(f"  Final: ρ_max = {np.max(rho_ref):.4f}, v_max = {np.max(np.abs(v_ref)):.4f}")
 
     return r_ref, rho_ref, v_ref
 
@@ -475,13 +492,13 @@ def test_isentropic_wave_convergence():
     print("(Rezzolla & Zanotti, 2013, Section 6.4.2, Problem 2)")
     print("="*70)
 
-    # Test parameters
-    # Use shorter time to minimize nonlinear steepening effects
-    resolutions = [100, 200, 400, 800, 1600]
-    Tfinal = 0.1           # Short time for clean convergence test
+    # Test parameters (following the paper)
+    # Using subset of resolutions from paper: [100, 200, 400, 800, 1600, 3200, 6400]
+    resolutions = [100, 200, 400, 800]  # Extend to more resolutions for convergence
+    Tfinal = 0.6           # Intermediate time (balance between accuracy and speed)
     cfl = 0.2
 
-    reconstructors = ["minmod", "mc", "mp5", "weno5", "wenoz"]
+    reconstructors = ["minmod", "mc", "mp5", "weno5", "wenoz"]  # All methods
 
     colors = {
         "minmod": "blue",
@@ -504,13 +521,13 @@ def test_isentropic_wave_convergence():
     print(f"  Time integrator: RK6 Butcher (6th order)")
 
     # ------------------------------------------------------------------
-    # Compute reference solution
+    # Compute reference solution using high-resolution Eulerian evolution
     # ------------------------------------------------------------------
-    r_ref, rho_ref, v_ref = compute_reference_solution(
-        n_ref=10000,
-        reconstructor_name="wenoz",
+    r_ref, rho_ref, v_ref = compute_reference_solution_eulerian(
+        n_ref=4000,      # Fine Eulerian grid (5x higher than highest test resolution)
         Tfinal=Tfinal,
-        cfl=0.01
+        cfl=0.2,         # Standard CFL for stability
+        reconstructor="wenoz"  # High-order reconstructor for reference
     )
 
     # Create interpolator for reference

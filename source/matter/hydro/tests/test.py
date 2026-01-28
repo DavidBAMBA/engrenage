@@ -16,8 +16,6 @@ and only hydro variables evolve.
 import os
 import sys
 import numpy as np
-import matplotlib
-matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 # Add source path
@@ -43,7 +41,7 @@ from source.bssn.bssnstatevariables import (
 from source.matter.hydro.perfect_fluid import PerfectFluid
 from source.matter.hydro.eos import IdealGasEOS
 from source.matter.hydro.reconstruction import create_reconstruction
-from source.matter.hydro.riemann import HLLRiemannSolver
+from source.matter.hydro.riemann import HLLRiemannSolver, LLFRiemannSolver, HLLCRiemannSolver
 from source.matter.hydro.cons2prim import Cons2PrimSolver, prim_to_cons
 from source.matter.hydro.geometry import GeometryState
 from source.matter.hydro.atmosphere import AtmosphereParams
@@ -55,7 +53,9 @@ from source.matter.hydro.atmosphere import AtmosphereParams
 
 def create_hydro_and_grid(n_interior=512, r_max=1.0, gamma=1.4,
                           reconstructor_name="minmod",
-                          spacetime_mode="fixed_minkowski"):
+                          spacetime_mode="fixed_minkowski",
+                          solver_method="newton",
+                          riemann_solver_name="hll"):
     """
     Create PerfectFluid, StateVector, and Grid following engrenage patterns.
 
@@ -67,6 +67,8 @@ def create_hydro_and_grid(n_interior=512, r_max=1.0, gamma=1.4,
         gamma: Adiabatic index for EOS
         reconstructor_name: "minmod", "mp5", "wenoz", etc.
         spacetime_mode: "fixed_minkowski" or "dynamic"
+        solver_method: "newton" or "kastaun" for cons2prim
+        riemann_solver_name: "hll", "llf", or "hllc" for Riemann solver
 
     Returns:
         grid: Grid object with all methods (fill_boundaries, derivatives, etc.)
@@ -92,7 +94,17 @@ def create_hydro_and_grid(n_interior=512, r_max=1.0, gamma=1.4,
 
     # Create reconstructor and Riemann solver
     reconstructor = create_reconstruction(reconstructor_name)
-    riemann_solver = HLLRiemannSolver(atmosphere=atmosphere)
+
+    # Select Riemann solver
+    riemann_solver_name = riemann_solver_name.lower()
+    if riemann_solver_name == "hll":
+        riemann_solver = HLLRiemannSolver(atmosphere=atmosphere)
+    elif riemann_solver_name == "llf":
+        riemann_solver = LLFRiemannSolver(atmosphere=atmosphere)
+    elif riemann_solver_name == "hllc":
+        riemann_solver = HLLCRiemannSolver(atmosphere=atmosphere)
+    else:
+        raise ValueError(f"Unknown Riemann solver: {riemann_solver_name}. Use 'hll', 'llf', or 'hllc'")
 
     # Create PerfectFluid (hydro object)
     hydro = PerfectFluid(
@@ -100,7 +112,8 @@ def create_hydro_and_grid(n_interior=512, r_max=1.0, gamma=1.4,
         spacetime_mode=spacetime_mode,
         atmosphere=atmosphere,
         reconstructor=reconstructor,
-        riemann_solver=riemann_solver
+        riemann_solver=riemann_solver,
+        solver_method=solver_method
     )
 
     # Create StateVector and Grid (following TOVEvolution.py pattern)
@@ -296,17 +309,19 @@ def volume_integrals(D, tau, r, dr):
 # TESTS
 # ============================================================================
 
-def test_uniform_state():
+def test_uniform_state(solver_method="newton", riemann_solver_name="hllc"):
     """Test uniform state remains uniform (should stay constant in Minkowski)."""
     print("\n" + "="*60)
-    print("TEST 1: Uniform state (Minkowski, engrenage infrastructure)")
+    print(f"TEST 1: Uniform state (Minkowski, solver={solver_method}, riemann={riemann_solver_name})")
     print("="*60)
 
     # Create grid and hydro using proper engrenage setup
     grid, hydro, background, eos = create_hydro_and_grid(
         n_interior=300, r_max=1.0, gamma=1.4,
         reconstructor_name="minmod",
-        spacetime_mode="fixed_minkowski"
+        spacetime_mode="fixed_minkowski",
+        solver_method=solver_method,
+        riemann_solver_name=riemann_solver_name
     )
 
     # Uniform initial conditions
@@ -356,10 +371,10 @@ def test_uniform_state():
     return ok
 
 
-def test_cons2prim_roundtrip():
+def test_cons2prim_roundtrip(solver_method="newton"):
     """Test conservative <-> primitive conversion roundtrip."""
     print("\n" + "="*60)
-    print("TEST 2: Conservative <-> Primitive roundtrip")
+    print(f"TEST 2: Conservative <-> Primitive roundtrip (solver={solver_method})")
     print("="*60)
 
     N = 128 + 2 * NUM_GHOSTS
@@ -367,17 +382,17 @@ def test_cons2prim_roundtrip():
 
     # Atmosphere for cons2prim
     atmosphere = AtmosphereParams(
-        rho_floor=1e-13,
-        p_floor=1e-15,
-        v_max=0.999999,
-        W_max=1e3
+        rho_floor=1e-16,
+        p_floor=1e-16,
+        v_max=0.999,
+        W_max=1e2
     )
 
     # Random initial primitives
     np.random.seed(42)
-    rho0 = np.random.uniform(0.01, 2.0, N)
-    v = np.random.uniform(-0.8, 0.8, N)
-    p = np.random.uniform(0.01, 1.0, N)
+    rho0 = np.random.uniform(1e-12, 1e3, N)
+    v = np.random.uniform(-0.5, 0.5, N)
+    p = np.random.uniform(1e-12, 1e6, N)
 
     # Minkowski spacetime
     geom = GeometryState.minkowski(N)
@@ -386,32 +401,36 @@ def test_cons2prim_roundtrip():
     D, Sr, tau = prim_to_cons(rho0, v, p, geom, eos)
 
     # Cons -> Prim
-    solver = Cons2PrimSolver(eos, atmosphere=atmosphere)
+    solver = Cons2PrimSolver(eos, atmosphere=atmosphere, tol=1e-13, max_iter=200,
+                              solver_method=solver_method)
     result = solver.convert(D, Sr, tau, geom, p_guess=p)
     rho0_rec, v_rec, p_rec = result[0], result[1], result[2]
 
-    e_rho = np.max(np.abs(rho0_rec - rho0))
-    e_v = np.max(np.abs(v_rec - v))
-    e_p = np.max(np.abs(p_rec - p))
+    # Use relative errors (appropriate for multi-scale data)
+    e_rho_rel = np.max(np.abs(rho0_rec - rho0) / rho0)
+    e_v_rel = np.max(np.abs(v_rec - v) / np.maximum(np.abs(v), 1e-15))
+    e_p_rel = np.max(np.abs(p_rec - p) / p)
 
-    print(f"max|Delta rho|={e_rho:.2e}, max|Delta v|={e_v:.2e}, max|Delta p|={e_p:.2e}")
+    print(f"max|Delta rho/rho|={e_rho_rel:.2e}, max|Delta v/v|={e_v_rel:.2e}, max|Delta p/p|={e_p_rel:.2e}")
 
-    ok = (e_rho < 1e-9) and (e_v < 1e-9) and (e_p < 1e-9)
+    ok = (e_rho_rel < 1e-9) and (e_v_rel < 1e-9) and (e_p_rel < 1e-9)
     print("PASS" if ok else "FAIL")
     return ok
 
 
-def test_conservation_short():
+def test_conservation_short(solver_method="newton", riemann_solver_name="hllc"):
     """Test global mass and energy conservation."""
     print("\n" + "="*60)
-    print("TEST 3: Global conservation (mass/energy)")
+    print(f"TEST 3: Global conservation (mass/energy, solver={solver_method}, riemann={riemann_solver_name})")
     print("="*60)
 
     # Create grid and hydro
     grid, hydro, background, eos = create_hydro_and_grid(
         n_interior=300, r_max=1.0, gamma=4.0/3.0,
         reconstructor_name="minmod",
-        spacetime_mode="fixed_minkowski"
+        spacetime_mode="fixed_minkowski",
+        solver_method=solver_method,
+        riemann_solver_name=riemann_solver_name
     )
 
     # Gaussian density perturbation
@@ -460,7 +479,8 @@ def test_conservation_short():
     return ok
 
 
-def run_sod_simulation(n_interior, reconstructor_name, Tfinal=0.35, gamma=1.4, r_max=1.0):
+def run_sod_simulation(n_interior, reconstructor_name, Tfinal=0.35, gamma=1.4, r_max=1.0,
+                       solver_method="kastaun", riemann_solver_name="hllc"):
     """
     Run a single Sod shock tube simulation with given parameters.
 
@@ -475,7 +495,9 @@ def run_sod_simulation(n_interior, reconstructor_name, Tfinal=0.35, gamma=1.4, r
     grid, hydro, background, eos = create_hydro_and_grid(
         n_interior=n_interior, r_max=r_max, gamma=gamma,
         reconstructor_name=reconstructor_name,
-        spacetime_mode="fixed_minkowski"
+        spacetime_mode="fixed_minkowski",
+        solver_method=solver_method,
+        riemann_solver_name=riemann_solver_name
     )
 
     r = grid.r
@@ -484,7 +506,7 @@ def run_sod_simulation(n_interior, reconstructor_name, Tfinal=0.35, gamma=1.4, r
     # Sod initial conditions
     r_mid = 0.5 * (r[ng] + r[-ng-1])
     rho0 = np.where(r < r_mid, 10.0, 1.0).astype(float)
-    p = np.where(r < r_mid, 40.0/3.0, 1.0e-6).astype(float)
+    p = np.where(r < r_mid, 40000.0/3.0, 1.0e-6).astype(float)
     v = np.zeros(grid.N)
 
     # Create initial state
@@ -511,10 +533,10 @@ def run_sod_simulation(n_interior, reconstructor_name, Tfinal=0.35, gamma=1.4, r
     return r[ng:-ng], rho0[ng:-ng], p[ng:-ng], v[ng:-ng], t, steps
 
 
-def test_riemann_sod():
+def test_riemann_sod(solver_method="newton", riemann_solver_name="hllc"):
     """Sod shock tube test comparing all reconstructors with convergence analysis."""
     print("\n" + "="*60)
-    print("TEST 4: Sod shock tube - Reconstructor comparison & Convergence")
+    print(f"TEST 4: Sod shock tube - Reconstructor comparison (solver={solver_method}, riemann={riemann_solver_name})")
     print("="*60)
 
     # Test parameters
@@ -540,13 +562,15 @@ def test_riemann_sod():
     # ------------------------------------------------------------------
     # Step 1: Run high-resolution reference simulation with MP5
     # ------------------------------------------------------------------
-    print(f"\nRunning high-resolution reference (n={n_interior_ref}, MP5)...")
+    print(f"\nRunning high-resolution reference (n={n_interior_ref}, MP5, {riemann_solver_name})...")
     r_ref, rho_ref, p_ref, v_ref, t_ref, steps_ref = run_sod_simulation(
         n_interior=n_interior_ref,
         reconstructor_name="mp5",
         Tfinal=Tfinal,
         gamma=gamma,
-        r_max=r_max
+        r_max=r_max,
+        solver_method=solver_method,
+        riemann_solver_name=riemann_solver_name
     )
     print(f"  Reference: t={t_ref:.4f}, steps={steps_ref}")
 
@@ -565,7 +589,9 @@ def test_riemann_sod():
                 reconstructor_name=recon_name,
                 Tfinal=Tfinal,
                 gamma=gamma,
-                r_max=r_max
+                r_max=r_max,
+                solver_method=solver_method,
+                riemann_solver_name=riemann_solver_name
             )
             print(f"  n={n_interior}: t={t_test:.4f}, steps={steps_test}")
 
@@ -649,7 +675,9 @@ def test_riemann_sod():
     grid_init, _, _, _ = create_hydro_and_grid(
         n_interior=n_interior_plot, r_max=r_max, gamma=gamma,
         reconstructor_name="minmod",
-        spacetime_mode="fixed_minkowski"
+        spacetime_mode="fixed_minkowski",
+        solver_method=solver_method,
+        riemann_solver_name=riemann_solver_name
     )
     r_init = grid_init.r
     ng = NUM_GHOSTS
@@ -719,17 +747,19 @@ def test_riemann_sod():
     return all_ok
 
 
-def test_blast_wave(case='weak'):
+def test_blast_wave(case='weak', solver_method="newton", riemann_solver_name="hllc"):
     """Blast wave test with MP5 reconstruction."""
     print("\n" + "="*60)
-    print(f"TEST 5: Blast wave ({case}, Minkowski, engrenage infrastructure)")
+    print(f"TEST 5: Blast wave ({case}, solver={solver_method}, riemann={riemann_solver_name})")
     print("="*60)
 
     # Create grid and hydro with MP5
     grid, hydro, background, eos = create_hydro_and_grid(
         n_interior=1000, r_max=1.0, gamma=1.4,
         reconstructor_name="mp5",
-        spacetime_mode="fixed_minkowski"
+        spacetime_mode="fixed_minkowski",
+        solver_method=solver_method,
+        riemann_solver_name=riemann_solver_name
     )
 
     r = grid.r
@@ -847,12 +877,533 @@ def test_blast_wave(case='weak'):
     return ok
 
 
+def run_blast_simulation(n_interior, reconstructor_name, case='strong', Tfinal=0.4, gamma=1.4, r_max=1.0,
+                         solver_method="kastaun", riemann_solver_name="hllc"):
+    """
+    Run a single blast wave simulation with given parameters.
+
+    Returns:
+        r_interior: radial coordinates (interior only)
+        rho_final: final density (interior only)
+        p_final: final pressure (interior only)
+        v_final: final velocity (interior only)
+        t_final: final simulation time
+        steps: number of timesteps taken
+    """
+    grid, hydro, background, eos = create_hydro_and_grid(
+        n_interior=n_interior, r_max=r_max, gamma=gamma,
+        reconstructor_name=reconstructor_name,
+        spacetime_mode="fixed_minkowski",
+        solver_method=solver_method,
+        riemann_solver_name=riemann_solver_name
+    )
+
+    r = grid.r
+    ng = NUM_GHOSTS
+
+    # Blast parameters
+    r_mid = 0.5 * (r[ng] + r[-ng-1])
+    if case.lower() == 'weak':
+        p_in, p_out = 1.0, 0.1
+        rho_in, rho_out = 1.0, 0.125
+    elif case.lower() == 'strong':
+        p_in, p_out = 133.33, 0.125
+        rho_in, rho_out = 10.0, 1.0
+    else:
+        raise ValueError("case must be 'weak' or 'strong'")
+
+    rho0 = np.where(r < r_mid, rho_in, rho_out).astype(float)
+    p = np.where(r < r_mid, p_in, p_out).astype(float)
+    v = np.zeros(grid.N)
+
+    # Create initial state
+    state_2d = create_initial_state(grid, rho0, v, p, eos)
+
+    # Fixed BSSN
+    bssn_fixed = state_2d[:NUM_BSSN_VARS, :].copy()
+    bssn_d1_fixed = grid.get_d1_metric_quantities(state_2d)
+
+    # Time evolution
+    t, steps = 0.0, 0
+    while t < Tfinal and steps < 10000:
+        dt = compute_dt(rho0, v, p, eos, grid, cfl=0.3)
+        state_2d = rk3_step(state_2d, dt, grid, background, hydro, bssn_fixed, bssn_d1_fixed)
+
+        # Update primitives
+        bssn_vars = BSSNVars(grid.N)
+        bssn_vars.set_bssn_vars(bssn_fixed)
+        rho0, v, p = extract_primitives(state_2d, grid, hydro, bssn_vars)
+
+        t += dt
+        steps += 1
+
+    return r[ng:-ng], rho0[ng:-ng], p[ng:-ng], v[ng:-ng], t, steps
+
+
+def test_riemann_solver_comparison(solver_method="kastaun"):
+    """
+    TEST 7: Compare LLF, HLL, and HLLC Riemann solvers on strong blast wave.
+
+    Runs the strong blast wave test with all three Riemann solvers at
+    resolution n=100 and plots the profiles for comparison.
+    """
+    print("\n" + "="*60)
+    print(f"TEST 7: Riemann solver comparison (strong blast, n=100, solver={solver_method})")
+    print("="*60)
+
+    # Test parameters
+    n_interior = 100
+    case = 'strong'
+    Tfinal = 0.4
+    gamma = 1.4
+    r_max = 1.0
+    reconstructor_name = "minmod"
+
+    # Riemann solvers to compare
+    riemann_solvers = ["llf", "hll", "hllc"]
+
+    # Colors and styles for plotting
+    styles = {
+        "llf": {"color": "blue", "linestyle": "-", "label": "LLF (Local Lax-Friedrichs)"},
+        "hll": {"color": "green", "linestyle": "--", "label": "HLL (Harten-Lax-van Leer)"},
+        "hllc": {"color": "red", "linestyle": "-.", "label": "HLLC (HLL-Contact)"}
+    }
+
+    # High-resolution reference with HLLC
+    n_ref = 1000
+    print(f"\nRunning high-resolution reference (n={n_ref}, HLLC, MP5)...")
+    r_ref, rho_ref, p_ref, v_ref, t_ref, steps_ref = run_blast_simulation(
+        n_interior=n_ref,
+        reconstructor_name=reconstructor_name,
+        case=case,
+        Tfinal=Tfinal,
+        gamma=gamma,
+        r_max=r_max,
+        solver_method=solver_method,
+        riemann_solver_name="hllc"
+    )
+    print(f"  Reference: t={t_ref:.4f}, steps={steps_ref}")
+
+    # Store results for each solver
+    results = {}
+
+    print(f"\nRunning simulations (n={n_interior}, MP5)...")
+    for riemann_name in riemann_solvers:
+        print(f"  {riemann_name.upper()}...", end=" ", flush=True)
+        r_test, rho_test, p_test, v_test, t_test, steps_test = run_blast_simulation(
+            n_interior=n_interior,
+            reconstructor_name=reconstructor_name,
+            case=case,
+            Tfinal=Tfinal,
+            gamma=gamma,
+            r_max=r_max,
+            solver_method=solver_method,
+            riemann_solver_name=riemann_name
+        )
+        print(f"t={t_test:.4f}, steps={steps_test}")
+
+        results[riemann_name] = {
+            "r": r_test,
+            "rho": rho_test,
+            "p": p_test,
+            "v": v_test,
+            "t": t_test,
+            "steps": steps_test
+        }
+
+        # Compute L2 error vs reference
+        rho_ref_interp = np.interp(r_test, r_ref, rho_ref)
+        p_ref_interp = np.interp(r_test, r_ref, p_ref)
+        v_ref_interp = np.interp(r_test, r_ref, v_ref)
+
+        dr = r_test[1] - r_test[0]
+        l2_rho = np.sqrt(np.sum((rho_test - rho_ref_interp)**2) * dr)
+        l2_p = np.sqrt(np.sum((p_test - p_ref_interp)**2) * dr)
+        l2_v = np.sqrt(np.sum((v_test - v_ref_interp)**2) * dr)
+
+        # Normalize
+        l2_rho_ref = np.sqrt(np.sum(rho_ref_interp**2) * dr)
+        l2_p_ref = np.sqrt(np.sum(p_ref_interp**2) * dr)
+        l2_v_ref = np.sqrt(np.sum(v_ref_interp**2) * dr)
+
+        results[riemann_name]["l2_rho"] = l2_rho / l2_rho_ref if l2_rho_ref > 0 else l2_rho
+        results[riemann_name]["l2_p"] = l2_p / l2_p_ref if l2_p_ref > 0 else l2_p
+        results[riemann_name]["l2_v"] = l2_v / l2_v_ref if l2_v_ref > 0 else l2_v
+
+    # Print L2 errors
+    print("\n" + "-"*60)
+    print("L2 ERRORS (relative to high-resolution HLLC reference)")
+    print("-"*60)
+    print(f"{'Solver':<12} {'L2(rho)':<14} {'L2(p)':<14} {'L2(v)':<14}")
+    print("-"*60)
+    for riemann_name in riemann_solvers:
+        res = results[riemann_name]
+        print(f"{riemann_name.upper():<12} {res['l2_rho']:<14.4e} {res['l2_p']:<14.4e} {res['l2_v']:<14.4e}")
+    print("-"*60)
+
+    # Create comparison plot (3 panels: density, pressure, velocity)
+    fig, axes = plt.subplots(1, 3, figsize=(18, 6))
+    lw = 2.0
+
+    for riemann_name in riemann_solvers:
+        res = results[riemann_name]
+        style = styles[riemann_name]
+
+        # Density
+        axes[0].plot(res["r"], res["rho"], color=style["color"],
+                     linestyle=style["linestyle"], linewidth=lw,
+                     label=f"{style['label']} (L2={res['l2_rho']:.2e})")
+
+        # Pressure
+        axes[1].plot(res["r"], res["p"], color=style["color"],
+                     linestyle=style["linestyle"], linewidth=lw,
+                     label=f"{style['label']} (L2={res['l2_p']:.2e})")
+
+        # Velocity
+        axes[2].plot(res["r"], res["v"], color=style["color"],
+                     linestyle=style["linestyle"], linewidth=lw,
+                     label=f"{style['label']} (L2={res['l2_v']:.2e})")
+
+    # Plot high-resolution reference
+    axes[0].plot(r_ref, rho_ref, 'k:', linewidth=1.5, alpha=0.7, label=f'Reference (HLLC n={n_ref})')
+    axes[1].plot(r_ref, p_ref, 'k:', linewidth=1.5, alpha=0.7, label=f'Reference (HLLC n={n_ref})')
+    axes[2].plot(r_ref, v_ref, 'k:', linewidth=1.5, alpha=0.7, label=f'Reference (HLLC n={n_ref})')
+
+    # Labels and formatting
+    axes[0].set_xlabel('r', fontsize=12)
+    axes[0].set_ylabel('Density', fontsize=12)
+    axes[0].set_title(f'Strong Blast - Density (t={t_ref:.3f})', fontsize=12)
+    axes[0].legend(fontsize=9, loc='best')
+    axes[0].grid(True, alpha=0.3)
+
+    axes[1].set_xlabel('r', fontsize=12)
+    axes[1].set_ylabel('Pressure', fontsize=12)
+    axes[1].set_title('Pressure', fontsize=12)
+    axes[1].legend(fontsize=9, loc='best')
+    axes[1].set_yscale('log')
+    axes[1].grid(True, alpha=0.3)
+
+    axes[2].set_xlabel('r', fontsize=12)
+    axes[2].set_ylabel('Velocity', fontsize=12)
+    axes[2].set_title('Velocity', fontsize=12)
+    axes[2].legend(fontsize=9, loc='best')
+    axes[2].grid(True, alpha=0.3)
+
+    fig.suptitle(f"Riemann Solver Comparison - Strong Blast Wave (n={n_interior}, MP5)",
+                 fontsize=14, fontweight='bold')
+    plt.tight_layout()
+    plt.savefig("test_riemann_solver_comparison.png", dpi=150, bbox_inches="tight")
+    print(f"\nPlot saved: test_riemann_solver_comparison.png")
+
+    # Check test pass/fail
+    # All solvers should capture the basic structure
+    all_ok = True
+    for riemann_name in riemann_solvers:
+        res = results[riemann_name]
+        variation = np.std(res["rho"]) / np.mean(res["rho"])
+        grad = np.gradient(res["rho"], res["r"])
+        contact = np.any(np.abs(grad) > 0.5)
+        solver_ok = (variation > 0.1) and contact
+        if not solver_ok:
+            all_ok = False
+            print(f"WARNING: {riemann_name.upper()} may have issues (variation={variation:.3f}, contact={contact})")
+
+    print("PASS" if all_ok else "FAIL")
+    return all_ok
+
+
+def run_contact_simulation(n_interior, reconstructor_name, Tfinal=0.4, gamma=1.4, r_max=1.0,
+                           solver_method="kastaun", riemann_solver_name="hllc"):
+    """
+    Run a pure contact discontinuity simulation.
+
+    Initial conditions:
+    - Density jump: rho_L != rho_R
+    - Constant pressure: P_L = P_R (NO pressure jump!)
+    - Zero velocity: v = 0
+
+    This is the ideal test for HLLC vs HLL because:
+    - Contact discontinuity should remain stationary and sharp
+    - HLL/LLF will diffuse it significantly
+    - HLLC should preserve it much better
+    """
+    grid, hydro, background, eos = create_hydro_and_grid(
+        n_interior=n_interior, r_max=r_max, gamma=gamma,
+        reconstructor_name=reconstructor_name,
+        spacetime_mode="fixed_minkowski",
+        solver_method=solver_method,
+        riemann_solver_name=riemann_solver_name
+    )
+
+    r = grid.r
+    ng = NUM_GHOSTS
+
+    # Pure contact discontinuity: density jump, constant pressure, zero velocity
+    r_mid = 0.5 * (r[ng] + r[-ng-1])
+
+    # Strong density contrast (8:1 ratio)
+    rho_L, rho_R = 1.0, 0.125
+    P_const = 1.0  # Constant pressure everywhere!
+    v_const = 0.0  # Zero velocity
+
+    rho0 = np.where(r < r_mid, rho_L, rho_R).astype(float)
+    p = np.ones(grid.N) * P_const
+    v = np.ones(grid.N) * v_const
+
+    # Create initial state
+    state_2d = create_initial_state(grid, rho0, v, p, eos)
+
+    # Fixed BSSN
+    bssn_fixed = state_2d[:NUM_BSSN_VARS, :].copy()
+    bssn_d1_fixed = grid.get_d1_metric_quantities(state_2d)
+
+    # Time evolution
+    t, steps = 0.0, 0
+    while t < Tfinal and steps < 10000:
+        dt = compute_dt(rho0, v, p, eos, grid, cfl=0.3)
+        state_2d = rk3_step(state_2d, dt, grid, background, hydro, bssn_fixed, bssn_d1_fixed)
+
+        # Update primitives
+        bssn_vars = BSSNVars(grid.N)
+        bssn_vars.set_bssn_vars(bssn_fixed)
+        rho0, v, p = extract_primitives(state_2d, grid, hydro, bssn_vars)
+
+        t += dt
+        steps += 1
+
+    return r[ng:-ng], rho0[ng:-ng], p[ng:-ng], v[ng:-ng], t, steps
+
+
+def test_contact_discontinuity(solver_method="kastaun"):
+    """
+    TEST 8: Pure contact discontinuity - HLLC advantage test.
+
+    This test demonstrates where HLLC excels over HLL/LLF:
+    - Pure density jump with constant pressure
+    - Contact should remain stationary and sharp
+    - HLL/LLF diffuse contacts; HLLC preserves them
+
+    The contact discontinuity is the key wave that HLLC restores
+    in the Riemann fan that HLL ignores.
+    """
+    print("\n" + "="*60)
+    print(f"TEST 8: Pure contact discontinuity (HLLC advantage test)")
+    print("="*60)
+
+    # Test parameters
+    n_interior = 200
+    Tfinal = 0.2  # Short time to see diffusion clearly
+    gamma = 1.4
+    r_max = 1.0
+    reconstructor_name = "minmod"  # Use low-order to see solver differences
+
+    # Riemann solvers to compare
+    riemann_solvers = ["llf", "hll", "hllc"]
+
+    # Colors and styles
+    styles = {
+        "llf": {"color": "blue", "linestyle": "-", "label": "LLF"},
+        "hll": {"color": "green", "linestyle": "--", "label": "HLL"},
+        "hllc": {"color": "red", "linestyle": "-.", "label": "HLLC"}
+    }
+
+    print(f"\nInitial conditions:")
+    print(f"  rho_L = 1.0, rho_R = 0.125 (8:1 density ratio)")
+    print(f"  P = 1.0 (constant - NO pressure jump!)")
+    print(f"  v = 0.0 (stationary)")
+    print(f"\nThis contact should remain stationary and sharp.")
+    print(f"HLL/LLF will diffuse it; HLLC should preserve it better.\n")
+
+    # Store results
+    results = {}
+
+    print(f"Running simulations (n={n_interior}, {reconstructor_name})...")
+    for riemann_name in riemann_solvers:
+        print(f"  {riemann_name.upper()}...", end=" ", flush=True)
+        r_test, rho_test, p_test, v_test, t_test, steps_test = run_contact_simulation(
+            n_interior=n_interior,
+            reconstructor_name=reconstructor_name,
+            Tfinal=Tfinal,
+            gamma=gamma,
+            r_max=r_max,
+            solver_method=solver_method,
+            riemann_solver_name=riemann_name
+        )
+        print(f"t={t_test:.4f}, steps={steps_test}")
+
+        results[riemann_name] = {
+            "r": r_test,
+            "rho": rho_test,
+            "p": p_test,
+            "v": v_test,
+            "t": t_test
+        }
+
+    # Compute contact sharpness metric
+    # Find the transition width (number of cells to go from 90% to 10% of jump)
+    print("\n" + "-"*60)
+    print("CONTACT SHARPNESS ANALYSIS")
+    print("-"*60)
+
+    r_mid = 0.5 * r_max
+    rho_L, rho_R = 1.0, 0.125
+    rho_90 = rho_R + 0.9 * (rho_L - rho_R)  # 90% of way from R to L
+    rho_10 = rho_R + 0.1 * (rho_L - rho_R)  # 10% of way from R to L
+
+    dr = results["hllc"]["r"][1] - results["hllc"]["r"][0]
+
+    print(f"{'Solver':<12} {'Width (cells)':<15} {'Width (dr)':<15} {'Max|dP/P|':<15} {'Max|v|':<12}")
+    print("-"*60)
+
+    sharpness_data = {}
+    for riemann_name in riemann_solvers:
+        res = results[riemann_name]
+        rho = res["rho"]
+        r = res["r"]
+
+        # Find transition width
+        # Look for where rho crosses rho_90 and rho_10
+        try:
+            # Find indices near the contact
+            center_idx = np.argmin(np.abs(r - r_mid))
+            search_range = min(50, len(r)//4)
+
+            idx_start = max(0, center_idx - search_range)
+            idx_end = min(len(r), center_idx + search_range)
+
+            rho_local = rho[idx_start:idx_end]
+            r_local = r[idx_start:idx_end]
+
+            # Find where density crosses thresholds
+            above_90 = np.where(rho_local > rho_90)[0]
+            below_10 = np.where(rho_local < rho_10)[0]
+
+            if len(above_90) > 0 and len(below_10) > 0:
+                idx_90 = above_90[-1]  # Last point above 90%
+                idx_10 = below_10[0]   # First point below 10%
+                width_cells = abs(idx_10 - idx_90)
+                width_dr = width_cells * dr
+            else:
+                width_cells = len(rho_local)
+                width_dr = width_cells * dr
+        except:
+            width_cells = -1
+            width_dr = -1
+
+        # Pressure should stay constant
+        p_error = np.max(np.abs(res["p"] - 1.0))
+
+        # Velocity should stay zero
+        v_max = np.max(np.abs(res["v"]))
+
+        sharpness_data[riemann_name] = {
+            "width_cells": width_cells,
+            "width_dr": width_dr,
+            "p_error": p_error,
+            "v_max": v_max
+        }
+
+        print(f"{riemann_name.upper():<12} {width_cells:<15} {width_dr:<15.4f} {p_error:<15.2e} {v_max:<12.2e}")
+
+    print("-"*60)
+
+    # Calculate improvement factor
+    if sharpness_data["hll"]["width_cells"] > 0 and sharpness_data["hllc"]["width_cells"] > 0:
+        improvement = sharpness_data["hll"]["width_cells"] / sharpness_data["hllc"]["width_cells"]
+        print(f"\nHLLC sharpness improvement over HLL: {improvement:.1f}x")
+
+    # Create comparison plot
+    fig, axes = plt.subplots(1, 3, figsize=(18, 6))
+    lw = 2.0
+
+    # Plot initial condition
+    r_init = results["hllc"]["r"]
+    rho_init = np.where(r_init < r_mid, rho_L, rho_R)
+    axes[0].plot(r_init, rho_init, 'k:', linewidth=2, alpha=0.5, label='Initial (exact)')
+
+    for riemann_name in riemann_solvers:
+        res = results[riemann_name]
+        style = styles[riemann_name]
+        sharp = sharpness_data[riemann_name]
+
+        # Density
+        axes[0].plot(res["r"], res["rho"], color=style["color"],
+                     linestyle=style["linestyle"], linewidth=lw,
+                     label=f"{style['label']} (width={sharp['width_cells']} cells)")
+
+        # Pressure (should be constant!)
+        axes[1].plot(res["r"], res["p"], color=style["color"],
+                     linestyle=style["linestyle"], linewidth=lw,
+                     label=f"{style['label']} (err={sharp['p_error']:.1e})")
+
+        # Velocity (should be zero!)
+        axes[2].plot(res["r"], res["v"], color=style["color"],
+                     linestyle=style["linestyle"], linewidth=lw,
+                     label=f"{style['label']} (max={sharp['v_max']:.1e})")
+
+    # Reference lines
+    axes[1].axhline(y=1.0, color='k', linestyle=':', linewidth=1.5, alpha=0.5, label='Exact (P=1)')
+    axes[2].axhline(y=0.0, color='k', linestyle=':', linewidth=1.5, alpha=0.5, label='Exact (v=0)')
+
+    # Labels
+    axes[0].set_xlabel('r', fontsize=12)
+    axes[0].set_ylabel('Density', fontsize=12)
+    axes[0].set_title(f'Contact Discontinuity - Density (t={Tfinal})', fontsize=12)
+    axes[0].legend(fontsize=9, loc='best')
+    axes[0].grid(True, alpha=0.3)
+    axes[0].set_xlim([0.3, 0.7])  # Zoom to contact region
+
+    axes[1].set_xlabel('r', fontsize=12)
+    axes[1].set_ylabel('Pressure', fontsize=12)
+    axes[1].set_title('Pressure (should be constant = 1.0)', fontsize=12)
+    axes[1].legend(fontsize=9, loc='best')
+    axes[1].grid(True, alpha=0.3)
+
+    axes[2].set_xlabel('r', fontsize=12)
+    axes[2].set_ylabel('Velocity', fontsize=12)
+    axes[2].set_title('Velocity (should be zero)', fontsize=12)
+    axes[2].legend(fontsize=9, loc='best')
+    axes[2].grid(True, alpha=0.3)
+
+    fig.suptitle(f"Pure Contact Discontinuity Test - HLLC Advantage (n={n_interior}, {reconstructor_name})",
+                 fontsize=14, fontweight='bold')
+    plt.tight_layout()
+    plt.savefig("test_contact_discontinuity.png", dpi=150, bbox_inches="tight")
+    print(f"\nPlot saved: test_contact_discontinuity.png")
+
+    # Pass criteria: HLLC should have sharper contact than HLL
+    hllc_sharper = sharpness_data["hllc"]["width_cells"] <= sharpness_data["hll"]["width_cells"]
+    p_preserved = all(sharpness_data[s]["p_error"] < 0.1 for s in riemann_solvers)
+
+    ok = hllc_sharper and p_preserved
+    if not ok:
+        if not hllc_sharper:
+            print("WARNING: HLLC not sharper than HLL!")
+        if not p_preserved:
+            print("WARNING: Pressure not well preserved!")
+
+    print("PASS" if ok else "FAIL")
+    return ok
+
+
 # ============================================================================
 # MAIN
 # ============================================================================
 
 if __name__ == "__main__":
     import time
+    import argparse
+
+    parser = argparse.ArgumentParser(description="Valencia hydro tests for engrenage")
+    parser.add_argument("--solver", type=str, default="kastaun", choices=["newton", "kastaun"],
+                        help="Cons2prim solver method: 'newton' or 'kastaun' (default: kastaun)")
+    parser.add_argument("--riemann", type=str, default="hllc", choices=["hll", "llf", "hllc"],
+                        help="Riemann solver: 'hll', 'llf', or 'hllc' (default: hllc)")
+    args = parser.parse_args()
+
+    solver_method = args.solver
+    riemann_solver = args.riemann
+
     start_time = time.perf_counter()
 
     np.set_printoptions(precision=3, suppress=True)
@@ -861,14 +1412,18 @@ if __name__ == "__main__":
     print("="*60)
     print(f"Using NUM_GHOSTS = {NUM_GHOSTS}")
     print(f"Using NUM_BSSN_VARS = {NUM_BSSN_VARS}")
+    print(f"Using solver_method = {solver_method}")
+    print(f"Using riemann_solver = {riemann_solver}")
 
     results = []
-    results.append(("Uniform", test_uniform_state()))
-    results.append(("cons2prim", test_cons2prim_roundtrip()))
-    results.append(("Conservation", test_conservation_short()))
-    results.append(("Sod", test_riemann_sod()))
-    results.append(("Blast weak", test_blast_wave(case="weak")))
-    results.append(("Blast strong", test_blast_wave(case="strong")))
+    results.append(("Uniform", test_uniform_state(solver_method=solver_method, riemann_solver_name=riemann_solver)))
+    results.append(("cons2prim", test_cons2prim_roundtrip(solver_method=solver_method)))
+    results.append(("Conservation", test_conservation_short(solver_method=solver_method, riemann_solver_name=riemann_solver)))
+    results.append(("Sod", test_riemann_sod(solver_method=solver_method, riemann_solver_name=riemann_solver)))
+    results.append(("Blast weak", test_blast_wave(case="weak", solver_method=solver_method, riemann_solver_name=riemann_solver)))
+    results.append(("Blast strong", test_blast_wave(case="strong", solver_method=solver_method, riemann_solver_name=riemann_solver)))
+    results.append(("Riemann cmp", test_riemann_solver_comparison(solver_method=solver_method)))
+    results.append(("Contact", test_contact_discontinuity(solver_method=solver_method)))
 
     elapsed_time = time.perf_counter() - start_time
 
@@ -880,4 +1435,6 @@ if __name__ == "__main__":
         print(f"{name:14s}: {'PASS' if ok else 'FAIL'}")
     print("-"*40)
     print(f"Total: {passed}/{len(results)}")
+    print(f"Cons2Prim Solver: {solver_method}")
+    print(f"Riemann Solver: {riemann_solver}")
     print(f"Time: {elapsed_time:.2f}s")

@@ -1,6 +1,7 @@
 import numpy as np
 import sys
 import os
+import time
 
 # Get the directory where this script is located
 script_dir = os.path.dirname(os.path.abspath(__file__))
@@ -26,11 +27,12 @@ from source.core.rhsevolution import get_rhs
 
 # Hydro
 from source.matter.hydro.perfect_fluid import PerfectFluid
-from source.matter.hydro.eos import PolytropicEOS
+from source.matter.hydro.eos import PolytropicEOS, IdealGasEOS
 from source.matter.hydro.reconstruction import create_reconstruction
 from source.matter.hydro.riemann import HLLRiemannSolver, LLFRiemannSolver
 from source.matter.hydro.cons2prim import prim_to_cons
 from source.matter.hydro.atmosphere import AtmosphereParams
+from source.matter.hydro.geometry import GeometryState
 
 # Local TOV modules (isotropic coordinates)
 from examples.TOV.tov_solver import load_or_solve_tov_iso
@@ -40,7 +42,6 @@ import examples.TOV.tov_initial_data_interpolated as tov_id
 import examples.TOV.utils_TOVEvolution as utils
 from examples.TOV.utils_TOVEvolution import (SimulationDataManager, evolve_fixed_timestep,
                                               get_star_folder_name)
-from examples.TOV.plot_TOVEvolution import compute_qnm_spectrum, extract_decay_rate
 
 
 
@@ -88,105 +89,52 @@ def get_rhs_dynamic(t, y, grid, background, hydro, progress_bar=None, time_state
     # Call the full RHS from rhsevolution.py
     return get_rhs(t, y, grid, background, hydro, progress_bar, time_state)
 
-
 def _apply_atmosphere_reset(state_2d, grid, hydro, atmosphere, rho_threshold=None):
-    """
-    Aplica floors atmosféricos y correcciones a variables conservativas.
-    """
+    """Aplica floors atmosféricos a variables conservativas densitizadas."""
     from source.matter.hydro.atmosphere import FloorApplicator
 
-    # Definir umbral para reset atmosférico
-    if rho_threshold is None:
-        #print("Warning: Using default hard floor factor of 10.0 for atmosphere reset.")
-        rho_hard_floor = 10.0 * atmosphere.rho_floor
+    rho_hard_floor = rho_threshold or 100.0 * atmosphere.rho_floor
+    idx_D, idx_Sr, idx_tau = NUM_BSSN_VARS, NUM_BSSN_VARS + 1, NUM_BSSN_VARS + 2
 
-    # Indices de variables conservativas
-    idx_D = NUM_BSSN_VARS + 0
-    idx_Sr = NUM_BSSN_VARS + 1
-    idx_tau = NUM_BSSN_VARS + 2
-
-    # Extraer vistas para lectura
-    D = state_2d[idx_D, :]
-
-    # --- HARD ATMOSPHERE RESET ---
-    # Resetear valores muy bajos al piso absoluto
-    atm_mask = D < rho_hard_floor
-
-    if np.any(atm_mask):
-        state_2d[idx_D, atm_mask] = atmosphere.rho_floor
-        state_2d[idx_Sr, atm_mask] = 0.0
-        state_2d[idx_tau, atm_mask] = atmosphere.tau_atm
-        
-        # Actualizar la variable local D para la siguiente fase
-        D[atm_mask] = atmosphere.rho_floor
-
-    # Si todo es atmósfera, terminamos
-    if np.all(atm_mask):
-        return state_2d
-
-    # --- STANDARD FLOORS  ---
-    # Solo para el interior de la estrella donde la densidad es alta
-    non_atm_mask = ~atm_mask
-
-    if not np.any(non_atm_mask):
-        return state_2d
-
-    # Necesitamos métrica para los floors físicos
+    # Métrica
     bssn_vars = BSSNVars(grid.N)
     bssn_vars.set_bssn_vars(state_2d[:NUM_BSSN_VARS, :])
-    
-    # Calcular gamma_rr físico
     bar_gamma_LL = get_bar_gamma_LL(grid.r, bssn_vars.h_LL, hydro.background)
-    phi = np.asarray(bssn_vars.phi, dtype=float)
-    e4phi = np.exp(4.0 * phi)
+    e4phi = np.exp(4.0 * bssn_vars.phi)
+    e6phi = np.exp(6.0 * bssn_vars.phi)
     gamma_rr = e4phi * bar_gamma_LL[:, 0, 0]
 
-    # Recuperar primitivas solo donde importa
+    # Hard reset atmosférico
+    atm_mask = state_2d[idx_D, :] < rho_hard_floor * e6phi
+    if np.any(atm_mask):
+        state_2d[idx_D, atm_mask] = atmosphere.rho_floor * e6phi[atm_mask]
+        state_2d[idx_Sr, atm_mask] = 0.0
+        state_2d[idx_tau, atm_mask] = atmosphere.tau_atm * e6phi[atm_mask]
+
+    # Floors en región no-atmosférica
+    non_atm = ~atm_mask
+    if not np.any(non_atm):
+        return state_2d
+
+    # Recuperar primitivas y aplicar floors
     hydro.set_matter_vars(state_2d, bssn_vars, grid)
-    rho0, vr, p, eps, W, h, success = hydro._get_primitives(bssn_vars, grid.r)
-
+    rho0, vr, p, *_ = hydro._get_primitives(bssn_vars, grid.r)
+    
     floor_app = FloorApplicator(atmosphere, hydro.eos)
+    rho0, vr, p = floor_app.apply_primitive_floors(rho0, vr, p, gamma_rr)
 
-    # Aplicar floors a primitivas (rho, p, v)
-    rho0_floor, vr_floor, p_floor = floor_app.apply_primitive_floors(rho0, vr, p, gamma_rr)
-
-    # Aplicar consistencia a conservativas (Tau floor, S^2 limit)
-    # Usamos las conservativas actuales del state_2d
-    D_curr = state_2d[idx_D, :]
-    Sr_curr = state_2d[idx_Sr, :]
-    tau_curr = state_2d[idx_tau, :]
-
-    D_floor, Sr_floor, tau_floor, cons_floor_applied = floor_app.apply_conservative_floors(
-        D_curr, Sr_curr, tau_curr, gamma_rr
+    # Recomputar conservativas donde no es atmósfera
+    geom = GeometryState(
+        alpha=np.ones_like(e6phi),   # no usado por prim_to_cons
+        beta_r=np.zeros_like(e6phi), # no usado por prim_to_cons
+        gamma_rr=gamma_rr,
+        e6phi=e6phi
     )
-
-    # Detectar dónde se aplicaron cambios
-    prim_floor_applied = (
-        (np.abs(rho0_floor - rho0) > 1e-14) |
-        (np.abs(vr_floor - vr) > 1e-14) |
-        (np.abs(p_floor - p) > 1e-14)
-    )
-
-    # Combinar: aplicar recomputo solo en celdas NO atmósfera que violaron floors
-    needs_recompute = prim_floor_applied & non_atm_mask
-    needs_cons_fix = cons_floor_applied & non_atm_mask
-
-    # 1. Si primitivas cambiaron, recomputar conservativas
-    if np.any(needs_recompute):
-        D_new, Sr_new, tau_new = prim_to_cons(
-            rho0_floor, vr_floor, p_floor, gamma_rr, hydro.eos, 
-            e6phi=np.exp(6.0*phi), alpha=bssn_vars.lapse, beta_r=bssn_vars.shift_r
-        )
-        state_2d[idx_D, needs_recompute] = D_new[needs_recompute]
-        state_2d[idx_Sr, needs_recompute] = Sr_new[needs_recompute]
-        state_2d[idx_tau, needs_recompute] = tau_new[needs_recompute]
-
-    # 2. Si conservativas violaban reglas físicas, aplicar corrección directa
-    if np.any(needs_cons_fix):
-        # Aplicar los valores corregidos por apply_conservative_floors
-        state_2d[idx_D, needs_cons_fix] = D_floor[needs_cons_fix]
-        state_2d[idx_Sr, needs_cons_fix] = Sr_floor[needs_cons_fix]
-        state_2d[idx_tau, needs_cons_fix] = tau_floor[needs_cons_fix]
+    D_new, Sr_new, tau_new = prim_to_cons(rho0, vr, p, geom, hydro.eos)
+    
+    state_2d[idx_D, non_atm] = D_new[non_atm]
+    state_2d[idx_Sr, non_atm] = Sr_new[non_atm]
+    state_2d[idx_tau, non_atm] = tau_new[non_atm]
 
     return state_2d
 
@@ -235,31 +183,35 @@ def rk4_step_dynamic(state_flat, dt, grid, background, hydro, atmosphere,
                      progress_bar=None, time_state=None):
     """
     Single RK4 timestep for full BSSN + hydro evolution.
-    Atmosphere reset applied after full step.
+    Atmosphere reset applied after EACH substage to prevent spurious expansion.
     """
+    state = state_flat.reshape((grid.NUM_VARS, grid.N))
+
     # --- Stage 1 ---
     k1 = get_rhs_dynamic(0, state_flat, grid, background, hydro, progress_bar, time_state)
+    state_1 = state + 0.5 * dt * k1.reshape((grid.NUM_VARS, grid.N))
+    #state_1 = _apply_atmosphere_reset(state_1, grid, hydro, atmosphere)
 
     # --- Stage 2 ---
-    state_2 = state_flat + 0.5 * dt * k1
-    k2 = get_rhs_dynamic(0, state_2, grid, background, hydro, progress_bar, time_state)
+    k2 = get_rhs_dynamic(0, state_1.flatten(), grid, background, hydro, progress_bar, time_state)
+    state_2 = state + 0.5 * dt * k2.reshape((grid.NUM_VARS, grid.N))
+    #state_2 = _apply_atmosphere_reset(state_2, grid, hydro, atmosphere)
 
     # --- Stage 3 ---
-    state_3 = state_flat + 0.5 * dt * k2
-    k3 = get_rhs_dynamic(0, state_3, grid, background, hydro, progress_bar, time_state)
+    k3 = get_rhs_dynamic(0, state_2.flatten(), grid, background, hydro, progress_bar, time_state)
+    state_3 = state + dt * k3.reshape((grid.NUM_VARS, grid.N))
+    #state_3 = _apply_atmosphere_reset(state_3, grid, hydro, atmosphere)
 
     # --- Stage 4 ---
-    state_4 = state_flat + dt * k3
-    k4 = get_rhs_dynamic(0, state_4, grid, background, hydro, progress_bar, time_state)
+    k4 = get_rhs_dynamic(0, state_3.flatten(), grid, background, hydro, progress_bar, time_state)
 
     # --- Combine ---
-    state_new = state_flat + (dt / 6.0) * (k1 + 2*k2 + 2*k3 + k4)
-    snew = state_new.reshape((grid.NUM_VARS, grid.N))
+    state_new = state + (dt / 6.0) * (k1 + 2*k2 + 2*k3 + k4).reshape((grid.NUM_VARS, grid.N))
 
-    # Apply atmosphere reset after full step
-    snew_reset = _apply_atmosphere_reset(snew, grid, hydro, atmosphere)
+    # Apply final atmosphere reset
+    state_new = _apply_atmosphere_reset(state_new, grid, hydro, atmosphere)
 
-    return snew_reset.flatten()
+    return state_new.flatten()
 
 
 def main():
@@ -268,51 +220,59 @@ def main():
     # ==================================================================
     # CONFIGURATION
     # ==================================================================
-    r_max = 16.0
-    num_points = 100
+    r_max = 100.0
+    num_points = 2000
     K = 100.0
     Gamma = 2.0
     rho_central = 1.28e-3
-    t_final = 10000
+    t_final = 2000
+    FOLDER_NAME_EVOL = "tov_evolution_data_${num_points}_rmax${r_max}"
+
 
     # Reconstructor: "wenoz" (wz), "weno5" (w5), "mp5" (mp5), "minmod" (md), "mc" (mc)
-    RECONSTRUCTOR_NAME = "wenoz"
+    RECONSTRUCTOR_NAME = "mp5"  # "wenoz", "weno5", "mp5", "minmod", "mc"
 
-    # ==================================================================
-    # EVOLUTION MODE SELECTION
-    # ==================================================================
+    # Cons2prim solver: "newton" (fast, needs good guess) or "kastaun" (robust, guaranteed convergence)
+    SOLVER_METHOD = "newton"  # "newton" or "kastaun"
+
+    # Riemann solver: "hll" or "llf"
+    RIEMANN_SOLVER = "hll"  # "hll" or "llf"
+
     # Options: "cowling" or "dynamic"
-    #   - "cowling": Fixed spacetime (BSSN variables frozen at t=0)
-    #   - "dynamic": Full BSSN + hydro evolution. 
-    EVOLUTION_MODE = "cowling" 
+    EVOLUTION_MODE = "cowling"  # "cowling" or "dynamic"
 
-    # ==================================================================
-    # ATMOSPHERE CONFIGURATION (Centralized floor management)
-    # ==================================================================
+    # atmosphere config
+    rho_floor_base = 1e-9 * rho_central
+    p_floor_base = K * (rho_floor_base)**Gamma
     ATMOSPHERE = AtmosphereParams(
-        rho_floor=1.0e-10,  # Rest mass density floor
-        p_floor=K*(1.0e-10)**Gamma,     # Pressure floor
-        v_max=0.999,           # Maximum velocity
-        W_max=100.0,            # Maximum Lorentz factor
-        conservative_floor_safety=0.999  # Safety factor for S^2 constraint
-    )
+        rho_floor=rho_floor_base,
+        p_floor=p_floor_base
+        )
 
     # ==================================================================
     # SETUP
     # ==================================================================
     spacing = LinearSpacing(num_points, r_max)
     eos = PolytropicEOS(K=K, gamma=Gamma)
+    #eos = IdealGasEOS(gamma=Gamma)  # Use ideal gas EOS for evolution
     
     # 1. RECONSTRUCTOR BASE (uses RECONSTRUCTOR_NAME from configuration)
     base_recon = create_reconstruction(RECONSTRUCTOR_NAME)
-    
-    # 3. PASAR 
+
+    # 2. RIEMANN SOLVER
+    if RIEMANN_SOLVER.lower() == "hll":
+        riemann = HLLRiemannSolver(atmosphere=ATMOSPHERE)
+    else:
+        riemann = LLFRiemannSolver(atmosphere=ATMOSPHERE)
+
+    # 3. PASAR
     hydro = PerfectFluid(
         eos=eos,
         spacetime_mode="dynamic",
         atmosphere=ATMOSPHERE,
         reconstructor=base_recon,
-        riemann_solver=LLFRiemannSolver(atmosphere=ATMOSPHERE)
+        riemann_solver=riemann,
+        solver_method=SOLVER_METHOD
     )
 
     state_vector = StateVector(hydro)
@@ -337,7 +297,7 @@ def main():
     # DATA SAVING CONFIGURATION
     # ==================================================================
     ENABLE_DATA_SAVING = True  # Set to True to save data to files
-    DATA_ROOT_DIR = os.path.join(script_dir, "tov_evolution_data")  # Root directory for all data
+    DATA_ROOT_DIR = os.path.join(script_dir,FOLDER_NAME_EVOL)  # Root directory for all data
 
     # Create star-specific folder based on parameters (includes evolution mode and reconstructor)
     star_folder = get_star_folder_name(rho_central, num_points, K, Gamma, EVOLUTION_MODE, RECONSTRUCTOR_NAME)
@@ -373,10 +333,10 @@ def main():
     # 'fixed': RK4 with fixed timestep 
     integration_method = 'fixed'  # 'fixed' 
 
-
-
     print(f"Grid: N={grid.N}, r_max={r_max}, dr_min={grid.min_dr}")
-    print(f"EOS: K={K}, Gamma={Gamma}\n")
+    print(f"EOS: K={K}, Gamma={Gamma}")
+    print(f"Cons2prim solver: {SOLVER_METHOD}")
+    print(f"Riemann solver: {RIEMANN_SOLVER}\n")
 
     # ==================================================================
     # SOLVE TOV DIRECTLY ON EVOLUTION GRID (for discrete equilibrium)
@@ -464,6 +424,9 @@ def main():
         dt = cfl_factor * grid.min_dr  # CFL condition
         num_steps_total = int(t_final / dt)  # Calculate steps from t_final
         print(f"\nEvolving with fixed dt={dt:.6f} (CFL={cfl_factor}) to t_final={t_final} ({num_steps_total} steps) using RK4")
+
+        # Start timing the evolution
+        evolution_start_time = time.time()
 
         # Save metadata now that we have dt
         if ENABLE_DATA_SAVING:
@@ -805,8 +768,17 @@ def main():
 
     # Finalize data saving
     if ENABLE_DATA_SAVING:
-        data_manager.finalize()
+        execution_time = time.time() - evolution_start_time
+        data_manager.finalize(execution_time_seconds=execution_time)
 
+    # ==================================================================
+    # PLOT CONSTRAINT VIOLATIONS (Dynamic mode only)
+    # ==================================================================
+    if EVOLUTION_MODE == "dynamic" and ENABLE_DATA_SAVING:
+        print("\n" + "="*70)
+        print("Plotting constraint violation evolution...")
+        print("="*70)
+        utils.plot_constraints_evolution(OUTPUT_DIR, suffix=PLOT_SUFFIX)
 
     print("\n" + "="*70)
     print("Evolution complete. Plots saved:")
@@ -816,6 +788,7 @@ def main():
     print(f"                                       t=0 → t={t_cp1:.3e} (1/3) → t={t_cp2:.3e} (2/3) → t={t_cp3:.3e} (final)")
     if EVOLUTION_MODE == "dynamic":
         print(f"  4. tov_bssn_evolution.png          - BSSN variables: t=0 → t={t_cp3:.3e} (metric evolution)")
+        print(f"  5. constraints_evolution{PLOT_SUFFIX}.png - BSSN constraint violations: max|H|, L2(H), max|M_r|, L2(M_r)")
     else:
         print(f"  4. tov_bssn_evolution.png          - BSSN variables: t=0 → t={t_cp3:.3e} (Cowling check - should be constant)")
     print("="*70)

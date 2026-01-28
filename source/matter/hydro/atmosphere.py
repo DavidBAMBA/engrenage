@@ -37,28 +37,22 @@ class AtmosphereParams:
     conservative_floor_safety : float
         Safety factor for conservative variable floors (0.999999 in IllinoisGRMHD)
 
-    Usage
-    -----
-    Create once at the top level (e.g., in TOVEvolution script):
-
-        atm_params = AtmosphereParams(rho_floor=1e-14, p_floor=1e-16)
-        matter = PerfectFluid(eos=eos, atmosphere=atm_params)
-
-    All subsystems (cons2prim, valencia, reconstruction, riemann) will use
-    the same parameters automatically.
-    """
+"""
 
     # Primary floors
-    rho_floor: float = 1e-10
-    p_floor: float = 100*(1e-10)**2
+    rho_floor: float = 1e-16
+    p_floor: float = 100*(1e-16)**2
 
     # Velocity and Lorentz factor limits
     v_max: float = 0.999
     W_max: float = 1.0e2
 
     # Conservative variable floor parameters
-    tau_atm_factor: float = 1.0  # tau_atm = tau_atm_factor * p_floor
-    conservative_floor_safety: float = 0.99  # Safety factor for inequalities
+    # tau_atm = tau_atm_factor * p_floor (for ideal gas with gamma=2, this equals rho*eps)
+    # For general gamma: tau_atm ≈ p_floor / (gamma - 1), adjust tau_atm_factor accordingly
+    tau_atm_factor: float = 1.0
+    # S² constraint: S² <= safety * tau*(tau + 2D). GRHayL uses 0.999999
+    conservative_floor_safety: float = 0.999999
 
     def __post_init__(self):
         """Validate parameters."""
@@ -76,19 +70,6 @@ class AtmosphereParams:
         """Atmosphere value for tau (energy density)."""
         return self.tau_atm_factor * self.p_floor
 
-    def to_cons2prim_params(self):
-        """
-        Convert atmosphere parameters to cons2prim solver format.
-
-        Returns:
-            dict: Parameters for Cons2PrimSolver
-        """
-        return {
-            "rho_floor": self.rho_floor,
-            "p_floor": self.p_floor,
-            "v_max": self.v_max,
-            "W_max": self.W_max,
-        }
 
 
 class FloorApplicator:
@@ -114,6 +95,30 @@ class FloorApplicator:
         """
         self.atm = atmosphere
         self.eos = eos
+
+        # Compute EOS-consistent eps_atm and tau_atm (following GRHayL)
+        # tau_atm = rho_atm * eps_atm where eps comes from EOS
+        try:
+            self._eps_atm = eos.eps_from_rho_p(atmosphere.rho_floor, atmosphere.p_floor)
+        except:
+            # Fallback for ideal gas: eps = p / (rho * (gamma - 1))
+            if hasattr(eos, 'gamma'):
+                self._eps_atm = atmosphere.p_floor / (atmosphere.rho_floor * (eos.gamma - 1.0))
+            else:
+                self._eps_atm = atmosphere.p_floor / atmosphere.rho_floor
+
+        # GRHayL: tau_atm = rho_atm * eps_atm
+        self._tau_atm = atmosphere.rho_floor * self._eps_atm
+
+    @property
+    def tau_atm(self):
+        """EOS-consistent tau atmosphere value."""
+        return self._tau_atm
+
+    @property
+    def eps_atm(self):
+        """EOS-consistent epsilon atmosphere value."""
+        return self._eps_atm
 
     def apply_primitive_floors(self, rho0, vr, p, gamma_rr):
         """
@@ -193,7 +198,8 @@ class FloorApplicator:
         floor_applied = np.zeros(N, dtype=bool)
 
         # 1. Tau floor (simplest case: no magnetic fields)
-        tau_min = self.atm.tau_atm
+        # Use EOS-consistent tau_atm from FloorApplicator
+        tau_min = self.tau_atm
         tau_violated = tau < tau_min
         if np.any(tau_violated):
             tau_floor[tau_violated] = tau_min
@@ -234,21 +240,13 @@ class FloorApplicator:
         vr[mask] = 0.0
         p[mask] = self.atm.p_floor
 
-        # EOS-consistent epsilon
-        try:
-            eps[mask] = self.eos.eps_from_rho_p(self.atm.rho_floor, self.atm.p_floor)
-        except:
-            eps[mask] = 1e-10
+        # Use precomputed EOS-consistent epsilon
+        eps[mask] = self._eps_atm
 
         W[mask] = 1.0
 
-        # Enthalpy (EOS-dependent)
-        if hasattr(self.eos, 'K') and hasattr(self.eos, 'gamma'):
-            # Polytropic: h = 1 + ε
-            h[mask] = 1.0 + eps[mask]
-        else:
-            # Ideal gas: h = 1 + ε + P/ρ
-            h[mask] = 1.0 + eps[mask] + self.atm.p_floor / self.atm.rho_floor
+        # Enthalpy: h = 1 + eps + P/rho (general formula)
+        h[mask] = 1.0 + self._eps_atm + self.atm.p_floor / self.atm.rho_floor
 
 
 def create_default_atmosphere(rho_floor: Optional[float] = None) -> AtmosphereParams:

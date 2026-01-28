@@ -2,6 +2,8 @@
 """Valencia formulation with reference metric - full 3D."""
 
 import numpy as np
+import time
+from contextlib import contextmanager
 
 from source.bssn.tensoralgebra import (
     SPACEDIM,
@@ -51,6 +53,58 @@ class ValenciaReferenceMetric:
 
         # GeometryState container (bundles 1D components for passing to other modules)
         self._geom = None
+
+        # Performance profiling
+        self.enable_profiling = False
+        self.timers = {
+            'extraction_geometry': 0.0,
+            'cons2prim': 0.0,
+            'reconstruction': 0.0,
+            'riemann_solver': 0.0,
+            'source_terms': 0.0,
+            'total_rhs': 0.0
+        }
+        self.call_counts = {k: 0 for k in self.timers.keys()}
+
+    @contextmanager
+    def timer(self, name):
+        """Context manager for timing code blocks."""
+        if not self.enable_profiling:
+            yield
+            return
+
+        t0 = time.perf_counter()
+        yield
+        elapsed = time.perf_counter() - t0
+        self.timers[name] += elapsed
+        self.call_counts[name] += 1
+
+    def print_profiling_stats(self):
+        """Print timing statistics."""
+        if not self.enable_profiling:
+            print("Profiling is disabled. Set valencia.enable_profiling = True")
+            return
+
+        print("\n" + "="*60)
+        print("VALENCIA PROFILING STATISTICS")
+        print("="*60)
+
+        for name in ['extraction_geometry', 'cons2prim', 'reconstruction',
+                     'riemann_solver', 'source_terms', 'total_rhs']:
+            t = self.timers[name]
+            c = self.call_counts[name]
+            avg = t / c if c > 0 else 0.0
+            pct = 100.0 * t / self.timers['total_rhs'] if self.timers['total_rhs'] > 0 else 0.0
+
+            print(f"{name:20s}: {t:8.3f}s total | {avg*1000:6.2f}ms avg | {pct:5.1f}% | {c:5d} calls")
+
+        print("="*60)
+
+    def reset_profiling_stats(self):
+        """Reset all timers."""
+        for k in self.timers.keys():
+            self.timers[k] = 0.0
+            self.call_counts[k] = 0
 
     def _extract_geometry(self, r, bssn_vars, spacetime_mode, background, grid):
         """
@@ -454,71 +508,74 @@ class ValenciaReferenceMetric:
         rhs_S: (N, 3) - time derivative of momentum vector
         rhs_tau: (N,) - time derivative of tau
         """
-        N = len(r)
+        with self.timer('total_rhs'):
+            N = len(r)
 
-        # Track original momentum dimensionality to preserve caller-facing API
-        _S_input = np.asarray(S)
-        _return_radial_only = (_S_input.ndim == 1) or (_S_input.ndim == 2 and _S_input.shape[1] == 1)
+            # Track original momentum dimensionality to preserve caller-facing API
+            _S_input = np.asarray(S)
+            _return_radial_only = (_S_input.ndim == 1) or (_S_input.ndim == 2 and _S_input.shape[1] == 1)
 
-        # Coerce 1D inputs to 3D: (N,) -> (N, 3) with radial component only
-        def to_3d(arr, N):
-            if arr is None:
-                return np.zeros((N, SPACEDIM))
-            arr = np.asarray(arr, dtype=float)
-            if arr.ndim == 1:
-                out = np.zeros((N, SPACEDIM))
-                out[:, 0] = arr
-                return out
-            return arr
+            # Coerce 1D inputs to 3D: (N,) -> (N, 3) with radial component only
+            def to_3d(arr, N):
+                if arr is None:
+                    return np.zeros((N, SPACEDIM))
+                arr = np.asarray(arr, dtype=float)
+                if arr.ndim == 1:
+                    out = np.zeros((N, SPACEDIM))
+                    out[:, 0] = arr
+                    return out
+                return arr
 
-        v_U = to_3d(v_U, N)
-        S = to_3d(S, N)
+            v_U = to_3d(v_U, N)
+            S = to_3d(S, N)
 
-        # Extract geometry (alpha, β^i, γ_ij, √γ, √ĝ, dr, etc.) early, as W may need γ_ij
-        self._extract_geometry(r, bssn_vars, spacetime_mode, background, grid)
+            # Extract geometry (alpha, β^i, γ_ij, √γ, √ĝ, dr, etc.) early, as W may need γ_ij
+            with self.timer('extraction_geometry'):
+                self._extract_geometry(r, bssn_vars, spacetime_mode, background, grid)
 
-        # Copy conservatives
-        D = D.copy()
-        S = S.copy()
-        tau = tau.copy()
+            # Copy conservatives
+            D = D.copy()
+            S = S.copy()
+            tau = tau.copy()
 
-        # Compute Fluxes at interfaces
-        F_D_face, F_S_face, F_tau_face = self._compute_interface_fluxes(rho0, v_U, pressure, r, eos, reconstructor, riemann_solver, bssn_vars)
+            # Compute Fluxes at interfaces (contains reconstruction + riemann)
+            F_D_face, F_S_face, F_tau_face = self._compute_interface_fluxes(rho0, v_U, pressure, r, eos, reconstructor, riemann_solver, bssn_vars)
 
-        # FLUX DERIVATIVE
-        div_D, div_S, div_tau = self._compute_flux_derivative(F_D_face, F_S_face, F_tau_face)
+            # FLUX DERIVATIVE
+            div_D, div_S, div_tau = self._compute_flux_derivative(F_D_face, F_S_face, F_tau_face)
 
-        # CONNECTION TERMS FLUX derivative
-        conn_D, conn_S, conn_tau = self._compute_connection_terms(rho0, v_U, pressure, W, h, bssn_vars, background)
+            # CONNECTION TERMS FLUX derivative
+            conn_D, conn_S, conn_tau = self._compute_connection_terms(rho0, v_U, pressure, W, h, bssn_vars, background)
 
-        # SOURCE TERMS
-        src_S, src_tau = self._compute_source_terms(rho0, v_U, pressure, W, h, bssn_vars, bssn_d1,background, spacetime_mode, r)
+            # SOURCE TERMS
+            with self.timer('source_terms'):
+                src_S, src_tau = self._compute_source_terms(rho0, v_U, pressure, W, h, bssn_vars, bssn_d1,background, spacetime_mode, r)
 
-        # ====================================================================
-        # ASSEMBLE RHS: divergence + connection + source
-        # ====================================================================
-        rhs_D = np.zeros(N)
-        rhs_S = np.zeros((N, SPACEDIM))
-        rhs_tau = np.zeros(N)
+            # ====================================================================
+            # ASSEMBLE RHS: divergence + connection + source
+            # ====================================================================
+            rhs_D = np.zeros(N)
+            rhs_S = np.zeros((N, SPACEDIM))
+            rhs_tau = np.zeros(N)
 
-        # Interior cells only
-        interior_mask = np.zeros(N, dtype=bool)
-        interior_mask[NUM_GHOSTS:N-NUM_GHOSTS] = True
+            # Interior cells only
+            interior_mask = np.zeros(N, dtype=bool)
+            interior_mask[NUM_GHOSTS:N-NUM_GHOSTS] = True
 
-        rhs_D[interior_mask]    = (div_D[interior_mask]    + conn_D[interior_mask])
+            rhs_D[interior_mask]    = (div_D[interior_mask]    + conn_D[interior_mask])
 
-        rhs_S[interior_mask, :] = (div_S[interior_mask, :] + conn_S[interior_mask, :] + src_S[interior_mask, :])
+            rhs_S[interior_mask, :] = (div_S[interior_mask, :] + conn_S[interior_mask, :] + src_S[interior_mask, :])
 
-        rhs_tau[interior_mask]  = (div_tau[interior_mask]  + conn_tau[interior_mask]  + src_tau[interior_mask])
+            rhs_tau[interior_mask]  = (div_tau[interior_mask]  + conn_tau[interior_mask]  + src_tau[interior_mask])
 
 
-        # Preserve backward-compatible shape: if input momentum was 1D, return RHS radial as (N,)
-        if _return_radial_only:
-            rhs_S_out = rhs_S[:, 0]
-        else:
-            rhs_S_out = rhs_S
+            # Preserve backward-compatible shape: if input momentum was 1D, return RHS radial as (N,)
+            if _return_radial_only:
+                rhs_S_out = rhs_S[:, 0]
+            else:
+                rhs_S_out = rhs_S
 
-        return rhs_D, rhs_S_out, rhs_tau  # (N,), (N,) or (N,3), (N,)
+            return rhs_D, rhs_S_out, rhs_tau  # (N,), (N,) or (N,3), (N,)
 
 #------------------------------------------------------------------------------
 # interface fluxes and reconstruction
@@ -526,7 +583,7 @@ class ValenciaReferenceMetric:
     def _compute_interface_fluxes(self, rho0, v_U, pressure, r,
                                 eos, reconstructor, riemann_solver, bssn_vars):
         """
-        Compute partial fluxes at cell interfaces: F̃_face = alpha_face √γ_face F_phys.
+        Compute partial fluxes at cell interfaces.
 
         GENERAL 3D STRUCTURE, 1D EVOLUTION:
         ====================================
@@ -539,11 +596,6 @@ class ValenciaReferenceMetric:
 
         This is a 1D solver limitation, NOT a physics assumption.
         All tensor algebra (T^μν, sources, connections) remains fully 3D.
-
-        Args:
-            v_U: (N, 3) contravariant velocity components in coordinate basis
-            r: Coordinate for reconstruction (interpretation depends on background)
-
         Returns:
             Tuple of partial-flux arrays at interfaces (no √ĝ factor):
                 F_D_face: (N_faces,) density flux
@@ -558,14 +610,25 @@ class ValenciaReferenceMetric:
         # Reconstruct primitives to left/right states at interfaces
         # Map Valencia boundary_mode to reconstructor boundary_type
         recon_boundary = "reflecting" if self.boundary_mode == "parity" else "outflow"
-        (rhoL, vL, pL), (rhoR, vR, pR) = reconstructor.reconstruct_primitive_variables(
-            rho0, v_r, pressure, x=r, boundary_type=recon_boundary
-        )
+        with self.timer('reconstruction'):
+            (rhoL, vL, pL), (rhoR, vR, pR) = reconstructor.reconstruct_primitive_variables(
+                rho0, v_r, pressure, x=r, boundary_type=recon_boundary
+            )
         # ============================================================
+        # Apply floors to reconstructed primitives
         rhoL = np.maximum(rhoL, self.atmosphere.rho_floor)
         rhoR = np.maximum(rhoR, self.atmosphere.rho_floor)
         pL = np.maximum(pL, self.atmosphere.p_floor)
         pR = np.maximum(pR, self.atmosphere.p_floor)
+
+        # Velocity damping near atmosphere (Opción 1: prevent spurious fluxes)
+        # Points with ρ < 100×ρ_floor are in the "surface zone" where WENO5
+        # oscillations can generate non-zero velocities that drive expansion
+        surface_threshold = 100.0 * self.atmosphere.rho_floor
+        surface_mask_L = rhoL < surface_threshold
+        surface_mask_R = rhoR < surface_threshold
+        vL[surface_mask_L] = 0.0
+        vR[surface_mask_R] = 0.0
         # ============================================================
 
         # Extract interior faces
@@ -605,8 +668,9 @@ class ValenciaReferenceMetric:
 
         # Convert primitives to conservatives at interfaces
         # prim_to_cons computes: D, S_r, τ where S_r is momentum
-        UL_D, UL_S_r, UL_tau = prim_to_cons(rhoL, vL, pL, geom_f, eos)
-        UR_D, UR_S_r, UR_tau = prim_to_cons(rhoR, vR, pR, geom_f, eos)
+        with self.timer('cons2prim'):
+            UL_D, UL_S_r, UL_tau = prim_to_cons(rhoL, vL, pL, geom_f, eos)
+            UR_D, UR_S_r, UR_tau = prim_to_cons(rhoR, vR, pR, geom_f, eos)
 
         # Package for Riemann solver
         UL_batch = np.stack([UL_D, UL_S_r, UL_tau], axis=1)
@@ -616,7 +680,8 @@ class ValenciaReferenceMetric:
 
         # Solve Riemann problem to get physical fluxes
         # Returns: [F_D, F_S_r, F_tau] in r spatial direction
-        F_phys_batch = riemann_solver.solve_batch(UL_batch, UR_batch, primL_batch, primR_batch, geom_f, eos)
+        with self.timer('riemann_solver'):
+            F_phys_batch = riemann_solver.solve_batch(UL_batch, UR_batch, primL_batch, primR_batch, geom_f, eos)
 
 
         F_batch = F_phys_batch

@@ -1,32 +1,25 @@
 #!/usr/bin/env python3
 """
-COMPREHENSIVE CONS2PRIM TEST SUITE
-==================================
+CONS2PRIM TEST SUITE
+====================
 
-Unified test script that combines all cons2prim testing functionality:
-- Performance benchmarks
+Test script for cons2prim algorithm robustness:
 - Correctness validation
 - Failure analysis
-- Method tracking
 - Edge case testing
-- Vectorized vs legacy comparison
-
-This replaces all the individual test_*.py, debug_*.py, and analyze_*.py files.
 """
 
-import os
 import sys
 import numpy as np
-import time
-import matplotlib.pyplot as plt
-from collections import defaultdict, Counter
 import traceback
 
 # Add source path
-sys.path.insert(0, '/home/yo/repositories/engrenage')
+sys.path.insert(0, '/home/davidbamba/repositories/engrenage')
 
 from source.matter.hydro.eos import IdealGasEOS
 from source.matter.hydro.cons2prim import Cons2PrimSolver, prim_to_cons
+from source.matter.hydro.atmosphere import AtmosphereParams
+from source.matter.hydro.geometry import GeometryState
 
 # ============================================================================
 # TEST DATA GENERATION
@@ -85,94 +78,6 @@ def create_edge_case_data():
     return edge_cases
 
 # ============================================================================
-# PERFORMANCE TESTING
-# ============================================================================
-
-class PerformanceTracker:
-    """Track performance metrics during testing."""
-
-    def __init__(self):
-        self.times = []
-        self.success_rates = []
-        self.sizes = []
-
-    def add_measurement(self, size, time_taken, success_rate):
-        self.sizes.append(size)
-        self.times.append(time_taken)
-        self.success_rates.append(success_rate)
-
-    def plot_performance(self, filename="cons2prim_performance.png"):
-        """Plot performance results."""
-        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 5))
-
-        # Time per point
-        time_per_point = np.array(self.times) / np.array(self.sizes) * 1e6  # μs
-        ax1.loglog(self.sizes, time_per_point, 'bo-')
-        ax1.set_xlabel('Number of points')
-        ax1.set_ylabel('Time per point (μs)')
-        ax1.set_title('Vectorized Performance')
-        ax1.grid(True)
-
-        # Success rate
-        ax2.semilogx(self.sizes, self.success_rates, 'ro-')
-        ax2.set_xlabel('Number of points')
-        ax2.set_ylabel('Success rate')
-        ax2.set_title('Conversion Success Rate')
-        ax2.grid(True)
-        ax2.set_ylim([0.98, 1.02])
-
-        plt.tight_layout()
-        plt.savefig(filename, dpi=150, bbox_inches='tight')
-        print(f"Performance plot saved: {filename}")
-
-def benchmark_performance():
-    """Comprehensive performance benchmark."""
-    print("=" * 60)
-    print("PERFORMANCE BENCHMARK")
-    print("=" * 60)
-
-    eos = IdealGasEOS(2.0)
-    solver = Cons2PrimSolver(eos)
-    tracker = PerformanceTracker()
-
-    sizes = [100, 500, 1000, 5000, 10000]
-
-    for N in sizes:
-        print(f"\nTesting with N = {N} points:")
-
-        # Create test data
-        rho0, vr, p = create_test_data_varied(N)
-        gamma_rr = np.ones(N)
-
-        # Convert to conservative
-        D, Sr, tau = prim_to_cons(rho0, vr, p, gamma_rr, eos)
-
-        # Time conversion
-        start_time = time.time()
-        rho0_result, vr_result, p_result, eps_result, W_result, h_result, success = solver.convert(
-            D, Sr, tau, gamma_rr
-        )
-        elapsed_time = time.time() - start_time
-
-        success_rate = np.mean(success)
-        time_per_point = elapsed_time / N * 1e6  # μs
-
-        print(f"  Time: {elapsed_time:.6f} s")
-        print(f"  Success rate: {success_rate:.3f}")
-        print(f"  Time per point: {time_per_point:.2f} μs")
-
-        tracker.add_measurement(N, elapsed_time, success_rate)
-
-        # Check results quality
-        if np.any(success):
-            print(f"  rho0 range: [{np.min(rho0_result[success]):.3e}, {np.max(rho0_result[success]):.3e}]")
-            print(f"  vr range: [{np.min(vr_result[success]):.3e}, {np.max(vr_result[success]):.3e}]")
-            print(f"  p range: [{np.min(p_result[success]):.3e}, {np.max(p_result[success]):.3e}]")
-
-    tracker.plot_performance()
-    return tracker
-
-# ============================================================================
 # CORRECTNESS TESTING
 # ============================================================================
 
@@ -183,7 +88,8 @@ def test_correctness():
     print("=" * 60)
 
     eos = IdealGasEOS(2.0)
-    solver = Cons2PrimSolver(eos)
+    atmosphere = AtmosphereParams()
+    solver = Cons2PrimSolver(eos, atmosphere, solver_method='newton')
 
     # Simple test cases
     test_cases = [
@@ -199,14 +105,17 @@ def test_correctness():
         rho0 = np.array(rho0_test)
         vr = np.array(vr_test)
         p = np.array(p_test)
-        gamma_rr = np.ones(len(rho0))
+        N = len(rho0)
+
+        # Create Minkowski geometry
+        geom = GeometryState.minkowski(N)
 
         # Convert to conservative
-        D, Sr, tau = prim_to_cons(rho0, vr, p, gamma_rr, eos)
+        D, Sr, tau = prim_to_cons(rho0, vr, p, geom, eos)
 
-        # Convert back
-        rho0_rec, vr_rec, p_rec, eps_rec, W_rec, h_rec, success = solver.convert(
-            D, Sr, tau, gamma_rr
+        # Convert back (with p_guess = original pressure, simulating cache)
+        rho0_rec, vr_rec, p_rec, eps_rec, W_rec, h_rec, success, _, _, _ = solver.convert(
+            D, Sr, tau, geom, p_guess=p
         )
 
         print(f"  Success: {success}")
@@ -237,12 +146,13 @@ def test_correctness():
 
 def analyze_failures():
     """Analyze what types of states cause conversion failures."""
-    print("=" * 60)
-    print("FAILURE ANALYSIS")
+    print("\n" + "=" * 60)
+    print("FAILURE ANALYSIS (EDGE CASES)")
     print("=" * 60)
 
     eos = IdealGasEOS(2.0)
-    solver = Cons2PrimSolver(eos)
+    atmosphere = AtmosphereParams()
+    solver = Cons2PrimSolver(eos, atmosphere, solver_method='newton')
 
     # Test edge cases
     edge_cases = create_edge_case_data()
@@ -251,29 +161,31 @@ def analyze_failures():
     successes = []
 
     for rho0, vr, p, description in edge_cases:
-        gamma_rr = 1.0
+        # Create Minkowski geometry for single point
+        geom = GeometryState.minkowski(1)
 
         # Convert to conservative
         D, Sr, tau = prim_to_cons(np.array([rho0]), np.array([vr]),
-                                 np.array([p]), np.array([gamma_rr]), eos)
+                                 np.array([p]), geom, eos)
 
         try:
-            rho0_result, vr_result, p_result, eps_result, W_result, h_result, success = solver.convert(
-                D, Sr, tau, np.array([gamma_rr])
+            # With p_guess = original pressure (simulating cache)
+            rho0_result, vr_result, p_result, eps_result, W_result, h_result, success, _, _, _ = solver.convert(
+                D, Sr, tau, geom, p_guess=np.array([p])
             )
 
             if success[0]:
                 successes.append((rho0, vr, p, description))
-                print(f"✓ SUCCESS: {description}")
-                print(f"    Input: rho0={rho0:.3e}, vr={vr:.3f}, p={p:.3e}")
+                print(f"SUCCESS: {description}")
+                print(f"    Input:  rho0={rho0:.3e}, vr={vr:.3f}, p={p:.3e}")
                 print(f"    Output: rho0={rho0_result[0]:.3e}, vr={vr_result[0]:.3f}, p={p_result[0]:.3e}")
             else:
                 failures.append((rho0, vr, p, description))
-                print(f"✗ FAILURE: {description}")
+                print(f"FAILURE: {description}")
                 print(f"    Input: rho0={rho0:.3e}, vr={vr:.3f}, p={p:.3e}")
         except Exception as e:
             failures.append((rho0, vr, p, f"{description} (Exception: {str(e)})"))
-            print(f"✗ ERROR: {description}")
+            print(f"ERROR: {description}")
             print(f"    Exception: {str(e)}")
 
     print(f"\nSUMMARY:")
@@ -287,128 +199,142 @@ def analyze_failures():
             print(f"  - {desc}: rho0={rho0:.3e}, vr={vr:.3f}, p={p:.3e}")
 
 # ============================================================================
-# COMPARISON TESTING
+# RANDOM STRESS TEST
 # ============================================================================
 
-def compare_vectorized_vs_legacy():
-    """Compare vectorized implementation with legacy point-by-point."""
-    print("=" * 60)
-    print("VECTORIZED vs LEGACY COMPARISON")
+def test_random_states(N=1000):
+    """Test conversion with random states across all regimes."""
+    print("\n" + "=" * 60)
+    print(f"RANDOM STRESS TEST (N={N})")
     print("=" * 60)
 
     eos = IdealGasEOS(2.0)
+    atmosphere = AtmosphereParams()
+    solver = Cons2PrimSolver(eos, atmosphere,solver_method='newton')
 
-    # Create test data
-    N = 1000
+    # Create varied test data
     rho0, vr, p = create_test_data_varied(N)
-    gamma_rr = np.ones(N)
-    D, Sr, tau = prim_to_cons(rho0, vr, p, gamma_rr, eos)
+    geom = GeometryState.minkowski(N)
 
-    # Test vectorized approach
-    print("Testing vectorized solver...")
-    solver = Cons2PrimSolver(eos)
+    # Convert to conservative
+    D, Sr, tau = prim_to_cons(rho0, vr, p, geom, eos)
 
-    start_time = time.time()
-    rho0_vec, vr_vec, p_vec, eps_vec, W_vec, h_vec, success_vec = solver.convert(D, Sr, tau, gamma_rr)
-    time_vec = time.time() - start_time
+    # Convert back (with p_guess = original pressure, simulating cache)
+    rho0_rec, vr_rec, p_rec, eps_rec, W_rec, h_rec, success, _, _, _ = solver.convert(
+        D, Sr, tau, geom, p_guess=p
+    )
 
-    # Test legacy approach (point by point)
-    print("Testing legacy point-by-point...")
-    start_time = time.time()
+    success_rate = np.mean(success)
+    print(f"  Success rate: {success_rate*100:.2f}%")
+    print(f"  Successful: {np.sum(success)}/{N}")
+    print(f"  Failed: {np.sum(~success)}/{N}")
 
-    rho0_legacy = np.zeros(N)
-    vr_legacy = np.zeros(N)
-    p_legacy = np.zeros(N)
-    success_legacy = np.zeros(N, dtype=bool)
+    # Analyze errors for successful conversions
+    if np.any(success):
+        rho_err = np.abs(rho0[success] - rho0_rec[success]) / np.maximum(rho0[success], 1e-30)
+        vr_err = np.abs(vr[success] - vr_rec[success])
+        p_err = np.abs(p[success] - p_rec[success]) / np.maximum(p[success], 1e-30)
 
-    solver_legacy = Cons2PrimSolver(eos)
-    for i in range(N):
-        try:
-            rho0_single, vr_single, p_single, eps_single, W_single, h_single, success_single = solver_legacy.convert(
-                D[i:i+1], Sr[i:i+1], tau[i:i+1], gamma_rr[i:i+1]
-            )
-
-            if success_single[0]:
-                rho0_legacy[i] = rho0_single[0]
-                vr_legacy[i] = vr_single[0]
-                p_legacy[i] = p_single[0]
-                success_legacy[i] = True
-        except:
-            pass
-
-    time_legacy = time.time() - start_time
-
-    # Compare results
-    success_rate_vec = np.mean(success_vec)
-    success_rate_legacy = np.mean(success_legacy)
-    speedup = time_legacy / time_vec
-
-    print(f"\nRESULTS:")
-    print(f"  Vectorized time: {time_vec:.6f} s")
-    print(f"  Legacy time: {time_legacy:.6f} s")
-    print(f"  Speedup: {speedup:.2f}x")
-    print(f"  Vectorized success rate: {success_rate_vec:.3f}")
-    print(f"  Legacy success rate: {success_rate_legacy:.3f}")
-
-    # Check agreement where both succeeded
-    both_success = success_vec & success_legacy
-    if np.any(both_success):
-        rho0_diff = np.max(np.abs(rho0_vec[both_success] - rho0_legacy[both_success]))
-        vr_diff = np.max(np.abs(vr_vec[both_success] - vr_legacy[both_success]))
-        p_diff = np.max(np.abs(p_vec[both_success] - p_legacy[both_success]))
-
-        print(f"  Max rho0 difference: {rho0_diff:.2e}")
-        print(f"  Max vr difference: {vr_diff:.2e}")
-        print(f"  Max p difference: {p_diff:.2e}")
+        print(f"\n  Relative errors (successful points):")
+        print(f"    rho0: max={np.max(rho_err):.2e}, mean={np.mean(rho_err):.2e}")
+        print(f"    vr:   max={np.max(vr_err):.2e}, mean={np.mean(vr_err):.2e}")
+        print(f"    p:    max={np.max(p_err):.2e}, mean={np.mean(p_err):.2e}")
 
 # ============================================================================
-# STATISTICS ANALYSIS
+# ATMOSPHERE LIMIT TEST
 # ============================================================================
 
-def analyze_solver_statistics():
-    """Analyze solver internal statistics."""
-    print("=" * 60)
-    print("SOLVER STATISTICS ANALYSIS")
+def test_atmosphere_limits():
+    """Test how close to atmosphere floors the algorithm can handle."""
+    print("\n" + "=" * 60)
+    print("ATMOSPHERE LIMITS TEST")
     print("=" * 60)
 
     eos = IdealGasEOS(2.0)
-    solver = Cons2PrimSolver(eos)
+    atmosphere = AtmosphereParams()
+    solver = Cons2PrimSolver(eos, atmosphere, solver_method='newton')
 
-    # Reset statistics
-    solver.reset_statistics()
+    print(f"\nAtmosphere floors:")
+    print(f"  rho_floor = {atmosphere.rho_floor:.2e}")
+    print(f"  p_floor   = {atmosphere.p_floor:.2e}")
 
-    # Run various test cases
-    test_regimes = {
-        'normal': (lambda N: create_test_data_varied(N)[:3]),
-        'extreme': (lambda N: (
-            np.random.uniform(1e-10, 100, N),
-            np.random.uniform(-0.95, 0.95, N),
-            np.random.uniform(1e-15, 1000, N)
-        ))
-    }
+    # Test density sweep (fixed moderate pressure and low velocity)
+    print("\n--- DENSITY SWEEP (p=0.01, vr=0.1) ---")
+    rho_values = [1e-3, 1e-5, 1e-7, 1e-9, 1e-10, 1e-11, 5e-12, 2e-12, 1e-12, 5e-13]
+    p_fixed = 0.01
+    vr_fixed = 0.1
 
-    for regime_name, data_func in test_regimes.items():
-        print(f"\nTesting {regime_name} regime:")
+    for rho in rho_values:
+        geom = GeometryState.minkowski(1)
+        D, Sr, tau = prim_to_cons(np.array([rho]), np.array([vr_fixed]),
+                                   np.array([p_fixed]), geom, eos)
 
-        N = 1000
-        rho0, vr, p = data_func(N)
-        gamma_rr = np.ones(N)
-        D, Sr, tau = prim_to_cons(rho0, vr, p, gamma_rr, eos)
-
-        start_time = time.time()
-        rho0_result, vr_result, p_result, eps_result, W_result, h_result, success = solver.convert(
-            D, Sr, tau, gamma_rr
+        rho_rec, vr_rec, p_rec, _, _, _, success, _, _, _ = solver.convert(
+            D, Sr, tau, geom, p_guess=np.array([p_fixed])
         )
-        elapsed = time.time() - start_time
 
-        stats = solver.get_statistics()
+        rel_err_rho = abs(rho - rho_rec[0]) / rho if rho > 0 else 0
+        status = "OK" if success[0] and rel_err_rho < 0.01 else "FLOOR" if success[0] else "FAIL"
 
-        print(f"  Time: {elapsed:.4f} s")
-        print(f"  Success rate: {stats['success_rate']:.3f}")
-        print(f"  Newton success rate: {stats['newton_rate']:.3f}")
-        print(f"  Total calls: {stats['total_calls']}")
+        print(f"  rho={rho:.1e}: rec={rho_rec[0]:.2e}, err={rel_err_rho:.2e} [{status}]")
 
-        solver.reset_statistics()
+    # Test pressure sweep with diagnostics
+    print("\n--- PRESSURE SWEEP WITH DIAGNOSTICS (rho=0.01, vr=0.1) ---")
+    p_values = [1e-3, 1e-5, 1e-6, 1e-7, 1e-8]
+    rho_fixed = 0.01
+    vr_fixed = 0.1
+    gamma = 2.0  # EOS gamma
+
+    for p in p_values:
+        geom = GeometryState.minkowski(1)
+        D, Sr, tau = prim_to_cons(np.array([rho_fixed]), np.array([vr_fixed]),
+                                   np.array([p]), geom, eos)
+
+        # Compute expected values analytically
+        v2 = vr_fixed**2
+        W_expected = 1.0 / np.sqrt(1.0 - v2)
+        eps_expected = p / (rho_fixed * (gamma - 1))
+        h_expected = 1.0 + eps_expected + p / rho_fixed
+        cs2_expected = p * gamma * (gamma - 1) / (p * gamma + rho_fixed * (gamma - 1))
+
+        # Show diagnostic info
+        print(f"\n  p={p:.1e}:")
+        print(f"    D={D[0]:.3e}, Sr={Sr[0]:.3e}, tau={tau[0]:.3e}")
+        print(f"    Expected: eps={eps_expected:.3e}, h={h_expected:.6f}, cs2={cs2_expected:.3e}")
+        print(f"    Check h>1: h-1 = {h_expected - 1:.3e}")
+
+        rho_rec, vr_rec, p_rec, eps_rec, W_rec, h_rec, success, _, _, _ = solver.convert(
+            D, Sr, tau, geom, p_guess=np.array([p])
+        )
+
+        rel_err_p = abs(p - p_rec[0]) / p if p > 0 else 0
+        status = "OK" if success[0] and rel_err_p < 0.01 else "FLOOR" if success[0] else "FAIL"
+
+        print(f"    Recovered: p={p_rec[0]:.2e}, eps={eps_rec[0]:.3e}, h={h_rec[0]:.6f} [{status}]")
+
+    # Test both low (approaching atmosphere)
+    print("\n--- BOTH LOW (rho and p decreasing together) ---")
+    factors = [1e0, 1e1, 1e2, 1e3, 1e4, 1e5, 1e6, 1e7, 1e8, 1e9, 1e10]
+
+    for factor in factors:
+        rho = atmosphere.rho_floor * factor
+        # For ideal gas with gamma=2: p ~ rho * eps, use p ~ rho^2 scaling
+        p = atmosphere.p_floor * factor**2
+
+        geom = GeometryState.minkowski(1)
+        D, Sr, tau = prim_to_cons(np.array([rho]), np.array([0.0]),
+                                   np.array([p]), geom, eos)
+
+        rho_rec, vr_rec, p_rec, _, _, _, success, _, _, _ = solver.convert(
+            D, Sr, tau, geom, p_guess=np.array([p])
+        )
+
+        rel_err_rho = abs(rho - rho_rec[0]) / rho if rho > 0 else 0
+        rel_err_p = abs(p - p_rec[0]) / p if p > 0 else 0
+        status = "OK" if success[0] and rel_err_rho < 0.01 and rel_err_p < 0.01 else "FLOOR" if success[0] else "FAIL"
+
+        print(f"  {factor:.0e}x floor: rho={rho:.1e}, p={p:.1e} -> err_rho={rel_err_rho:.2e}, err_p={rel_err_p:.2e} [{status}]")
+
 
 # ============================================================================
 # MAIN TEST RUNNER
@@ -416,39 +342,20 @@ def analyze_solver_statistics():
 
 def run_all_tests():
     """Run the complete test suite."""
-    print("COMPREHENSIVE CONS2PRIM TEST SUITE")
+    print("CONS2PRIM ROBUSTNESS TEST SUITE")
     print("=" * 60)
-    print("Testing vectorized cons2prim implementation")
-    print("This replaces all individual test/debug/analyze scripts")
     print()
 
-    start_time = time.time()
-
     try:
-        # Core functionality tests
-        test_correctness()
+        # Atmosphere limits test (main focus)
+        test_atmosphere_limits()
 
-        # Performance testing
-        benchmark_performance()
-
-        # Failure analysis
-        analyze_failures()
-
-        # Comparison testing
-        compare_vectorized_vs_legacy()
-
-        # Statistics analysis
-        analyze_solver_statistics()
-
-        total_time = time.time() - start_time
-
-        print("=" * 60)
-        print("ALL TESTS COMPLETED SUCCESSFULLY!")
-        print(f"Total test time: {total_time:.2f} seconds")
+        print("\n" + "=" * 60)
+        print("ALL TESTS COMPLETED!")
         print("=" * 60)
 
     except Exception as e:
-        print(f"\n❌ TEST FAILED: {str(e)}")
+        print(f"\nTEST FAILED: {str(e)}")
         traceback.print_exc()
 
 if __name__ == "__main__":

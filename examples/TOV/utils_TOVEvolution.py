@@ -9,12 +9,18 @@ This module contains utilities for TOV evolution simulations:
 
 import numpy as np
 import os
+import sys
 import matplotlib.pyplot as plt
 from scipy.integrate import cumulative_trapezoid, simpson, trapezoid
 from scipy.interpolate import interp1d
 import h5py
 import json
 from datetime import datetime
+
+# Add repository root to path to import source modules
+script_dir = os.path.dirname(os.path.abspath(__file__))
+repo_root = os.path.dirname(os.path.dirname(script_dir))  # Go up two levels: TOV -> examples -> repo_root
+sys.path.insert(0, repo_root)
 
 # Import required BSSN and Hydro components
 from source.bssn.bssnvars import BSSNVars
@@ -118,13 +124,19 @@ class SimulationDataManager:
             'rho_central': [],
             'v_central': [],
             'p_central': [],
+            'baryon_mass': [],
             'max_rho_error': [],
             'max_p_error': [],
             'l1_rho_error': [],
             'l2_rho_error': [],
             'max_D': [],
             'max_Sr': [],
-            'max_tau': []
+            'max_tau': [],
+            # Constraint violations
+            'max_Ham': [],
+            'l2_Ham': [],
+            'max_Mom_r': [],
+            'l2_Mom_r': []
         }
 
         # Initialize HDF5 files
@@ -202,8 +214,9 @@ class SimulationDataManager:
         with open(self.metadata_file, 'w') as f:
             json.dump(metadata, f, indent=2)
 
-    def save_snapshot(self, step, time, state_2d, rho0=None, vr=None, p=None, eps=None, W=None, h=None):
-        """Save full domain snapshot."""
+    def save_snapshot(self, step, time, state_2d, rho0=None, vr=None, p=None, eps=None, W=None, h=None,
+                     Ham=None, Mom=None):
+        """Save full domain snapshot with optional constraints."""
         if not self.enable_saving:
             return
 
@@ -247,9 +260,18 @@ class SimulationDataManager:
                 prim_group['vr'] = vr
                 prim_group['W'] = W
 
+            # Save constraints if provided
+            if Ham is not None and Mom is not None:
+                const_group = snap_group.create_group('constraints')
+                const_group['Ham'] = Ham
+                const_group['Mom_r'] = Mom[:, 0]  # Radial component
+                const_group['Mom_theta'] = Mom[:, 1]
+                const_group['Mom_phi'] = Mom[:, 2]
+
     def add_evolution_point(self, step, time, state_2d, rho0, vr, p, eps, W, h, success,
-                           rho0_ref, vr_ref, p_ref, eps_ref, W_ref, h_ref, success_ref):
-        """Add a point to the evolution time series."""
+                           rho0_ref, vr_ref, p_ref, eps_ref, W_ref, h_ref, success_ref,
+                           Ham=None, Mom=None):
+        """Add a point to the evolution time series with optional constraints."""
         if not self.enable_saving:
             return
 
@@ -271,12 +293,16 @@ class SimulationDataManager:
             l1_rho = 0.0
             l2_rho = 0.0
 
+        # Compute baryon mass
+        M_b = compute_baryon_mass(self.grid, state_2d, rho0, vr, p, eps, W, h)
+
         # Store in buffer
         self.evolution_buffer['step'].append(step)
         self.evolution_buffer['time'].append(time)
         self.evolution_buffer['rho_central'].append(rho0[NUM_GHOSTS])
         self.evolution_buffer['v_central'].append(vr[NUM_GHOSTS])
         self.evolution_buffer['p_central'].append(p[NUM_GHOSTS])
+        self.evolution_buffer['baryon_mass'].append(M_b)
         self.evolution_buffer['max_rho_error'].append(np.max(rel_delta_rho))
         self.evolution_buffer['max_p_error'].append(np.max(rel_delta_p))
         self.evolution_buffer['l1_rho_error'].append(l1_rho)
@@ -284,6 +310,18 @@ class SimulationDataManager:
         self.evolution_buffer['max_D'].append(np.max(state_2d[self.hydro.idx_D, :]))
         self.evolution_buffer['max_Sr'].append(np.max(np.abs(state_2d[self.hydro.idx_Sr, :])))
         self.evolution_buffer['max_tau'].append(np.max(state_2d[self.hydro.idx_tau, :]))
+
+        # Store constraint violations if provided
+        if Ham is not None and Mom is not None:
+            self.evolution_buffer['max_Ham'].append(np.max(np.abs(Ham[interior])))
+            self.evolution_buffer['l2_Ham'].append(np.sqrt(np.mean(Ham[interior]**2)))
+            self.evolution_buffer['max_Mom_r'].append(np.max(np.abs(Mom[interior, 0])))
+            self.evolution_buffer['l2_Mom_r'].append(np.sqrt(np.mean(Mom[interior, 0]**2)))
+        else:
+            self.evolution_buffer['max_Ham'].append(0.0)
+            self.evolution_buffer['l2_Ham'].append(0.0)
+            self.evolution_buffer['max_Mom_r'].append(0.0)
+            self.evolution_buffer['l2_Mom_r'].append(0.0)
 
     def flush_evolution_buffer(self):
         """Write buffered evolution data to HDF5 file."""
@@ -302,16 +340,54 @@ class SimulationDataManager:
         for key in self.evolution_buffer:
             self.evolution_buffer[key] = []
 
-    def finalize(self):
-        """Finalize data storage (flush buffers, close files)."""
+    def finalize(self, execution_time_seconds=None):
+        """Finalize data storage (flush buffers, close files).
+
+        Args:
+            execution_time_seconds: Total execution time in seconds (optional)
+        """
         if not self.enable_saving:
             return
 
         self.flush_evolution_buffer()
+
+        # Update metadata with execution time if provided
+        if execution_time_seconds is not None:
+            self._update_execution_time(execution_time_seconds)
+
         print(f"\nData saved to:")
         print(f"  - Snapshots: {self.snapshot_file}")
         print(f"  - Evolution: {self.evolution_file}")
         print(f"  - Metadata:  {self.metadata_file}")
+
+    def _update_execution_time(self, execution_time_seconds):
+        """Update metadata file with execution time.
+
+        Args:
+            execution_time_seconds: Total execution time in seconds
+        """
+        if not os.path.exists(self.metadata_file):
+            return
+
+        with open(self.metadata_file, 'r') as f:
+            metadata = json.load(f)
+
+        # Add execution time info
+        metadata['simulation']['execution_time_seconds'] = float(execution_time_seconds)
+
+        # Format as human-readable string
+        hours, remainder = divmod(execution_time_seconds, 3600)
+        minutes, seconds = divmod(remainder, 60)
+        if hours > 0:
+            time_str = f"{int(hours)}h {int(minutes)}m {seconds:.1f}s"
+        elif minutes > 0:
+            time_str = f"{int(minutes)}m {seconds:.1f}s"
+        else:
+            time_str = f"{seconds:.2f}s"
+        metadata['simulation']['execution_time_formatted'] = time_str
+
+        with open(self.metadata_file, 'w') as f:
+            json.dump(metadata, f, indent=2)
 
 
 # =============================================================================
@@ -401,10 +477,15 @@ def evolve_fixed_timestep(state_initial, dt, num_steps, grid, background, hydro,
 
     # Save initial snapshot if data manager provided
     if data_manager and data_manager.enable_saving:
-        data_manager.save_snapshot(step_offset, t_start, state_initial, rho0_initial, vr_initial, p_initial, eps_initial, W_initial, h_initial)
+        # Compute constraints at initial state
+        Ham_0, Mom_0 = compute_constraints(state_initial, grid, background, hydro)
+
+        data_manager.save_snapshot(step_offset, t_start, state_initial, rho0_initial, vr_initial, p_initial, eps_initial, W_initial, h_initial,
+                                   Ham=Ham_0, Mom=Mom_0)
         data_manager.add_evolution_point(step_offset, t_start, state_initial,
                                         rho0_initial, vr_initial, p_initial, eps_initial, W_initial, h_initial, success_initial,
-                                        rho0_initial, vr_initial, p_initial, eps_initial, W_initial, h_initial, success_initial)
+                                        rho0_initial, vr_initial, p_initial, eps_initial, W_initial, h_initial, success_initial,
+                                        Ham=Ham_0, Mom=Mom_0)
 
     # Timeseries for mass, central density, and central velocity
     times_series = [t_start]
@@ -476,18 +557,26 @@ def evolve_fixed_timestep(state_initial, dt, num_steps, grid, background, hydro,
 
         t_curr = t_start + (step + 1) * dt
         step_num = step_offset + step + 1
-        if step_num % 200 == 0:
+        if step_num % 100 == 0:
             print(f"step {step_num:4d}  t={t_curr:.2e}:  ρ_c={rho_central:.6e}  max_Δρ/ρ={max_rel_rho_err:.2e}@r={r_max_rho_err:.2f}  "
               f"max_vʳ={max_abs_v:.3e}@r={r_max_v:.2f}  max_Sʳ={max_Sr:.2e}@r={r_max_Sr:.2f}  "
               f"c2p_fail={c2p_fail_count}")
 
         # Save data if requested
         if data_manager and data_manager.enable_saving:
+            # Compute constraints for this timestep (expensive, only when saving)
+            Ham, Mom = None, None
+            if evolution_interval and (step_num % evolution_interval == 0):
+                Ham, Mom = compute_constraints(s_next, grid, background, hydro)
+            if snapshot_interval and (step_num % snapshot_interval == 0) and (Ham is None):
+                Ham, Mom = compute_constraints(s_next, grid, background, hydro)
+
             # Save evolution data at specified interval
             if evolution_interval and step_num % evolution_interval == 0:
                 data_manager.add_evolution_point(step_num, t_curr, s_next,
                                                 rho0_next, vr_next, p_next, eps_next, W_next, h_next, success_next,
-                                                rho0_initial, vr_initial, p_initial, eps_initial, W_initial, h_initial, success_initial)
+                                                rho0_initial, vr_initial, p_initial, eps_initial, W_initial, h_initial, success_initial,
+                                                Ham=Ham, Mom=Mom)
 
                 # Periodic buffer flush
                 if step_num % (evolution_interval * 10) == 0:
@@ -495,7 +584,8 @@ def evolve_fixed_timestep(state_initial, dt, num_steps, grid, background, hydro,
 
             # Save full snapshot at specified interval
             if snapshot_interval and step_num % snapshot_interval == 0:
-                data_manager.save_snapshot(step_num, t_curr, s_next, rho0_next, vr_next, p_next, eps_next, W_next, h_next)
+                data_manager.save_snapshot(step_num, t_curr, s_next, rho0_next, vr_next, p_next, eps_next, W_next, h_next,
+                                          Ham=Ham, Mom=Mom)
 
         # Append to time series (mass, central density, and central velocity)
         Mb_next = compute_baryon_mass(grid, s_next, rho0_next, vr_next, p_next, eps_next, W_next, h_next)
@@ -1200,6 +1290,105 @@ def compute_baryon_mass(grid, state, rho0, vr, p, eps, W, h):
     psi = np.exp(phi)
     integrand = rho0_int * W_int * (psi**6) * (r**2)
     return 4.0 * np.pi * simpson(integrand, x=r)
+
+
+def compute_constraints(state_2d, grid, background, matter):
+    """Compute Hamiltonian and Momentum constraints using constraintsdiagnostic.py.
+
+    Args:
+        state_2d: State array (NUM_VARS x N)
+        grid: Grid object
+        background: Background object
+        matter: Matter object (hydro)
+
+    Returns:
+        tuple: (Ham, Mom) where
+            - Ham: Hamiltonian constraint array (N,)
+            - Mom: Momentum constraint array (N, 3)
+    """
+    from source.bssn.constraintsdiagnostic import get_constraints_diagnostic
+
+    # Reshape state to what get_constraints_diagnostic expects
+    state_flat = state_2d.flatten()
+
+    # Calculate constraints (returns arrays with shape (1, N) and (1, N, 3))
+    Ham, Mom = get_constraints_diagnostic(state_flat, 0.0, grid, background, matter)
+
+    # Return squeezed arrays (N,) and (N, 3)
+    return Ham[0, :], Mom[0, :, :]
+
+
+def plot_constraints_evolution(output_dir, suffix=""):
+    """Plot constraint violations evolution from saved HDF5 data.
+
+    Reads from tov_evolution{suffix}.h5 and creates plots showing:
+    - max(|H|) and L2(H) vs time
+    - max(|M_r|) and L2(M_r) vs time
+
+    Args:
+        output_dir: Directory containing the evolution file
+        suffix: Suffix for the evolution file (e.g., "_dyn")
+    """
+    evolution_file = os.path.join(output_dir, f'tov_evolution{suffix}.h5')
+
+    if not os.path.exists(evolution_file):
+        print(f"\n⚠️  Warning: Evolution file not found: {evolution_file}")
+        print(f"   Cannot plot constraints. Make sure to run evolution with data saving enabled.")
+        return
+
+    # Read constraint data
+    with h5py.File(evolution_file, 'r') as f:
+        # Check if constraint data exists
+        if 'max_Ham' not in f:
+            print(f"\n⚠️  Warning: No constraint data found in {evolution_file}")
+            print(f"   This evolution was run before constraint monitoring was added.")
+            print(f"   Re-run the evolution to generate constraint data.")
+            return
+
+        times = np.array(f['time'])
+        max_Ham = np.array(f['max_Ham'])
+        l2_Ham = np.array(f['l2_Ham'])
+        max_Mom_r = np.array(f['max_Mom_r'])
+        l2_Mom_r = np.array(f['l2_Mom_r'])
+
+    # Create figure
+    fig, axes = plt.subplots(2, 2, figsize=(14, 10))
+
+    # Hamiltonian constraint - max
+    axes[0, 0].semilogy(times, np.maximum(np.abs(max_Ham), 1e-20), 'r-', linewidth=1.5)
+    axes[0, 0].set_xlabel('t [M]')
+    axes[0, 0].set_ylabel(r'max$|$H$|$')
+    axes[0, 0].set_title('Hamiltonian Constraint: Maximum Violation')
+    axes[0, 0].grid(True, alpha=0.3)
+
+    # Hamiltonian constraint - L2
+    axes[0, 1].semilogy(times, np.maximum(l2_Ham, 1e-20), 'b-', linewidth=1.5)
+    axes[0, 1].set_xlabel('t [M]')
+    axes[0, 1].set_ylabel(r'L$_2$(H)')
+    axes[0, 1].set_title('Hamiltonian Constraint: L2 Norm')
+    axes[0, 1].grid(True, alpha=0.3)
+
+    # Momentum constraint - max
+    axes[1, 0].semilogy(times, np.maximum(np.abs(max_Mom_r), 1e-20), 'r-', linewidth=1.5)
+    axes[1, 0].set_xlabel('t [M]')
+    axes[1, 0].set_ylabel(r'max$|$M$_r|$')
+    axes[1, 0].set_title('Momentum Constraint (radial): Maximum Violation')
+    axes[1, 0].grid(True, alpha=0.3)
+
+    # Momentum constraint - L2
+    axes[1, 1].semilogy(times, np.maximum(l2_Mom_r, 1e-20), 'b-', linewidth=1.5)
+    axes[1, 1].set_xlabel('t [M]')
+    axes[1, 1].set_ylabel(r'L$_2$(M$_r$)')
+    axes[1, 1].set_title('Momentum Constraint (radial): L2 Norm')
+    axes[1, 1].grid(True, alpha=0.3)
+
+    plt.suptitle(f'BSSN Constraint Violations Evolution', fontsize=14)
+    plt.tight_layout()
+
+    out_path = os.path.join(plots_dir, f'constraints_evolution{suffix}.png')
+    plt.savefig(out_path, dpi=150, bbox_inches='tight')
+    plt.close(fig)
+    print(f"Saved: {out_path}")
 
 
 def plot_tov_vs_initial_data_zoom(tov_solution, initial_state_2d, grid, primitives, window=0.5, suffix=""):

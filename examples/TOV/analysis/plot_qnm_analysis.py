@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
-Quasi-Normal Mode (QNM) Analysis for TOV Star Evolution - Version 3
+Quasi-Normal Mode (QNM) Analysis for TOV Star Evolution
 
-Detects ACTUAL peaks in the spectrum, then compares with theoretical values.
-Does NOT force peaks to be near theoretical frequencies.
+Detects actual peaks in the spectrum and compares with theoretical values.
+Reports mode, theoretical frequency, obtained frequency, and percentage error.
 """
 
 import numpy as np
@@ -17,12 +17,24 @@ import argparse
 M_SUN_SECONDS = 4.926e-6
 FREQ_CONVERSION = 1.0 / (M_SUN_SECONDS * 1e3)
 
-# Scaling factor: Valencia uses α in characteristic speeds, Font et al. does not
-# Measured ratio f_sim/f_Font ≈ 0.889 → scale by 1/0.889 to compare
-VALENCIA_TO_FONT_SCALE = 1.0 #/ 0.889  # ≈ 1.125
-
 # Analysis variable selection: 1 = rho_central (density), 2 = v_central (velocity)
 ANALYSIS_VAR = 1
+
+# Time to start analysis (in M_sun units) - data before this is discarded
+T_START = 0.0
+
+# =============================================================================
+# FOLDERS TO ANALYZE - Specify the exact folders you want to analyze
+# =============================================================================
+FOLDERS_TO_ANALYZE = [
+    '../tov_evolution_data_last3/tov_star_rhoc1p28em03_N400_K100_G2_cow_mp5',
+    '../tov_evolution_data_last3/tov_star_rhoc1p28em03_N800_K100_G2_cow_mp5',
+    '../tov_evolution_data_last3/tov_star_rhoc1p28em03_N1600_K100_G2_cow_mp5',
+    #'tov_evolution_data2/tov_star_rhoc1p28em03_N400_K100_G2_cow_w5',
+    #'tov_evolution_data2/tov_star_rhoc1p28em03_N600_K100_G2_cow_w5',
+    #'tov_evolution_data2/tov_star_rhoc1p28em03_N800_K100_G2_cow_w5',
+    #'tov_evolution_data2/tov_star_rhoc1p28em03_N1000_K100_G2_cow_w5'
+]
 
 # Theoretical frequencies (Font et al. 2002)
 FREQUENCIES_COWLING_KHZ = {
@@ -163,42 +175,42 @@ def compute_power_spectrum(t, signal_data, t_start=None, window='hann'):
     
     return freq_khz, power
 
-def find_all_peaks(freq_khz, power, min_freq=1.5, max_freq=14.0, max_peaks=8):
+def find_all_peaks(freq_khz, power, min_freq=1.0, max_freq=14.0, max_peaks=10):
     """Find the most significant peaks."""
     mask = (freq_khz >= min_freq) & (freq_khz <= max_freq)
     freq_sel = freq_khz[mask]
     power_sel = power[mask]
-    
+
     if len(power_sel) == 0:
         return np.array([]), np.array([])
-    
+
     # Use log power for better peak detection
     log_power = np.log10(power_sel + 1e-50)
     noise_floor = np.median(log_power)
-    
-    # Find peaks - balanced criteria
+
+    # Find peaks - very relaxed criteria to detect all visible peaks
     peaks, props = signal.find_peaks(
         log_power,
-        height=noise_floor + 2.0,  # ~100x above noise
-        prominence=0.7,            # Moderate prominence
-        distance=8                 # ~1 kHz minimum separation
+        height=noise_floor + 0.3,  # ~2x above noise (very relaxed)
+        prominence=0.08,           # Very low prominence threshold
+        distance=2                 # Minimum separation
     )
-    
+
     if len(peaks) == 0:
         return np.array([]), np.array([])
-    
+
     # Sort by power (descending) and keep only top N peaks
     sorted_idx = np.argsort(power_sel[peaks])[::-1]
     peaks = peaks[sorted_idx[:max_peaks]]
-    
+
     # Re-sort by frequency for display
     freq_order = np.argsort(freq_sel[peaks])
     peaks = peaks[freq_order]
-    
+
     return freq_sel[peaks], power_sel[peaks]
 
 def plot_qnm_v3(t, signal_data, freq_khz, power, peak_freqs, peak_powers,
-                theoretical_freqs, output_path=None, title=None, scale_factor=1.0, var_name='rho_central'):
+                theoretical_freqs, output_path=None, title=None, var_name='rho_central'):
     from mpl_toolkits.axes_grid1.inset_locator import inset_axes
 
     fig, axes = plt.subplots(1, 2, figsize=(14, 4))
@@ -245,11 +257,7 @@ def plot_qnm_v3(t, signal_data, freq_khz, power, peak_freqs, peak_powers,
     # Right: spectrum
     ax2 = axes[1]
 
-    # Scale the frequency axis by the factor
-    freq_khz_scaled = freq_khz * scale_factor
-    peak_freqs_scaled = peak_freqs * scale_factor
-
-    ax2.semilogy(freq_khz_scaled, power, color='#8B0000', linewidth=1.2)
+    ax2.semilogy(freq_khz, power, color='#8B0000', linewidth=1.2)
 
     # Theoretical lines (gray, dashed)
     for mode, f_theo in theoretical_freqs.items():
@@ -258,20 +266,19 @@ def plot_qnm_v3(t, signal_data, freq_khz, power, peak_freqs, peak_powers,
             ax2.text(f_theo, ax2.get_ylim()[1] if ax2.get_ylim()[1] > 0 else 1e-2,
                     mode, ha='center', va='bottom', fontsize=9, color='gray', alpha=0.7)
 
-    # Detected peaks (blue dots with SCALED frequency labels)
-    for f_scaled, p in zip(peak_freqs_scaled, peak_powers):
-        if f_scaled < 14:
-            ax2.plot(f_scaled, p, 'bo', markersize=8, markeredgecolor='darkblue',
+    # Detected peaks (blue dots with frequency labels)
+    for f, p in zip(peak_freqs, peak_powers):
+        if f < 14:
+            ax2.plot(f, p, 'bo', markersize=8, markeredgecolor='darkblue',
                     markeredgewidth=1.5, markerfacecolor='dodgerblue', zorder=5)
-            ax2.annotate(f'{f_scaled:.2f}', xy=(f_scaled, p), xytext=(0, 8),
+            ax2.annotate(f'{f:.3f}', xy=(f, p), xytext=(0, 8),
                         textcoords='offset points', ha='center', fontsize=8,
                         fontweight='bold', color='blue')
 
-    ax2.set_xlabel('Frequency [kHz] (scaled)' if scale_factor != 1.0 else 'Frequency [kHz]', fontsize=12)
+    ax2.set_xlabel('Frequency [kHz]', fontsize=12)
     ax2.set_ylabel('Power', fontsize=12)
     ax2.set_xlim(0, 14)
-    scale_text = f' (×{scale_factor:.3f})' if scale_factor != 1.0 else ''
-    ax2.set_title(f'Power Spectrum{scale_text}\n', fontsize=12)
+    ax2.set_title('Power Spectrum\n', fontsize=12)
     ax2.grid(True, linestyle=':', alpha=0.3)
     
     # Y limits
@@ -344,30 +351,188 @@ def analyze_and_plot(data, folder_name, plot_dir):
         # Density: use relative change
         delta_signal = (signal_data - signal_data[0]) / signal_data[0]
 
-    freq_khz, power = compute_power_spectrum(t, delta_signal, t_start=0.0)
+    freq_khz, power = compute_power_spectrum(t, delta_signal, t_start=T_START)
     peak_freqs, peak_powers = find_all_peaks(freq_khz, power)
 
-    print(f"\nDETECTED PEAKS (with Valencia→Font scaling = {VALENCIA_TO_FONT_SCALE:.3f}):")
-    theo = list(FREQUENCIES_COWLING_KHZ.values())
-    theo_names = list(FREQUENCIES_COWLING_KHZ.keys())
+    print(f"\nDETECTED PEAKS:")
 
-    print(f"\n{'#':<4} {'Raw [kHz]':<12} {'Scaled [kHz]':<14} {'Mode':<8} {'Theo [kHz]':<12} {'Ratio':<10}")
-    print("-"*70)
-    for i, (f, p) in enumerate(sorted(zip(peak_freqs, peak_powers), key=lambda x: x[0])):
-        f_scaled = f * VALENCIA_TO_FONT_SCALE
-        closest_idx = np.argmin(np.abs(np.array(theo) - f_scaled))
-        ratio = f_scaled / theo[closest_idx]
-        print(f"{i+1:<4} {f:<12.3f} {f_scaled:<14.3f} {theo_names[closest_idx]:<8} {theo[closest_idx]:<12.3f} {ratio:<10.3f}")
+    # Match each theoretical mode with the closest detected peak (if any)
+    print(f"\n{'Mode':<8} {'Theo [kHz]':<12} {'Obtained [kHz]':<15} {'yerror [%]':<12}")
+    print("-"*50)
 
-    if len(peak_freqs) >= 2:
-        scaled_freqs = np.array(sorted(peak_freqs)) * VALENCIA_TO_FONT_SCALE
-        ratios = [f/theo[i] for i, f in enumerate(scaled_freqs[:min(4, len(theo))])]
-        print(f"\nAfter scaling: Average ratio = {np.mean(ratios):.3f} (difference from Font: {(np.mean(ratios)-1)*100:.1f}%)")
+    for mode, f_theo in FREQUENCIES_COWLING_KHZ.items():
+        if len(peak_freqs) == 0:
+            # No peaks detected
+            print(f"{mode:<8} {f_theo:<12.3f} {'N/A':<15} {'N/A':<12}")
+        else:
+            # Find closest detected peak to this theoretical frequency
+            distances = np.abs(peak_freqs - f_theo)
+            closest_idx = np.argmin(distances)
+            closest_freq = peak_freqs[closest_idx]
+
+            # Only match if the peak is within a reasonable range (e.g., ±15% of theoretical)
+            tolerance = 0.15 * f_theo
+            if distances[closest_idx] <= tolerance:
+                yerror = 100.0 * (closest_freq - f_theo) / f_theo
+                print(f"{mode:<8} {f_theo:<12.3f} {closest_freq:<15.3f} {yerror:<12.2f}")
+            else:
+                print(f"{mode:<8} {f_theo:<12.3f} {'N/A':<15} {'N/A':<12}")
 
     output_path = os.path.join(plot_dir, f'qnm_{folder_name}_{var_name}.png')
     plot_qnm_v3(t, signal_data, freq_khz, power, peak_freqs, peak_powers,
                FREQUENCIES_COWLING_KHZ, output_path, title=f"{folder_name} ({var_name})",
-               scale_factor=VALENCIA_TO_FONT_SCALE, var_name=var_name)
+               var_name=var_name)
+
+    # Return analysis results for comparison table
+    return {
+        'output_path': output_path,
+        'peak_freqs': peak_freqs,
+        'peak_powers': peak_powers,
+        'folder_name': folder_name
+    }
+
+
+def extract_resolution_from_name(folder_name):
+    """Extract resolution number from folder name (e.g., 'N100', 'Nr200', 'N=400')."""
+    import re
+    match = re.search(r'[Nn]r?[=_]?(\d+)', folder_name)
+    if match:
+        return int(match.group(1))
+    return None
+
+
+def create_comparison_table(results_list, plot_dir, var_name='rho_central'):
+    """
+    Create a comparison table for the first 3 peaks across different resolutions.
+
+    Args:
+        results_list: List of dictionaries with 'folder_name', 'peak_freqs', 'peak_powers'
+        plot_dir: Directory to save the plot
+        var_name: Variable name for filename
+
+    Returns:
+        Path to the saved plot
+    """
+    # Sort results by resolution
+    sorted_results = []
+    for result in results_list:
+        res = extract_resolution_from_name(result['folder_name'])
+        if res is not None:
+            sorted_results.append((res, result))
+
+    if len(sorted_results) < 2:
+        print("\nSkipping comparison table (need at least 2 resolutions)")
+        return None
+
+    sorted_results.sort(key=lambda x: x[0])  # Sort by resolution number
+
+    # Match top 3 peaks for each resolution to theoretical modes
+    mode_list = list(FREQUENCIES_COWLING_KHZ.keys())
+    theo_freqs = list(FREQUENCIES_COWLING_KHZ.values())
+
+    # Build comparison data: dict[mode] -> list of (resolution, freq)
+    comparison = {mode: {} for mode in mode_list}
+
+    for res, result in sorted_results:
+        peak_freqs = result['peak_freqs']
+        peak_powers = result['peak_powers']
+
+        if len(peak_freqs) == 0:
+            continue
+
+        # Get top 3 peaks by power
+        if len(peak_freqs) > 3:
+            # Sort by power to get top 3
+            power_idx = np.argsort(peak_powers)[::-1][:3]
+            top3_freqs = peak_freqs[power_idx]
+        else:
+            top3_freqs = peak_freqs
+
+        # Match each peak to closest theoretical mode
+        for peak_freq in top3_freqs:
+            # Find closest theoretical frequency
+            distances = [abs(peak_freq - f_theo) for f_theo in theo_freqs]
+            min_idx = np.argmin(distances)
+            closest_mode = mode_list[min_idx]
+            closest_theo = theo_freqs[min_idx]
+
+            # Only match if within ±15% tolerance
+            tolerance = 0.15 * closest_theo
+            if distances[min_idx] <= tolerance:
+                comparison[closest_mode][res] = peak_freq
+
+    # Filter modes that have at least one detection
+    active_modes = [mode for mode in mode_list if len(comparison[mode]) > 0]
+
+    if len(active_modes) == 0:
+        print("\nNo matched modes found for comparison table")
+        return None
+
+    # Create the plot
+    fig, ax = plt.subplots(figsize=(12, len(active_modes) * 0.6 + 2))
+    ax.axis('off')
+
+    # Build table data
+    resolutions = [res for res, _ in sorted_results]
+
+    # Header
+    header = ['Mode', 'Theo [kHz]'] + [f'Nr={res}' for res in resolutions] + ['yerror [%]']
+
+    # Rows
+    table_data = []
+    for mode in active_modes:
+        f_theo = FREQUENCIES_COWLING_KHZ[mode]
+        row = [mode, f'{f_theo:.3f}']
+
+        # Add obtained frequencies for each resolution
+        last_freq = None
+        for res in resolutions:
+            if res in comparison[mode]:
+                freq = comparison[mode][res]
+                row.append(f'{freq:.3f}')
+                last_freq = freq
+            else:
+                row.append('N/A')
+
+        # Calculate yerror from last available frequency
+        if last_freq is not None:
+            yerror = 100.0 * (last_freq - f_theo) / f_theo
+            row.append(f'{yerror:.2f}')
+        else:
+            row.append('N/A')
+
+        table_data.append(row)
+
+    # Create table
+    table = ax.table(cellText=table_data, colLabels=header,
+                     cellLoc='center', loc='center',
+                     colWidths=[0.08, 0.12] + [0.12] * len(resolutions) + [0.12])
+
+    table.auto_set_font_size(False)
+    table.set_fontsize(10)
+    table.scale(1, 2.5)
+
+    # Style header - bold only, no colors
+    for i in range(len(header)):
+        cell = table[(0, i)]
+        cell.set_text_props(weight='bold')
+
+    # Style rows - no colors, just highlight N/A
+    for i in range(len(table_data)):
+        for j in range(len(header)):
+            cell = table[(i + 1, j)]
+            # Highlight N/A cells
+            if table_data[i][j] == 'N/A':
+                cell.set_text_props(style='italic', color='gray')
+
+    plt.title('QNM Frequency Comparison Across Resolutions',
+              fontsize=14, fontweight='bold', pad=20)
+
+    output_path = os.path.join(plot_dir, f'qnm_comparison_table_{var_name}.png')
+    plt.savefig(output_path, dpi=150, bbox_inches='tight')
+    plt.close(fig)
+    print(f"\nSaved comparison table: {output_path}")
+
     return output_path
 
 
@@ -377,42 +542,38 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog='''
 Examples:
-  python plot_qnm_analysis.py                          # Use default folder, all data points
-  python plot_qnm_analysis.py --delta-t 1             # Subsample to t=0,1,2,3,...
-  python plot_qnm_analysis.py --data-dir tov_evolution_data  # Use different data folder
-  python plot_qnm_analysis.py --delta-t 1 --data-dir tov_evolution_data
+  python plot_qnm_analysis.py                # Use all data points
+  python plot_qnm_analysis.py --delta-t 1    # Subsample to t=0,1,2,3,...
+
+Configure the folders to analyze by editing FOLDERS_TO_ANALYZE at the top of this script.
 '''
     )
     parser.add_argument('--delta-t', type=float, default=None,
                         help='Time interval for subsampling (e.g., 1 for t=0,1,2,...). Default: None (use all data)')
-    parser.add_argument('--data-dir', type=str, default='tov_evolution_data',
-                        help='Data directory name (relative to script). Default: tov_evolution_data')
     args = parser.parse_args()
 
     script_dir = os.path.dirname(os.path.abspath(__file__))
-    data_dir = os.path.join(script_dir, args.data_dir)
     plot_dir = os.path.join(script_dir, "plots")
     os.makedirs(plot_dir, exist_ok=True)
 
-    if not os.path.exists(data_dir):
-        print(f"Data directory not found: {data_dir}")
-        return
-
-    # Find all data folders
+    # Use folders from FOLDERS_TO_ANALYZE list
     data_folders = []
-    for item in sorted(os.listdir(data_dir)):
-        item_path = os.path.join(data_dir, item)
-        if os.path.isdir(item_path):
-            data_folders.append((item, item_path))
+    for folder_rel_path in FOLDERS_TO_ANALYZE:
+        folder_path = os.path.join(script_dir, folder_rel_path)
+        if os.path.exists(folder_path):
+            folder_name = os.path.basename(folder_path)
+            data_folders.append((folder_name, folder_path))
+        else:
+            print(f"Warning: Folder not found: {folder_path}")
 
     if not data_folders:
-        print(f"No data folders found in {data_dir}")
+        print("No valid folders found in FOLDERS_TO_ANALYZE")
+        print("Edit FOLDERS_TO_ANALYZE at the top of this script to specify folders to analyze.")
         return
 
-    print(f"Data directory: {args.data_dir}")
-    print(f"Found {len(data_folders)} data folder(s):")
-    for name, _ in data_folders:
-        print(f"  - {name}")
+    print(f"Analyzing {len(data_folders)} folder(s):")
+    for name, path in data_folders:
+        print(f"  - {name} ({path})")
 
     delta_t = args.delta_t
     if delta_t is not None:
@@ -423,20 +584,29 @@ Examples:
     var_name = "rho_central" if ANALYSIS_VAR == 1 else "v_central"
     print(f"Analysis variable: {var_name} (ANALYSIS_VAR = {ANALYSIS_VAR})")
 
-    generated_plots = []
+    results_list = []
     for folder_name, folder_path in data_folders:
         data = load_data_from_folder(folder_path, delta_t=delta_t, var=ANALYSIS_VAR)
         if data is not None:
-            output_path = analyze_and_plot(data, folder_name, plot_dir)
-            generated_plots.append(output_path)
+            result = analyze_and_plot(data, folder_name, plot_dir)
+            results_list.append(result)
         else:
             print(f"\nNo data found in: {folder_name}")
 
+    # Create comparison table if multiple resolutions are available
+    comparison_table_path = None
+    if len(results_list) >= 2:
+        comparison_table_path = create_comparison_table(results_list, plot_dir, var_name)
+
     print(f"\n{'='*70}")
-    print(f"SUMMARY: Generated {len(generated_plots)} plot(s)")
+    print(f"SUMMARY: Generated {len(results_list)} plot(s)")
     print(f"{'='*70}")
-    for p in generated_plots:
-        print(f"  - {p}")
+    for result in results_list:
+        print(f"  - {result['output_path']}")
+
+    if comparison_table_path:
+        print(f"\nComparison table:")
+        print(f"  - {comparison_table_path}")
 
     plt.show()
 

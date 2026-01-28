@@ -7,7 +7,7 @@ Fully optimized with Numba JIT compilation for CPU performance.
 """
 
 import numpy as np
-from numba import jit
+from numba import jit, prange
 from .valencia_reference_metric import ValenciaReferenceMetric
 from .geometry import (
     GeometryState,
@@ -21,16 +21,10 @@ from .geometry import (
 # JIT-COMPILED KERNELS
 # ==============================================================================
 
-@jit(nopython=True, cache=True, fastmath=True)
+@jit(nopython=True, cache=True, fastmath=True, parallel=True)
 def find_cp_cm_kernel(flux_dirn, g4UU, u4U, cs2):
     """
     JIT-compiled kernel to compute characteristic speeds c+/c- using quadratic method.
-
-    Args:
-        flux_dirn: Flux direction (0 for radial)
-        g4UU: (M, 4, 4) inverse 4-metric
-        u4U: (M, 4) contravariant 4-velocity
-        cs2: (M,) sound speed squared
 
     Returns:
         (cminus, cplus): Tuple of (M,) arrays
@@ -41,7 +35,7 @@ def find_cp_cm_kernel(flux_dirn, g4UU, u4U, cs2):
     cminus = np.empty(M)
     cplus = np.empty(M)
 
-    for m in range(M):
+    for m in prange(M):
         v02 = cs2[m]
         one_minus_cs2 = 1.0 - v02
 
@@ -79,11 +73,6 @@ def entropy_fix_kernel(lam_minus, lam_plus, delta=1e-8):
     """
     JIT-compiled entropy fix to avoid sonic glitches.
 
-    Args:
-        lam_minus: (M,) left wave speeds
-        lam_plus: (M,) right wave speeds
-        delta: Minimum separation from zero
-
     Returns:
         (lam_minus_fixed, lam_plus_fixed): Tuple of (M,) arrays
     """
@@ -106,22 +95,17 @@ def entropy_fix_kernel(lam_minus, lam_plus, delta=1e-8):
     return lm_out, lp_out
 
 
-@jit(nopython=True, cache=True, fastmath=True)
-def physical_flux_1d_kernel(rho0, vr, pressure, W, h, alpha, e6phi, gamma_rr):
+@jit(nopython=True, cache=True, fastmath=True, parallel=True)
+def physical_flux_1d_kernel(rho0, vr, pressure, W, h, alpha, e6phi, gamma_rr, beta_r):
     """
     JIT-compiled kernel to compute physical flux for 1D radial direction.
 
-    Inlines the Valencia flux computation for better performance.
+    Implements Valencia flux formulas with full shift support:
+        vtilde^r = v^r - β^r/α
+        F̃_D^r   = e^{6φ} α D vtilde^r
+        F̃_Sr^r  = e^{6φ} α T^r_r
+        F̃_τ^r   = e^{6φ} (α² T^{0r} - α D vtilde^r)
 
-    Args:
-        rho0: (M,) rest-mass density
-        vr: (M,) radial velocity
-        pressure: (M,) pressure
-        W: (M,) Lorentz factor
-        h: (M,) specific enthalpy
-        alpha: (M,) lapse
-        e6phi: (M,) conformal factor e^{6phi}
-        gamma_rr: (M,) radial metric component
 
     Returns:
         F: (M, 3) physical flux [F_D, F_Sr, F_tau]
@@ -129,11 +113,12 @@ def physical_flux_1d_kernel(rho0, vr, pressure, W, h, alpha, e6phi, gamma_rr):
     M = rho0.shape[0]
     F = np.empty((M, 3))
 
-    for m in range(M):
+    for m in prange(M):
         # Metric components
         alph = alpha[m]
         e6p = e6phi[m]
         grr = gamma_rr[m]
+        betar = beta_r[m]
 
         # Fluid quantities
         rho = rho0[m]
@@ -142,56 +127,68 @@ def physical_flux_1d_kernel(rho0, vr, pressure, W, h, alpha, e6phi, gamma_rr):
         Wm = W[m]
         hm = h[m]
 
-        # For spherical symmetry with zero shift: vtilde^r = v^r
-        vtilde_r = v
+        # Valencia velocity: vtilde^r = v^r - β^r/α
+        vtilde_r = v - betar / alph
 
-        # 4-velocity components: u^0 = W/alpha, u^r = W * v^r
+        # 4-velocity components: u^0 = W/α, u^r = W * vtilde^r
         u0 = Wm / alph
         ur = Wm * vtilde_r
 
-        # Conservative density: D = rho * W
+        # Conservative density: D = ρ W
         D = rho * Wm
 
-        # Stress-energy tensor components needed for flux
-        # T^{0r} = rho*h*u^0*u^r + P*g^{0r}
-        # For zero shift: g^{0r} = 0
-        rho_h = rho * hm
-        T0r = rho_h * u0 * ur
-
-        # T^{rr} = rho*h*u^r*u^r + P*g^{rr}
-        # g^{rr} = 1/gamma_rr (for diagonal metric)
+        # Inverse metric components with shift
+        alph_sq = alph * alph
         grr_inv = 1.0 / grr
-        Trr = rho_h * ur * ur + p * grr_inv
 
-        # T^r_r = T^{rr} * gamma_rr = rho*h*u^r*u^r*gamma_rr + P
-        Tr_r = rho_h * ur * ur * grr + p
+        # g^{0r} = β^r/α²
+        g4UU_0r = betar / alph_sq
 
-        # Fluxes (densitized by e^{6phi})
-        # F_D = e6phi * alpha * D * vtilde^r
+        # g^{rr} = γ^{rr} - β^r β^r/α²
+        g4UU_rr = grr_inv - betar * betar / alph_sq
+
+        # Stress-energy tensor components
+        rho_h = rho * hm
+
+        # T^{0r} = ρh u^0 u^r + P g^{0r}
+        T0r = rho_h * u0 * ur + p * g4UU_0r
+
+        # T^{rr} = ρh u^r u^r + P g^{rr}
+        Trr = rho_h * ur * ur + p * g4UU_rr
+
+        # T^r_r = T^{rr} γ_{rr}
+        Tr_r = Trr * grr
+
+        # Fluxes (densitized by e^{6φ})
+        # F̃_D = e^{6φ} α D vtilde^r
         F[m, 0] = e6p * alph * D * vtilde_r
 
-        # F_Sr = e6phi * alpha * T^r_r
+        # F̃_Sr = e^{6φ} α T^r_r
         F[m, 1] = e6p * alph * Tr_r
 
-        # F_tau = e6phi * (alpha^2 * T^{0r} - alpha * D * vtilde^r)
-        F[m, 2] = e6p * (alph * alph * T0r - alph * D * vtilde_r)
+        # F̃_τ = e^{6φ} (α² T^{0r} - α D vtilde^r)
+        F[m, 2] = e6p * (alph_sq * T0r - alph * D * vtilde_r)
 
     return F
 
 
-@jit(nopython=True, cache=True, fastmath=True)
+@jit(nopython=True, cache=True, fastmath=True, parallel=True)
 def hll_flux_kernel(DL, SrL, tauL, DR, SrR, tauR,
                     FL, FR, lam_minus, lam_plus):
     """
     JIT-compiled parallel kernel for HLL flux computation.
+
+    HLL formula: F = (λ⁺ F_L - λ⁻ F_R + λ⁺λ⁻ ΔU) / (λ⁺ - λ⁻)
+
+    Note: entropy_fix_kernel guarantees λ⁻ < 0 < λ⁺, so no edge cases needed.
 
     Args:
         DL, SrL, tauL: (M,) left conservative variables
         DR, SrR, tauR: (M,) right conservative variables
         FL: (M, 3) left physical flux
         FR: (M, 3) right physical flux
-        lam_minus: (M,) left wave speed
-        lam_plus: (M,) right wave speed
+        lam_minus: (M,) left wave speed (negative after entropy fix)
+        lam_plus: (M,) right wave speed (positive after entropy fix)
 
     Returns:
         out: (M, 3) HLL flux
@@ -199,42 +196,22 @@ def hll_flux_kernel(DL, SrL, tauL, DR, SrR, tauR,
     M = DL.shape[0]
     out = np.empty((M, 3))
 
-    for m in range(M):
+    for m in prange(M):
         lm = lam_minus[m]
         lp = lam_plus[m]
 
-        if lm >= 0.0:
-            # Flow entirely from left
-            out[m, 0] = FL[m, 0]
-            out[m, 1] = FL[m, 1]
-            out[m, 2] = FL[m, 2]
-        elif lp <= 0.0:
-            # Flow entirely from right
-            out[m, 0] = FR[m, 0]
-            out[m, 1] = FR[m, 1]
-            out[m, 2] = FR[m, 2]
-        else:
-            # Mixed flow - HLL combination
-            denom = lp - lm
+        inv_denom = 1.0 / (lp - lm)
+        lp_lm = lp * lm
 
-            if abs(denom) < 1e-30:
-                # Degenerate case: average
-                out[m, 0] = 0.5 * (FL[m, 0] + FR[m, 0])
-                out[m, 1] = 0.5 * (FL[m, 1] + FR[m, 1])
-                out[m, 2] = 0.5 * (FL[m, 2] + FR[m, 2])
-            else:
-                inv_denom = 1.0 / denom
-                lp_lm = lp * lm
+        # U differences
+        dD = DR[m] - DL[m]
+        dSr = SrR[m] - SrL[m]
+        dTau = tauR[m] - tauL[m]
 
-                # U differences
-                dD = DR[m] - DL[m]
-                dSr = SrR[m] - SrL[m]
-                dTau = tauR[m] - tauL[m]
-
-                # HLL formula
-                out[m, 0] = (lp * FL[m, 0] - lm * FR[m, 0] + lp_lm * dD) * inv_denom
-                out[m, 1] = (lp * FL[m, 1] - lm * FR[m, 1] + lp_lm * dSr) * inv_denom
-                out[m, 2] = (lp * FL[m, 2] - lm * FR[m, 2] + lp_lm * dTau) * inv_denom
+        # HLL formula
+        out[m, 0] = (lp * FL[m, 0] - lm * FR[m, 0] + lp_lm * dD) * inv_denom
+        out[m, 1] = (lp * FL[m, 1] - lm * FR[m, 1] + lp_lm * dSr) * inv_denom
+        out[m, 2] = (lp * FL[m, 2] - lm * FR[m, 2] + lp_lm * dTau) * inv_denom
 
     return out
 
@@ -421,9 +398,9 @@ class HLLRiemannSolver:
 
         # JIT: Compute physical fluxes (inlined, no Valencia overhead)
         FL = physical_flux_1d_kernel(rho0L, vrL, pL, WL, hL,
-                                     alpha_batch, e6phi_batch, gamma_rr_batch)
+                                     alpha_batch, e6phi_batch, gamma_rr_batch, beta_r_batch)
         FR = physical_flux_1d_kernel(rho0R, vrR, pR, WR, hR,
-                                     alpha_batch, e6phi_batch, gamma_rr_batch)
+                                     alpha_batch, e6phi_batch, gamma_rr_batch, beta_r_batch)
 
         # Ensure contiguous
         DL = np.ascontiguousarray(DL)
@@ -456,7 +433,7 @@ class HLLRiemannSolver:
 # LLF (LOCAL LAX-FRIEDRICHS) RIEMANN SOLVER
 # ==============================================================================
 
-@jit(nopython=True, cache=True, fastmath=True)
+@jit(nopython=True, cache=True, fastmath=True, parallel=True)
 def llf_flux_kernel(DL, SrL, tauL, DR, SrR, tauR,
                     FL, FR, lam_minus, lam_plus):
     """
@@ -483,7 +460,7 @@ def llf_flux_kernel(DL, SrL, tauL, DR, SrR, tauR,
     M = DL.shape[0]
     out = np.empty((M, 3))
 
-    for m in range(M):
+    for m in prange(M):
         # Maximum absolute wave speed
         lam_max = max(lam_plus[m], -lam_minus[m])
 
@@ -627,9 +604,9 @@ class LLFRiemannSolver:
 
         # JIT: Compute physical fluxes (reuse HLL kernel)
         FL = physical_flux_1d_kernel(rho0L, vrL, pL, WL, hL,
-                                     alpha_batch, e6phi_batch, gamma_rr_batch)
+                                     alpha_batch, e6phi_batch, gamma_rr_batch, beta_r_batch)
         FR = physical_flux_1d_kernel(rho0R, vrR, pR, WR, hR,
-                                     alpha_batch, e6phi_batch, gamma_rr_batch)
+                                     alpha_batch, e6phi_batch, gamma_rr_batch, beta_r_batch)
 
         # Ensure contiguous
         DL = np.ascontiguousarray(DL)

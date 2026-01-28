@@ -195,7 +195,7 @@ def mp5_face_kernel(um2, um1, u0, up1, up2):
     """
     # Parameters
     alpha = 4.0
-    eps = 1e-10
+    eps = 1e-20
 
     # Norm for switching criterion
     vnorm = np.sqrt(um2**2 + um1**2 + u0**2 + up1**2 + up2**2) + 1e-30
@@ -321,7 +321,7 @@ def weno5_face_kernel(um2, um1, u0, up1, up2):
 
     # Ideal weights
     d0, d1, d2 = 0.1, 0.6, 0.3
-    eps = 1.0e-6
+    eps = 1.0e-20
 
     # Alpha weights
     alpha0 = d0 / (eps + beta0)**2
@@ -411,7 +411,7 @@ def wenoz_face_kernel(um2, um1, u0, up1, up2):
 
     # Ideal weights
     d0, d1, d2 = 0.1, 0.6, 0.3
-    eps = 1.0e-6
+    eps = 1.0e-20
 
     # Modified alpha weights with tau enhancement
     alpha0 = d0 * (1.0 + (tau5 / (beta0 + eps))**2)
