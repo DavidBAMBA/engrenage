@@ -68,7 +68,7 @@ def create_hydro_and_grid(n_interior=512, r_max=1.0, gamma=1.4,
         reconstructor_name: "minmod", "mp5", "wenoz", etc.
         spacetime_mode: "fixed_minkowski" or "dynamic"
         solver_method: "newton" or "kastaun" for cons2prim
-        riemann_solver_name: "hll", "llf", or "hllc" for Riemann solver
+        riemann_solver_name: "hll", "llf" for Riemann solver
 
     Returns:
         grid: Grid object with all methods (fill_boundaries, derivatives, etc.)
@@ -309,7 +309,7 @@ def volume_integrals(D, tau, r, dr):
 # TESTS
 # ============================================================================
 
-def test_uniform_state(solver_method="newton", riemann_solver_name="hllc"):
+def test_uniform_state(solver_method="newton", riemann_solver_name="hll"):
     """Test uniform state remains uniform (should stay constant in Minkowski)."""
     print("\n" + "="*60)
     print(f"TEST 1: Uniform state (Minkowski, solver={solver_method}, riemann={riemann_solver_name})")
@@ -418,7 +418,7 @@ def test_cons2prim_roundtrip(solver_method="newton"):
     return ok
 
 
-def test_conservation_short(solver_method="newton", riemann_solver_name="hllc"):
+def test_conservation_short(solver_method="newton", riemann_solver_name="hll"):
     """Test global mass and energy conservation."""
     print("\n" + "="*60)
     print(f"TEST 3: Global conservation (mass/energy, solver={solver_method}, riemann={riemann_solver_name})")
@@ -480,7 +480,7 @@ def test_conservation_short(solver_method="newton", riemann_solver_name="hllc"):
 
 
 def run_sod_simulation(n_interior, reconstructor_name, Tfinal=0.35, gamma=1.4, r_max=1.0,
-                       solver_method="kastaun", riemann_solver_name="hllc"):
+                       solver_method="kastaun", riemann_solver_name="hll"):
     """
     Run a single Sod shock tube simulation with given parameters.
 
@@ -533,7 +533,7 @@ def run_sod_simulation(n_interior, reconstructor_name, Tfinal=0.35, gamma=1.4, r
     return r[ng:-ng], rho0[ng:-ng], p[ng:-ng], v[ng:-ng], t, steps
 
 
-def test_riemann_sod(solver_method="newton", riemann_solver_name="hllc"):
+def test_riemann_sod(solver_method="newton", riemann_solver_name="hll"):
     """Sod shock tube test comparing all reconstructors with convergence analysis."""
     print("\n" + "="*60)
     print(f"TEST 4: Sod shock tube - Reconstructor comparison (solver={solver_method}, riemann={riemann_solver_name})")
@@ -747,7 +747,7 @@ def test_riemann_sod(solver_method="newton", riemann_solver_name="hllc"):
     return all_ok
 
 
-def test_blast_wave(case='weak', solver_method="newton", riemann_solver_name="hllc"):
+def test_blast_wave(case='weak', solver_method="newton", riemann_solver_name="hll"):
     """Blast wave test with MP5 reconstruction."""
     print("\n" + "="*60)
     print(f"TEST 5: Blast wave ({case}, solver={solver_method}, riemann={riemann_solver_name})")
@@ -878,7 +878,7 @@ def test_blast_wave(case='weak', solver_method="newton", riemann_solver_name="hl
 
 
 def run_blast_simulation(n_interior, reconstructor_name, case='strong', Tfinal=0.4, gamma=1.4, r_max=1.0,
-                         solver_method="kastaun", riemann_solver_name="hllc"):
+                         solver_method="kastaun", riemann_solver_name="hll"):
     """
     Run a single blast wave simulation with given parameters.
 
@@ -942,9 +942,9 @@ def run_blast_simulation(n_interior, reconstructor_name, case='strong', Tfinal=0
 
 def test_riemann_solver_comparison(solver_method="kastaun"):
     """
-    TEST 7: Compare LLF, HLL, and HLLC Riemann solvers on strong blast wave.
+    TEST 7: Compare LLF and HLL Riemann solvers on strong blast wave.
 
-    Runs the strong blast wave test with all three Riemann solvers at
+    Runs the strong blast wave test with both Riemann solvers at
     resolution n=100 and plots the profiles for comparison.
     """
     print("\n" + "="*60)
@@ -960,18 +960,17 @@ def test_riemann_solver_comparison(solver_method="kastaun"):
     reconstructor_name = "minmod"
 
     # Riemann solvers to compare
-    riemann_solvers = ["llf", "hll", "hllc"]
+    riemann_solvers = ["llf", "hll"]
 
     # Colors and styles for plotting
     styles = {
         "llf": {"color": "blue", "linestyle": "-", "label": "LLF (Local Lax-Friedrichs)"},
-        "hll": {"color": "green", "linestyle": "--", "label": "HLL (Harten-Lax-van Leer)"},
-        "hllc": {"color": "red", "linestyle": "-.", "label": "HLLC (HLL-Contact)"}
+        "hll": {"color": "green", "linestyle": "--", "label": "HLL (Harten-Lax-van Leer)"}
     }
 
-    # High-resolution reference with HLLC
+    # High-resolution reference with HLL
     n_ref = 1000
-    print(f"\nRunning high-resolution reference (n={n_ref}, HLLC, MP5)...")
+    print(f"\nRunning high-resolution reference (n={n_ref}, HLL, MP5)...")
     r_ref, rho_ref, p_ref, v_ref, t_ref, steps_ref = run_blast_simulation(
         n_interior=n_ref,
         reconstructor_name=reconstructor_name,
@@ -980,7 +979,7 @@ def test_riemann_solver_comparison(solver_method="kastaun"):
         gamma=gamma,
         r_max=r_max,
         solver_method=solver_method,
-        riemann_solver_name="hllc"
+        riemann_solver_name="hll"
     )
     print(f"  Reference: t={t_ref:.4f}, steps={steps_ref}")
 
@@ -1032,7 +1031,7 @@ def test_riemann_solver_comparison(solver_method="kastaun"):
 
     # Print L2 errors
     print("\n" + "-"*60)
-    print("L2 ERRORS (relative to high-resolution HLLC reference)")
+    print("L2 ERRORS (relative to high-resolution HLL reference)")
     print("-"*60)
     print(f"{'Solver':<12} {'L2(rho)':<14} {'L2(p)':<14} {'L2(v)':<14}")
     print("-"*60)
@@ -1065,9 +1064,9 @@ def test_riemann_solver_comparison(solver_method="kastaun"):
                      label=f"{style['label']} (L2={res['l2_v']:.2e})")
 
     # Plot high-resolution reference
-    axes[0].plot(r_ref, rho_ref, 'k:', linewidth=1.5, alpha=0.7, label=f'Reference (HLLC n={n_ref})')
-    axes[1].plot(r_ref, p_ref, 'k:', linewidth=1.5, alpha=0.7, label=f'Reference (HLLC n={n_ref})')
-    axes[2].plot(r_ref, v_ref, 'k:', linewidth=1.5, alpha=0.7, label=f'Reference (HLLC n={n_ref})')
+    axes[0].plot(r_ref, rho_ref, 'k:', linewidth=1.5, alpha=0.7, label=f'Reference (HLL n={n_ref})')
+    axes[1].plot(r_ref, p_ref, 'k:', linewidth=1.5, alpha=0.7, label=f'Reference (HLL n={n_ref})')
+    axes[2].plot(r_ref, v_ref, 'k:', linewidth=1.5, alpha=0.7, label=f'Reference (HLL n={n_ref})')
 
     # Labels and formatting
     axes[0].set_xlabel('r', fontsize=12)
@@ -1113,7 +1112,7 @@ def test_riemann_solver_comparison(solver_method="kastaun"):
 
 
 def run_contact_simulation(n_interior, reconstructor_name, Tfinal=0.4, gamma=1.4, r_max=1.0,
-                           solver_method="kastaun", riemann_solver_name="hllc"):
+                           solver_method="kastaun", riemann_solver_name="hll"):
     """
     Run a pure contact discontinuity simulation.
 
@@ -1122,10 +1121,10 @@ def run_contact_simulation(n_interior, reconstructor_name, Tfinal=0.4, gamma=1.4
     - Constant pressure: P_L = P_R (NO pressure jump!)
     - Zero velocity: v = 0
 
-    This is the ideal test for HLLC vs HLL because:
+    This is an ideal test for contact discontinuities because:
     - Contact discontinuity should remain stationary and sharp
-    - HLL/LLF will diffuse it significantly
-    - HLLC should preserve it much better
+    - LLF will diffuse it significantly
+    - HLL should preserve it better than LLF
     """
     grid, hydro, background, eos = create_hydro_and_grid(
         n_interior=n_interior, r_max=r_max, gamma=gamma,
@@ -1176,18 +1175,15 @@ def run_contact_simulation(n_interior, reconstructor_name, Tfinal=0.4, gamma=1.4
 
 def test_contact_discontinuity(solver_method="kastaun"):
     """
-    TEST 8: Pure contact discontinuity - HLLC advantage test.
+    TEST 8: Pure contact discontinuity test.
 
-    This test demonstrates where HLLC excels over HLL/LLF:
+    This test checks contact discontinuity handling:
     - Pure density jump with constant pressure
     - Contact should remain stationary and sharp
-    - HLL/LLF diffuse contacts; HLLC preserves them
-
-    The contact discontinuity is the key wave that HLLC restores
-    in the Riemann fan that HLL ignores.
+    - LLF will diffuse contacts more than HLL
     """
     print("\n" + "="*60)
-    print(f"TEST 8: Pure contact discontinuity (HLLC advantage test)")
+    print(f"TEST 8: Pure contact discontinuity test")
     print("="*60)
 
     # Test parameters
@@ -1198,13 +1194,13 @@ def test_contact_discontinuity(solver_method="kastaun"):
     reconstructor_name = "minmod"  # Use low-order to see solver differences
 
     # Riemann solvers to compare
-    riemann_solvers = ["llf", "hll", "hllc"]
+    riemann_solvers = ["llf", "hll", 'hllc']
 
     # Colors and styles
     styles = {
         "llf": {"color": "blue", "linestyle": "-", "label": "LLF"},
         "hll": {"color": "green", "linestyle": "--", "label": "HLL"},
-        "hllc": {"color": "red", "linestyle": "-.", "label": "HLLC"}
+        "hllc": {"color": "black", "linestyle": "-", "label": "HLLC"}
     }
 
     print(f"\nInitial conditions:")
@@ -1212,7 +1208,7 @@ def test_contact_discontinuity(solver_method="kastaun"):
     print(f"  P = 1.0 (constant - NO pressure jump!)")
     print(f"  v = 0.0 (stationary)")
     print(f"\nThis contact should remain stationary and sharp.")
-    print(f"HLL/LLF will diffuse it; HLLC should preserve it better.\n")
+    print(f"LLF will diffuse it more than HLL.\n")
 
     # Store results
     results = {}
@@ -1250,7 +1246,7 @@ def test_contact_discontinuity(solver_method="kastaun"):
     rho_90 = rho_R + 0.9 * (rho_L - rho_R)  # 90% of way from R to L
     rho_10 = rho_R + 0.1 * (rho_L - rho_R)  # 10% of way from R to L
 
-    dr = results["hllc"]["r"][1] - results["hllc"]["r"][0]
+    dr = results["hll"]["r"][1] - results["hll"]["r"][0]
 
     print(f"{'Solver':<12} {'Width (cells)':<15} {'Width (dr)':<15} {'Max|dP/P|':<15} {'Max|v|':<12}")
     print("-"*60)
@@ -1307,17 +1303,17 @@ def test_contact_discontinuity(solver_method="kastaun"):
 
     print("-"*60)
 
-    # Calculate improvement factor
-    if sharpness_data["hll"]["width_cells"] > 0 and sharpness_data["hllc"]["width_cells"] > 0:
-        improvement = sharpness_data["hll"]["width_cells"] / sharpness_data["hllc"]["width_cells"]
-        print(f"\nHLLC sharpness improvement over HLL: {improvement:.1f}x")
+    # Calculate sharpness comparison
+    if sharpness_data["hll"]["width_cells"] > 0 and sharpness_data["llf"]["width_cells"] > 0:
+        improvement = sharpness_data["llf"]["width_cells"] / sharpness_data["hll"]["width_cells"]
+        print(f"\nHLL sharpness improvement over LLF: {improvement:.1f}x")
 
     # Create comparison plot
     fig, axes = plt.subplots(1, 3, figsize=(18, 6))
     lw = 2.0
 
     # Plot initial condition
-    r_init = results["hllc"]["r"]
+    r_init = results["hll"]["r"]
     rho_init = np.where(r_init < r_mid, rho_L, rho_R)
     axes[0].plot(r_init, rho_init, 'k:', linewidth=2, alpha=0.5, label='Initial (exact)')
 
@@ -1365,20 +1361,20 @@ def test_contact_discontinuity(solver_method="kastaun"):
     axes[2].legend(fontsize=9, loc='best')
     axes[2].grid(True, alpha=0.3)
 
-    fig.suptitle(f"Pure Contact Discontinuity Test - HLLC Advantage (n={n_interior}, {reconstructor_name})",
+    fig.suptitle(f"Pure Contact Discontinuity Test (n={n_interior}, {reconstructor_name})",
                  fontsize=14, fontweight='bold')
     plt.tight_layout()
     plt.savefig("test_contact_discontinuity.png", dpi=150, bbox_inches="tight")
     print(f"\nPlot saved: test_contact_discontinuity.png")
 
-    # Pass criteria: HLLC should have sharper contact than HLL
-    hllc_sharper = sharpness_data["hllc"]["width_cells"] <= sharpness_data["hll"]["width_cells"]
+    # Pass criteria: HLL should have sharper contact than LLF
+    hll_sharper = sharpness_data["hll"]["width_cells"] <= sharpness_data["llf"]["width_cells"]
     p_preserved = all(sharpness_data[s]["p_error"] < 0.1 for s in riemann_solvers)
 
-    ok = hllc_sharper and p_preserved
+    ok = hll_sharper and p_preserved
     if not ok:
-        if not hllc_sharper:
-            print("WARNING: HLLC not sharper than HLL!")
+        if not hll_sharper:
+            print("WARNING: HLL not sharper than LLF!")
         if not p_preserved:
             print("WARNING: Pressure not well preserved!")
 
@@ -1397,8 +1393,8 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Valencia hydro tests for engrenage")
     parser.add_argument("--solver", type=str, default="kastaun", choices=["newton", "kastaun"],
                         help="Cons2prim solver method: 'newton' or 'kastaun' (default: kastaun)")
-    parser.add_argument("--riemann", type=str, default="hllc", choices=["hll", "llf", "hllc"],
-                        help="Riemann solver: 'hll', 'llf', or 'hllc' (default: hllc)")
+    parser.add_argument("--riemann", type=str, default="hll", choices=["hll", "llf", "hllc"],
+                        help="Riemann solver: 'hll', 'llf', or 'hllc' (default: hll)")
     args = parser.parse_args()
 
     solver_method = args.solver

@@ -480,7 +480,8 @@ def plot_initial_comparison(tov_solution, initial_state_2d, grid, primitives, ou
 
 
 def plot_hamiltonian_constraint_iso(tov_solution, initial_state_2d, grid, background, hydro,
-                                     polytrope_K, polytrope_Gamma, rho_central, output_dir="."):
+                                     polytrope_K, polytrope_Gamma, rho_central, output_dir=".",
+                                     show=False):
     """
     Compute and plot Hamiltonian constraint for TOV initial data in isotropic coords.
     """
@@ -551,19 +552,15 @@ def plot_hamiltonian_constraint_iso(tov_solution, initial_state_2d, grid, backgr
     axes[0].set_ylabel(r'$\log_{10}$(Relative Error)')
     axes[0].set_title(r'Hamiltonian Constraint: $\log_{10}$(|Ham|/|Ham|$_{max}$)')
     axes[0].legend()
-
-    
-    axes[0].set_xlim([0, 14])
-    axes[0].set_ylim([-10, -3])
     axes[0].grid(True, alpha=0.3)
 
     # Plot 2: Absolute value in log scale
     axes[1].semilogy(grid.r, np.abs(Ham_profile) + 1e-20, 'b-', linewidth=1.5)
-    axes[1].axvline(R_iso, color='red', linestyle='--', alpha=0.5)
+    axes[1].axvline(R_iso, color='red', linestyle='--', alpha=0.5, label=f'R_iso={R_iso:.2f}')
     axes[1].set_xlabel(r'$r_{iso}$')
     axes[1].set_ylabel('|Ham|')
     axes[1].set_title('Hamiltonian Constraint (absolute value)')
-    axes[1].set_xlim([0, 14])
+    axes[1].legend()
     axes[1].grid(True, alpha=0.3)
 
     plt.suptitle(f'TOV Isotropic: Ham Constraint (K={polytrope_K}, Γ={polytrope_Gamma}, ρ_c={rho_central:.3e})',
@@ -572,8 +569,12 @@ def plot_hamiltonian_constraint_iso(tov_solution, initial_state_2d, grid, backgr
 
     filepath = os.path.join(output_dir, 'tov_hamiltonian_constraint_iso.png')
     plt.savefig(filepath, dpi=150, bbox_inches='tight')
-    plt.close(fig)
     print(f"\nSaved: {filepath}")
+
+    if show:
+        plt.show()
+    else:
+        plt.close(fig)
 
     print("\n" + "="*80)
     print("Note: In isotropic coords with h_ij=0, constraint violations")
@@ -598,11 +599,11 @@ if __name__ == "__main__":
 
     p = argparse.ArgumentParser(description='Generate TOV initial data in isotropic coordinates')
     p.add_argument('--r_max', type=float, default=20.0)
-    p.add_argument('--num_points', type=int, default=3000)
+    p.add_argument('--num_points', type=int, default=100)
     p.add_argument('--K', type=float, default=100.0)
     p.add_argument('--Gamma', type=float, default=2.0)
     p.add_argument('--rho_central', type=float, default=1.28e-3)
-    p.add_argument('--atmosphere_rho', type=float, default=1.0e-10)
+    p.add_argument('--atmosphere_rho', type=float, default=1.0e-16)
     p.add_argument('--interp_order', type=int, default=12)
     p.add_argument('--save_npz', type=str, default=None)
     args = p.parse_args()

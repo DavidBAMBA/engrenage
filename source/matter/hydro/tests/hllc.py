@@ -324,10 +324,10 @@ def hllc_flux_kernel(D_L, S_L, E_L, D_R, S_R, E_R,
         F_S_HLL = (lam_plus * F_S_L[m] - lam_minus * F_S_R[m] + lam_plus * lam_minus * (S_R[m] - S_L[m])) * inv_denom
         F_E_HLL = (lam_plus * F_E_L[m] - lam_minus * F_E_R[m] + lam_plus * lam_minus * (E_R[m] - E_L[m])) * inv_denom
         
-        # Contact wave speed (quadratic equation from MB2005 eq. 18)
-        # F^E_HLL λ² - (E_HLL + F^S_HLL) λ + S_HLL = 0
-        a_coef = F_E_HLL
-        b_coef = -(E_HLL + F_S_HLL)
+        # Contact wave speed (quadratic equation for pressure)
+        # λ_c² E_HLL - λ_c (F_E_HLL + F_S_HLL) + S_HLL = 0
+        a_coef = E_HLL
+        b_coef = -(F_E_HLL + F_S_HLL)
         c_coef = S_HLL
         
         # Solve quadratic
@@ -356,8 +356,8 @@ def hllc_flux_kernel(D_L, S_L, E_L, D_R, S_R, E_R,
                 # Fallback: average of roots
                 lam_c = 0.5 * (lam_c1 + lam_c2)
         
-        # Contact pressure (MB2006 eq. 48)
-        p_c = -lam_c * F_E_HLL + F_S_HLL
+        # Contact pressure
+        p_c = -lam_c * F_E_HLL - F_S_HLL
         
         # Star region states (left and right of contact)
         denom_cL = lam_minus - lam_c
@@ -418,48 +418,42 @@ def hllc_flux_kernel(D_L, S_L, E_L, D_R, S_R, E_R,
 
 
 @jit(nopython=True, cache=True, fastmath=True, parallel=True)
-def transform_flux_to_global_kernel(F_local, alpha, e6phi, gamma_rr):
+def transform_flux_to_global_kernel(F_local, alpha, e4phi, sqrt_hatg, sqrt_bargamma_rr):
     """
     Transform fluxes from local tetrad frame to global Valencia coordinates.
-
-    For BSSN with conformally flat metric (γ_rr = e^{4φ} γ̃_rr, γ̃_rr = 1):
-      - F̃_D = α e^{4φ} F^{(r̂)}_D     (scalar density flux)
-      - F̃_{S_r} = α e^{6φ} F^{(r̂)}_S  (momentum flux, indices cancel)
-      - F̃_τ = α e^{4φ} (F^{(r̂)}_E - F^{(r̂)}_D)
-
-    The different factors arise from tetrad transformations:
-      - e^r_{(r̂)} = 1/√γ_rr = e^{-2φ} for scalars
-      - For momentum T^r_r, upper and lower indices transform oppositely, canceling
-
+    
+    Transformation factor: T = α e^(4φ) √ĝ / √γ̄_rr
+    
+    For flat reference metric with γ̄_rr = 1:
+        T = α e^(4φ) r² sin(θ)
+        
     Args:
         F_local: (M, 3) fluxes in local frame [F_D, F_S, F_E]
         alpha: (M,) lapse function
-        e6phi: (M,) e^{6φ} conformal factor
-        gamma_rr: (M,) γ_rr metric component
-
+        e4phi: (M,) e^(4φ) conformal factor
+        sqrt_hatg: (M,) √ĝ from reference metric
+        sqrt_bargamma_rr: (M,) √γ̄_rr
+        
     Returns:
         F_global: (M, 3) densitized Valencia fluxes [F̃_D, F̃_Sr, F̃_τ]
     """
     M = F_local.shape[0]
     F_global = np.empty((M, 3))
-
+    
     for m in prange(M):
-        # e^{4φ} = e^{6φ} / e^{2φ} = e^{6φ} / √(e^{4φ}) = e^{6φ} / √γ_rr
-        sqrt_grr = np.sqrt(gamma_rr[m])
-        e4phi = e6phi[m] / sqrt_grr  # = e^{6φ} / e^{2φ} = e^{4φ}
-
-        # Transform density flux: F̃_D = α e^{4φ} F^{(r̂)}_D
-        T_D = alpha[m] * e4phi
-        F_global[m, 0] = T_D * F_local[m, 0]
-
-        # Transform momentum flux: F̃_{S_r} = α e^{6φ} F^{(r̂)}_S
-        # (tetrad indices cancel for T^r_r)
-        T_S = alpha[m] * e6phi[m]
-        F_global[m, 1] = T_S * F_local[m, 1]
-
-        # Transform energy flux: F̃_τ = α e^{4φ} (F^{(r̂)}_E - F^{(r̂)}_D)
-        F_global[m, 2] = T_D * (F_local[m, 2] - F_local[m, 0])
-
+        # Transformation factor
+        T = alpha[m] * e4phi[m] * sqrt_hatg[m] / sqrt_bargamma_rr[m]
+        
+        # Transform density flux (D is scalar)
+        F_global[m, 0] = T * F_local[m, 0]
+        
+        # Transform momentum flux (S is spatial vector component)
+        F_global[m, 1] = T * F_local[m, 1]
+        
+        # Transform energy flux
+        # τ = E - D, so F_τ = F_E - F_D
+        F_global[m, 2] = T * (F_local[m, 2] - F_local[m, 0])
+    
     return F_global
 
 
@@ -1177,6 +1171,13 @@ class HLLCRiemannSolver:
         beta_r = np.ascontiguousarray(geom.beta_r, dtype=np.float64)
         e6phi = np.ascontiguousarray(geom.e6phi, dtype=np.float64)
         
+        # For flux transformation
+        e4phi = np.ascontiguousarray(geom.e4phi, dtype=np.float64)
+        sqrt_hatg = np.ascontiguousarray(geom.sqrtdetgam, dtype=np.float64)
+        
+        # Reference metric component (flat reference: γ̄_rr = 1)
+        sqrt_bargamma_rr = np.ones(M, dtype=np.float64)
+        
         # Convert inputs to contiguous float64 arrays
         primL_batch = np.ascontiguousarray(primL_batch, dtype=np.float64)
         primR_batch = np.ascontiguousarray(primR_batch, dtype=np.float64)
@@ -1234,9 +1235,10 @@ class HLLCRiemannSolver:
         lam_minus = np.minimum(lam_L, lam_L_R)
         lam_plus = np.maximum(lam_R_L, lam_R_R)
         
-        # Interface velocity in local frame: the Riemann problem is solved
-        # at the interface x=0, so v_interface = 0 for region selection
-        v_interface = np.zeros(M, dtype=np.float64)
+        # Interface velocity in local frame: v^(r̂)_interface = β^r/(α√γ_rr)
+        sqrt_grr = np.sqrt(gamma_rr)
+        v_interface = beta_r / (alpha * sqrt_grr)
+        v_interface = np.ascontiguousarray(v_interface)
         
         # Ensure all inputs to HLLC kernel are contiguous
         D_loc_L = np.ascontiguousarray(D_loc_L)
@@ -1270,7 +1272,7 @@ class HLLCRiemannSolver:
         
         # Transform flux back to global Valencia coordinates
         F_global = transform_flux_to_global_kernel(
-            F_local, alpha, e6phi, gamma_rr
+            F_local, alpha, e4phi, sqrt_hatg, sqrt_bargamma_rr
         )
         
         return F_global

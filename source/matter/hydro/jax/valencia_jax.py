@@ -559,11 +559,12 @@ def compute_connection_terms(rho0, vr, pressure, W, h,
 # Main RHS function (Cowling approximation)
 # =============================================================================
 
-@partial(jit, static_argnums=(4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14))
+@partial(jit, static_argnums=(4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16))
 def _compute_hydro_rhs_impl(D, Sr, tau, geom,
                              eos_type, eos_gamma, eos_K,
                              rho_floor, p_floor, v_max, W_max, tol, max_iter,
-                             recon_method, riemann_type):
+                             recon_method, riemann_type,
+                             use_connections, use_sources):
     """
     JIT-compiled hydro RHS implementation for Cowling evolution.
 
@@ -649,7 +650,7 @@ def _compute_hydro_rhs_impl(D, Sr, tau, geom,
     # =========================================================================
     # 7. Connection terms
     # =========================================================================
-    if geom.has_connections:
+    if use_connections:
         conn_D, conn_Sr, conn_tau = compute_connection_terms(
             rho0, vr, p, W, h,
             geom.alpha, geom.beta_U, geom.gamma_LL, geom.gamma_UU, geom.e6phi,
@@ -662,7 +663,7 @@ def _compute_hydro_rhs_impl(D, Sr, tau, geom,
     # =========================================================================
     # 8. Source terms
     # =========================================================================
-    if geom.has_sources:
+    if use_sources:
         src_Sr, src_tau = compute_source_terms(
             rho0, vr, p, W, h,
             geom.alpha, geom.beta_U, geom.gamma_LL, geom.gamma_UU, geom.e6phi,
@@ -708,4 +709,6 @@ def compute_hydro_rhs_cowling(D, Sr, tau, geom, eos_type, eos_params,
         atm_params.get('max_iter', 500),
         recon_method,
         riemann_type,
+        geom.has_connections,  # Pass as static argument
+        geom.has_sources,      # Pass as static argument
     )

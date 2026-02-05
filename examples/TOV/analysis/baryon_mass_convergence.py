@@ -11,20 +11,20 @@ import numpy as np
 import matplotlib.pyplot as plt
 import h5py
 import os
+import argparse
 from scipy.signal import savgol_filter
 
 # Resolutions - UPDATE THESE TO CHANGE RESOLUTIONS
-N_low = 500
-N_med = 1000
-N_high = 2000
+N_low = 2000
+N_med = 4000
+N_high = 8000
 
 # Data paths - constructed from resolution values
 FOLDERS = {
-    f'N={N_low}': f'/home/davidbamba/repositories/engrenage/examples/TOV/tov_evolution_data_last_domain/tov_star_rhoc1p28em03_N{N_low}_K100_G2_cow_mp5',
-    f'N={N_med}': f'/home/davidbamba/repositories/engrenage/examples/TOV/tov_evolution_data_last_domain/tov_star_rhoc1p28em03_N{N_med}_K100_G2_cow_mp5',
-    f'N={N_high}': f'/home/davidbamba/repositories/engrenage/examples/TOV/tov_evolution_data_last_domain/tov_star_rhoc1p28em03_N{N_high}_K100_G2_cow_mp5',
+    f'N={N_low}': f'/home/davidbamba/repositories/engrenage/examples/TOV/tov_evolution_data_rmax100_TEST_long_domain_16/tov_star_rhoc1p28em03_N{N_low}_K100_G2_cow_mp5',
+    f'N={N_med}': f'/home/davidbamba/repositories/engrenage/examples/TOV/tov_evolution_data_rmax100_TEST_long_domain_16/tov_star_rhoc1p28em03_N{N_med}_K100_G2_cow_mp5',
+    f'N={N_high}': f'/home/davidbamba/repositories/engrenage/examples/TOV/tov_evolution_data_rmax100_TEST_long_domain_16/tov_star_rhoc1p28em03_N{N_high}_K100_G2_cow_mp5',
 }
-
 # Resolution labels (keys to FOLDERS dictionary)
 low_res = f'N={N_low}'
 med_res = f'N={N_med}'
@@ -100,7 +100,7 @@ def running_average(x, window):
     return np.convolve(x, kernel, mode='same')
 
 
-def smooth(y, window=20, polyorder=4):
+def smooth(y, window=10, polyorder=2):
     """Apply light Savitzky-Golay smoothing to data."""
     if len(y) < window:
         return y
@@ -112,15 +112,82 @@ def interpolate_to_common_times(t_ref, M_ref, t_other, M_other):
     return np.interp(t_ref, t_other, M_other)
 
 
+def extract_resolution_from_dirname(dirname):
+    """Extract resolution number from directory name."""
+    import re
+    match = re.search(r'[Nn]r?[=_]?(\d+)', dirname)
+    if match:
+        return int(match.group(1))
+    return None
+
+
 def main():
-    t_max = 2000.0
+    parser = argparse.ArgumentParser(
+        description='Baryon mass convergence analysis (requires exactly 3 resolutions)',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog='''
+Examples:
+  python baryon_mass_convergence.py                       # Use default folders
+  python baryon_mass_convergence.py --data-dirs D1 D2 D3  # Exactly 3 directories
+'''
+    )
+    parser.add_argument('--data-dirs', nargs='+', default=None,
+                        help='List of data directories (exactly 3 required). Default: use FOLDERS')
+    parser.add_argument('--output-dir', default=None,
+                        help='Output directory for plots. Default: script_dir/plots')
+    parser.add_argument('--t-max', type=float, default=2000.0,
+                        help='Maximum time to plot. Default: 2000.0')
+    args = parser.parse_args()
+
+    t_max = args.t_max
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+
+    # Determine output directory
+    if args.output_dir:
+        plots_dir = args.output_dir
+    else:
+        plots_dir = os.path.join(script_dir, 'plots')
+    os.makedirs(plots_dir, exist_ok=True)
+
+    # Determine data folders
+    if args.data_dirs:
+        # Validate exactly 3 directories
+        if len(args.data_dirs) != 3:
+            print(f"Error: This script requires exactly 3 directories, got {len(args.data_dirs)}")
+            return
+
+        # Use command-line provided directories
+        folders_dict = {}
+        for folder_path in args.data_dirs:
+            if os.path.exists(folder_path):
+                folder_name = os.path.basename(folder_path)
+                res_num = extract_resolution_from_dirname(folder_name)
+                label = f'N={res_num}' if res_num else folder_name
+                folders_dict[label] = folder_path
+            else:
+                print(f"Warning: Folder not found: {folder_path}")
+
+        if len(folders_dict) != 3:
+            print("Error: Need exactly 3 valid directories")
+            return
+
+        # Sort by resolution to assign low/med/high
+        sorted_items = sorted(folders_dict.items(), key=lambda x: extract_resolution_from_dirname(x[0]) or 0)
+        low_res, med_res, high_res = sorted_items[0][0], sorted_items[1][0], sorted_items[2][0]
+        folders_dict = dict(sorted_items)
+    else:
+        # Use default FOLDERS (backward compatibility)
+        folders_dict = FOLDERS
+        low_res = f'N={N_low}'
+        med_res = f'N={N_med}'
+        high_res = f'N={N_high}'
 
     # =========================================================
     # Load all data and compute baryon mass for each snapshot
     # =========================================================
     data = {}
 
-    for label, folder_path in FOLDERS.items():
+    for label, folder_path in folders_dict.items():
         print(f"Processing {label}...")
         times, r, rho0_list, W_list, phi_list = load_snapshots_with_primitives(folder_path)
 
@@ -180,7 +247,7 @@ def main():
     with np.errstate(divide='ignore', invalid='ignore'):
         p = np.log(E12 / E23) / np.log(2.0)
 
-    p_avg = running_average(p, window=50)
+    p_avg = running_average(p, window=10)
 
     # =========================================================
     # Create figure with 2x2 subplots
@@ -243,11 +310,11 @@ def main():
     plt.tight_layout()
 
     # Save figure
-    script_dir = os.path.dirname(os.path.abspath(__file__))
-    plots_dir = os.path.join(script_dir, 'plots')
-    os.makedirs(plots_dir, exist_ok=True)
-    plt.savefig(os.path.join(plots_dir, 'baryon_mass_convergence.png'), dpi=150, bbox_inches='tight')
+    output_path = os.path.join(plots_dir, 'baryon_mass_convergence.png')
+    plt.savefig(output_path, dpi=150, bbox_inches='tight')
+    print(f"Saved: {output_path}")
     plt.show()
+    #plt.close('all')
 
     # =========================================================
     # Print convergence analysis

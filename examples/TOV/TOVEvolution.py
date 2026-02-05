@@ -29,7 +29,7 @@ from source.core.rhsevolution import get_rhs
 from source.matter.hydro.perfect_fluid import PerfectFluid
 from source.matter.hydro.eos import PolytropicEOS, IdealGasEOS
 from source.matter.hydro.reconstruction import create_reconstruction
-from source.matter.hydro.riemann import HLLRiemannSolver, LLFRiemannSolver
+from source.matter.hydro.riemann import HLLRiemannSolver, LLFRiemannSolver, HLLCRiemannSolver
 from source.matter.hydro.cons2prim import prim_to_cons
 from source.matter.hydro.atmosphere import AtmosphereParams
 from source.matter.hydro.geometry import GeometryState
@@ -221,19 +221,21 @@ def main():
     # CONFIGURATION
     # ==================================================================
     r_max = 100.0
-    num_points = 2000
+    num_points = 16000
     K = 100.0
     Gamma = 2.0
     rho_central = 1.28e-3
-    t_final = 2000
-    FOLDER_NAME_EVOL = "tov_evolution_data_${num_points}_rmax${r_max}"
+    t_final = 4000  # Performance test
+    FOLDER_NAME_EVOL = f"tov_evolution_data_rmax{r_max}_TEST_long_domain_long_time"  # Folder name for evolution data (includes r_max for clarity)
 
+    SNAPSHOT_INTERVAL = 100  # Save full domain every N timesteps (None to disable)
+    EVOLUTION_INTERVAL = 100  # Save time series every N timesteps (None to disable)
 
     # Reconstructor: "wenoz" (wz), "weno5" (w5), "mp5" (mp5), "minmod" (md), "mc" (mc)
     RECONSTRUCTOR_NAME = "mp5"  # "wenoz", "weno5", "mp5", "minmod", "mc"
 
     # Cons2prim solver: "newton" (fast, needs good guess) or "kastaun" (robust, guaranteed convergence)
-    SOLVER_METHOD = "newton"  # "newton" or "kastaun"
+    SOLVER_METHOD = "kastaun"  # "newton" or "kastaun"
 
     # Riemann solver: "hll" or "llf"
     RIEMANN_SOLVER = "hll"  # "hll" or "llf"
@@ -242,7 +244,7 @@ def main():
     EVOLUTION_MODE = "cowling"  # "cowling" or "dynamic"
 
     # atmosphere config
-    rho_floor_base = 1e-9 * rho_central
+    rho_floor_base = 1e-13# * rho_central
     p_floor_base = K * (rho_floor_base)**Gamma
     ATMOSPHERE = AtmosphereParams(
         rho_floor=rho_floor_base,
@@ -253,8 +255,8 @@ def main():
     # SETUP
     # ==================================================================
     spacing = LinearSpacing(num_points, r_max)
-    eos = PolytropicEOS(K=K, gamma=Gamma)
-    #eos = IdealGasEOS(gamma=Gamma)  # Use ideal gas EOS for evolution
+    #eos = PolytropicEOS(K=K, gamma=Gamma)
+    eos = IdealGasEOS(gamma=Gamma)  # Use ideal gas EOS for evolution
     
     # 1. RECONSTRUCTOR BASE (uses RECONSTRUCTOR_NAME from configuration)
     base_recon = create_reconstruction(RECONSTRUCTOR_NAME)
@@ -262,6 +264,8 @@ def main():
     # 2. RIEMANN SOLVER
     if RIEMANN_SOLVER.lower() == "hll":
         riemann = HLLRiemannSolver(atmosphere=ATMOSPHERE)
+    elif RIEMANN_SOLVER.lower() == "hllc":
+        riemann = HLLCRiemannSolver(atmosphere=ATMOSPHERE)
     else:
         riemann = LLFRiemannSolver(atmosphere=ATMOSPHERE)
 
@@ -302,10 +306,6 @@ def main():
     # Create star-specific folder based on parameters (includes evolution mode and reconstructor)
     star_folder = get_star_folder_name(rho_central, num_points, K, Gamma, EVOLUTION_MODE, RECONSTRUCTOR_NAME)
     OUTPUT_DIR = os.path.join(DATA_ROOT_DIR, star_folder)
-
-    SNAPSHOT_INTERVAL = 100  # Save full domain every N timesteps (None to disable)
-    EVOLUTION_INTERVAL = 100  # Save time series every N timesteps (None to disable)
-
     # Time series saving (density profiles and central density evolution)
     SAVE_TIMESERIES = True  # Set to True to save time series data to .npz file
 
@@ -370,9 +370,13 @@ def main():
     # Diagnostics: check discrete hydrostatic balance at t=0
     utils.diagnose_t0_residuals(initial_state_2d, grid, background, hydro)
 
-    # Initial-data diagnostics 
+    # Initial-data diagnostics
     tov_id.plot_initial_comparison(tov_solution, initial_state_2d, grid, prim_tuple,
                                    output_dir=plots_dir, suffix=PLOT_SUFFIX)
+
+    # Hamiltonian constraint diagnostic (show before evolution)
+    tov_id.plot_hamiltonian_constraint_iso(tov_solution, initial_state_2d, grid, background, hydro,
+                                            K, Gamma, rho_central, output_dir=plots_dir, show=True)
 
     # Zoom comparison: TOV solution vs interpolated initial data 
     #utils.plot_tov_vs_initial_data_zoom(tov_solution, initial_state_2d, grid, prim_tuple,
@@ -789,15 +793,16 @@ def main():
 
     print("\n" + "="*70)
     print("Evolution complete. Plots saved:")
-    print("  1. tov_solution.png                - TOV solution (ρ, P, M, alpha)")
-    print("  2. tov_initial_data_comparison.png - TOV vs Initial data at t=0")
-    print(f"  3. tov_evolution.png               - Hydro evolution at checkpoints:")
-    print(f"                                       t=0 → t={t_cp1:.3e} (1/3) → t={t_cp2:.3e} (2/3) → t={t_cp3:.3e} (final)")
+    print("  1. tov_solution.png                    - TOV solution (ρ, P, M, alpha)")
+    print("  2. tov_initial_data_comparison.png     - TOV vs Initial data at t=0")
+    print("  3. tov_hamiltonian_constraint_iso.png  - Hamiltonian constraint at t=0")
+    print(f"  4. tov_evolution.png                   - Hydro evolution at checkpoints:")
+    print(f"                                           t=0 → t={t_cp1:.3e} (1/3) → t={t_cp2:.3e} (2/3) → t={t_cp3:.3e} (final)")
     if EVOLUTION_MODE == "dynamic":
-        print(f"  4. tov_bssn_evolution.png          - BSSN variables: t=0 → t={t_cp3:.3e} (metric evolution)")
-        print(f"  5. constraints_evolution{PLOT_SUFFIX}.png - BSSN constraint violations: max|H|, L2(H), max|M_r|, L2(M_r)")
+        print(f"  5. tov_bssn_evolution.png              - BSSN variables: t=0 → t={t_cp3:.3e} (metric evolution)")
+        print(f"  6. constraints_evolution{PLOT_SUFFIX}.png     - BSSN constraint violations: max|H|, L2(H), max|M_r|, L2(M_r)")
     else:
-        print(f"  4. tov_bssn_evolution.png          - BSSN variables: t=0 → t={t_cp3:.3e} (Cowling check - should be constant)")
+        print(f"  5. tov_bssn_evolution.png              - BSSN variables: t=0 → t={t_cp3:.3e} (Cowling check - should be constant)")
     print("="*70)
 
 

@@ -27,13 +27,10 @@ T_START = 0.0
 # FOLDERS TO ANALYZE - Specify the exact folders you want to analyze
 # =============================================================================
 FOLDERS_TO_ANALYZE = [
-    '../tov_evolution_data_last3/tov_star_rhoc1p28em03_N400_K100_G2_cow_mp5',
-    '../tov_evolution_data_last3/tov_star_rhoc1p28em03_N800_K100_G2_cow_mp5',
-    '../tov_evolution_data_last3/tov_star_rhoc1p28em03_N1600_K100_G2_cow_mp5',
-    #'tov_evolution_data2/tov_star_rhoc1p28em03_N400_K100_G2_cow_w5',
-    #'tov_evolution_data2/tov_star_rhoc1p28em03_N600_K100_G2_cow_w5',
-    #'tov_evolution_data2/tov_star_rhoc1p28em03_N800_K100_G2_cow_w5',
-    #'tov_evolution_data2/tov_star_rhoc1p28em03_N1000_K100_G2_cow_w5'
+    '../tov_evolution_data_rmax20_TEST_kas_ideal_long_domain_lasttest/tov_star_rhoc1p28em03_N100_K100_G2_cow_mp5',
+    '../tov_evolution_data_rmax20_TEST_kas_ideal_long_domain_lasttest/tov_star_rhoc1p28em03_N200_K100_G2_cow_mp5',
+    '../tov_evolution_data_rmax20_TEST_kas_ideal_long_domain_lasttest/tov_star_rhoc1p28em03_N400_K100_G2_cow_mp5',
+    '../tov_evolution_data_rmax20_TEST_kas_ideal_long_domain_lasttest/tov_star_rhoc1p28em03_N800_K100_G2_cow_mp5',
 ]
 
 # Theoretical frequencies (Font et al. 2002)
@@ -542,33 +539,54 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog='''
 Examples:
-  python plot_qnm_analysis.py                # Use all data points
+  python plot_qnm_analysis.py                # Use all data points (default folders)
   python plot_qnm_analysis.py --delta-t 1    # Subsample to t=0,1,2,3,...
-
-Configure the folders to analyze by editing FOLDERS_TO_ANALYZE at the top of this script.
+  python plot_qnm_analysis.py --data-dirs DIR1 DIR2 --output-dir OUT  # Custom paths
 '''
     )
     parser.add_argument('--delta-t', type=float, default=None,
                         help='Time interval for subsampling (e.g., 1 for t=0,1,2,...). Default: None (use all data)')
+    parser.add_argument('--data-dirs', nargs='+', default=None,
+                        help='List of data directories to analyze. Default: use FOLDERS_TO_ANALYZE')
+    parser.add_argument('--output-dir', default=None,
+                        help='Output directory for plots. Default: script_dir/plots')
     args = parser.parse_args()
 
     script_dir = os.path.dirname(os.path.abspath(__file__))
-    plot_dir = os.path.join(script_dir, "plots")
+
+    # Determine output directory
+    if args.output_dir:
+        plot_dir = args.output_dir
+    else:
+        plot_dir = os.path.join(script_dir, "plots")
     os.makedirs(plot_dir, exist_ok=True)
 
-    # Use folders from FOLDERS_TO_ANALYZE list
+    # Determine data folders
     data_folders = []
-    for folder_rel_path in FOLDERS_TO_ANALYZE:
-        folder_path = os.path.join(script_dir, folder_rel_path)
-        if os.path.exists(folder_path):
-            folder_name = os.path.basename(folder_path)
-            data_folders.append((folder_name, folder_path))
-        else:
-            print(f"Warning: Folder not found: {folder_path}")
+    if args.data_dirs:
+        # Use command-line provided directories
+        for folder_path in args.data_dirs:
+            if os.path.exists(folder_path):
+                folder_name = os.path.basename(folder_path)
+                data_folders.append((folder_name, folder_path))
+            else:
+                print(f"Warning: Folder not found: {folder_path}")
+    else:
+        # Use folders from FOLDERS_TO_ANALYZE list (backward compatibility)
+        for folder_rel_path in FOLDERS_TO_ANALYZE:
+            folder_path = os.path.join(script_dir, folder_rel_path)
+            if os.path.exists(folder_path):
+                folder_name = os.path.basename(folder_path)
+                data_folders.append((folder_name, folder_path))
+            else:
+                print(f"Warning: Folder not found: {folder_path}")
 
     if not data_folders:
-        print("No valid folders found in FOLDERS_TO_ANALYZE")
-        print("Edit FOLDERS_TO_ANALYZE at the top of this script to specify folders to analyze.")
+        print("No valid folders found.")
+        if args.data_dirs:
+            print("Check the paths provided via --data-dirs")
+        else:
+            print("Edit FOLDERS_TO_ANALYZE at the top of this script or use --data-dirs")
         return
 
     print(f"Analyzing {len(data_folders)} folder(s):")
@@ -608,7 +626,7 @@ Configure the folders to analyze by editing FOLDERS_TO_ANALYZE at the top of thi
         print(f"\nComparison table:")
         print(f"  - {comparison_table_path}")
 
-    plt.show()
+    plt.close('all')
 
 
 if __name__ == "__main__":

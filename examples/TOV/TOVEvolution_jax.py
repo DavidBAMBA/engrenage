@@ -13,6 +13,7 @@ import numpy as np
 import sys
 import os
 import time
+import json
 from functools import partial
 
 # Get the directory where this script is located
@@ -41,7 +42,7 @@ from source.bssn.tensoralgebra import get_bar_gamma_LL, get_bar_A_LL, get_hat_D_
 
 # Hydro (for initial data setup and reference)
 from source.matter.hydro.perfect_fluid import PerfectFluid
-from source.matter.hydro.eos import PolytropicEOS
+from source.matter.hydro.eos import PolytropicEOS, IdealGasEOS
 from source.matter.hydro.reconstruction import create_reconstruction
 from source.matter.hydro.riemann import HLLRiemannSolver
 from source.matter.hydro.atmosphere import AtmosphereParams
@@ -183,32 +184,47 @@ def main():
     """Main execution."""
 
     # ==================================================================
-    # CONFIGURATION (same as TOVEvolution.py)
+    # CONFIGURATION
     # ==================================================================
-    r_max = 100.0
-    num_points = 1000
+    r_max = 20.0
+    num_points = 100
     K = 100.0
     Gamma = 2.0
     rho_central = 1.28e-3
-    t_final = 10  # Short test
+    t_final = 100  # Performance test
 
+    # Data saving
+    FOLDER_NAME_EVOL = "tov_evolution_data_performance_JAX"
+    SNAPSHOT_INTERVAL = 100  # Save full domain every N timesteps (None to disable)
+    EVOLUTION_INTERVAL = 100  # Save time series every N timesteps (None to disable)
+    ENABLE_DATA_SAVING = True
+    SAVE_TIMESERIES = True
+
+    # Reconstruction: "wenoz" (wz), "weno5" (w5), "mp5" (mp5), "minmod" (md), "mc" (mc)
     RECONSTRUCTOR_NAME = "mp5"
-    RIEMANN_SOLVER = "hll"
-    SOLVER_METHOD = "newton"
 
-    # Atmosphere
-    rho_floor_base = 1e-12 * rho_central
-    p_floor_base = K * (rho_floor_base) ** Gamma
+    # Cons2prim solver: "newton" (fast, needs good guess) or "kastaun" (robust, guaranteed convergence)
+    SOLVER_METHOD = "kastaun"
+
+    # Riemann solver: "hll", "hllc", or "llf"
+    RIEMANN_SOLVER = "hll"
+
+    # Evolution mode: "cowling" or "dynamic"
+    EVOLUTION_MODE = "cowling"  # JAX only supports Cowling for now
+
+    # Atmosphere config
+    rho_floor_base = 1e-13
+    p_floor_base = K * (rho_floor_base)**Gamma
     ATMOSPHERE = AtmosphereParams(
         rho_floor=rho_floor_base,
-        p_floor=p_floor_base,
+        p_floor=p_floor_base
     )
 
     # ==================================================================
     # SETUP (reuse engrenage infrastructure for initial data)
     # ==================================================================
     spacing = LinearSpacing(num_points, r_max)
-    eos = PolytropicEOS(K=K, gamma=Gamma)
+    eos = IdealGasEOS(gamma=Gamma)  # Use ideal gas for evolution (production default)
     base_recon = create_reconstruction(RECONSTRUCTOR_NAME)
     riemann = HLLRiemannSolver(atmosphere=ATMOSPHERE)
 
@@ -233,11 +249,14 @@ def main():
     print("=" * 70)
     print("TOV Star Evolution - JAX Backend (Cowling Approximation)")
     print("=" * 70)
+    print(f"Evolution mode: {EVOLUTION_MODE}")
     print(f"Grid: N={grid.N}, r_max={r_max}, dr_min={grid.min_dr}")
-    print(f"EOS: K={K}, Gamma={Gamma} (Polytropic)")
+    print(f"EOS: Gamma={Gamma} (Ideal Gas)")
     print(f"Reconstruction: {RECONSTRUCTOR_NAME}")
     print(f"Riemann solver: {RIEMANN_SOLVER}")
+    print(f"Cons2prim solver: {SOLVER_METHOD}")
     print(f"dt={dt:.6f} (CFL={cfl_factor}), t_final={t_final}, steps={num_steps_total}")
+    print(f"Data saving: {ENABLE_DATA_SAVING} (snapshots every {SNAPSHOT_INTERVAL if SNAPSHOT_INTERVAL else 'disabled'} steps)")
     print(f"JAX devices: {jax.devices()}")
     print()
 
@@ -377,38 +396,204 @@ def main():
     rk4_jit_time = jit_time
 
     # ==================================================================
-    # EVOLUTION (Python loop with JIT-compiled step)
+    # EVOLUTION (Checkpoint-based with time series tracking)
     # ==================================================================
-    print(f"\n{'='*70}")
-    print(f"Starting evolution: {num_steps_total} steps")
-    print(f"{'='*70}")
-    print("Using Python loop + JIT-compiled full step...")
+    # Calculate checkpoints (1/3, 2/3, final)
+    checkpoint_1 = max(1, num_steps_total // 3)
+    checkpoint_2 = max(2, 2 * num_steps_total // 3)
+    checkpoint_3 = num_steps_total
 
-    print_every = max(1, num_steps_total // 20)
-    D, Sr, tau = D0, Sr0, tau0
+    print(f"\n{'='*70}")
+    print(f"Evolution checkpoints:")
+    print(f"  step {checkpoint_1:6d}: 1/3 (~{checkpoint_1*dt:.3e})")
+    print(f"  step {checkpoint_2:6d}: 2/3 (~{checkpoint_2*dt:.3e})")
+    print(f"  step {checkpoint_3:6d}: final (~{checkpoint_3*dt:.3e})")
+    print(f"{'='*70}\n")
+
+    # Storage for checkpoints and time series
+    checkpoint_states = {}
+    checkpoint_times = {}
+    time_series = {'t': [], 'rho_c': [], 'v_c': [], 'Mb': []}
+
+    # Start timing
     t0_evol = time.perf_counter()
 
-    for step in range(num_steps_total):
+    # Extract phi from initial state for central density estimation
+    phi_bssn = initial_state_2d[5, :]  # phi is index 5 in BSSN variables
+    e6phi_central = np.exp(6.0 * phi_bssn[NUM_GHOSTS])
+
+    # Helper to extract central density (simple estimate without full cons2prim)
+    def get_central_density_estimate(D_arr):
+        """Estimate central density from D (simple: D/e6phi)."""
+        D_np = np.array(D_arr)
+        rho_c_est = D_np[NUM_GHOSTS] / e6phi_central
+        return rho_c_est
+
+    # ==================================================================
+    # Evolve to checkpoint 1
+    # ==================================================================
+    print(f"Evolving to checkpoint 1 (step {checkpoint_1})...")
+    D, Sr, tau = D0, Sr0, tau0
+    t = 0.0
+    print_every = max(1, checkpoint_1 // 10)
+
+    for step in range(checkpoint_1):
         D, Sr, tau = jit_step(D, Sr, tau, geom)
+        t += dt
+
+        # Track time series
+        if EVOLUTION_INTERVAL and (step + 1) % EVOLUTION_INTERVAL == 0:
+            rho_c_est = get_central_density_estimate(D)
+            time_series['t'].append(t)
+            time_series['rho_c'].append(rho_c_est)
+            time_series['v_c'].append(0.0)  # Placeholder
+            time_series['Mb'].append(0.0)   # Placeholder
 
         if (step + 1) % print_every == 0:
             jax.block_until_ready(D)
             elapsed = time.perf_counter() - t0_evol
-            pct = 100.0 * (step + 1) / num_steps_total
+            pct = 100.0 * (step + 1) / checkpoint_1
             rate = (step + 1) / elapsed
-            eta = (num_steps_total - step - 1) / rate if rate > 0 else 0
-            D_c_val = float(jax.device_get(D)[NUM_GHOSTS])
-            print(f"  Step {step+1:>7d}/{num_steps_total} ({pct:5.1f}%) | "
-                  f"wall={elapsed:7.1f}s | ETA={eta:6.1f}s | "
-                  f"rate={rate:.0f} steps/s | D_c={D_c_val:.6e}")
+            rho_c_est = get_central_density_estimate(D)
+            print(f"  Step {step+1:>7d}/{checkpoint_1} ({pct:5.1f}%) | "
+                  f"rate={rate:.0f} steps/s | ρ_c={rho_c_est:.6e}")
 
     jax.block_until_ready((D, Sr, tau))
+    checkpoint_states[1] = (np.array(D), np.array(Sr), np.array(tau))
+    checkpoint_times[1] = t
+    print(f"  -> Reached checkpoint 1, t={t:.6e}")
+
+    # ==================================================================
+    # Evolve to checkpoint 2
+    # ==================================================================
+    remaining_steps = checkpoint_2 - checkpoint_1
+    print(f"\nEvolving to checkpoint 2 (step {checkpoint_2})...")
+    print_every = max(1, remaining_steps // 10)
+
+    for step in range(remaining_steps):
+        D, Sr, tau = jit_step(D, Sr, tau, geom)
+        t += dt
+
+        # Track time series
+        if EVOLUTION_INTERVAL and (checkpoint_1 + step + 1) % EVOLUTION_INTERVAL == 0:
+            rho_c_est = get_central_density_estimate(D)
+            time_series['t'].append(t)
+            time_series['rho_c'].append(rho_c_est)
+            time_series['v_c'].append(0.0)
+            time_series['Mb'].append(0.0)
+
+        if (step + 1) % print_every == 0:
+            jax.block_until_ready(D)
+            elapsed = time.perf_counter() - t0_evol
+            pct = 100.0 * (checkpoint_1 + step + 1) / num_steps_total
+            rate = (checkpoint_1 + step + 1) / elapsed
+            rho_c_est = get_central_density_estimate(D)
+            print(f"  Step {checkpoint_1+step+1:>7d}/{checkpoint_2} ({pct:5.1f}%) | "
+                  f"rate={rate:.0f} steps/s | ρ_c={rho_c_est:.6e}")
+
+    jax.block_until_ready((D, Sr, tau))
+    checkpoint_states[2] = (np.array(D), np.array(Sr), np.array(tau))
+    checkpoint_times[2] = t
+    print(f"  -> Reached checkpoint 2, t={t:.6e}")
+
+    # ==================================================================
+    # Evolve to checkpoint 3 (final)
+    # ==================================================================
+    remaining_steps = checkpoint_3 - checkpoint_2
+    print(f"\nEvolving to checkpoint 3 (step {checkpoint_3}, final)...")
+    print_every = max(1, remaining_steps // 10)
+
+    for step in range(remaining_steps):
+        D, Sr, tau = jit_step(D, Sr, tau, geom)
+        t += dt
+
+        # Track time series
+        if EVOLUTION_INTERVAL and (checkpoint_2 + step + 1) % EVOLUTION_INTERVAL == 0:
+            rho_c_est = get_central_density_estimate(D)
+            time_series['t'].append(t)
+            time_series['rho_c'].append(rho_c_est)
+            time_series['v_c'].append(0.0)
+            time_series['Mb'].append(0.0)
+
+        if (step + 1) % print_every == 0:
+            jax.block_until_ready(D)
+            elapsed = time.perf_counter() - t0_evol
+            pct = 100.0 * (checkpoint_2 + step + 1) / num_steps_total
+            rate = (checkpoint_2 + step + 1) / elapsed
+            rho_c_est = get_central_density_estimate(D)
+            print(f"  Step {checkpoint_2+step+1:>7d}/{checkpoint_3} ({pct:5.1f}%) | "
+                  f"rate={rate:.0f} steps/s | ρ_c={rho_c_est:.6e}")
+
+    jax.block_until_ready((D, Sr, tau))
+    checkpoint_states[3] = (np.array(D), np.array(Sr), np.array(tau))
+    checkpoint_times[3] = t
     evol_time = time.perf_counter() - t0_evol
     D_final, Sr_final, tau_final = D, Sr, tau
+    print(f"  -> Reached checkpoint 3 (final), t={t:.6e}")
 
     print(f"\nEvolution complete!")
     print(f"  Total wall time: {evol_time:.2f}s")
     print(f"  Steps/second: {num_steps_total / evol_time:.0f}")
+
+    # ==================================================================
+    # DATA MANAGEMENT - Save metadata and time series
+    # ==================================================================
+    if ENABLE_DATA_SAVING:
+        # Create output directory
+        from examples.TOV.utils_TOVEvolution import get_star_folder_name
+        star_folder = get_star_folder_name(
+            rho_central, num_points, K, Gamma, EVOLUTION_MODE, RECONSTRUCTOR_NAME
+        )
+        OUTPUT_DIR = os.path.join(script_dir, FOLDER_NAME_EVOL, star_folder)
+        os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+        print(f"\nSaving data to: {OUTPUT_DIR}")
+
+        # Save metadata as JSON
+        metadata = {
+            'K': K,
+            'Gamma': Gamma,
+            'rho_central': rho_central,
+            'r_max': r_max,
+            'num_points': num_points,
+            't_final': t_final,
+            'dt': dt,
+            'num_steps': num_steps_total,
+            'cfl_factor': cfl_factor,
+            'reconstructor': RECONSTRUCTOR_NAME,
+            'solver_method': SOLVER_METHOD,
+            'riemann_solver': RIEMANN_SOLVER,
+            'evolution_mode': EVOLUTION_MODE,
+            'backend': 'JAX',
+            'jit_time_s': jit_time,
+            'wall_time_s': evol_time,
+            'steps_per_second': num_steps_total / evol_time,
+            'tov_mass': tov_solution.M_star,
+            'tov_radius_iso': tov_solution.R_iso,
+        }
+
+        metadata_path = os.path.join(OUTPUT_DIR, 'metadata.json')
+        with open(metadata_path, 'w') as f:
+            json.dump(metadata, f, indent=2)
+        print(f"  Metadata saved: {metadata_path}")
+
+        # Save time series
+        if SAVE_TIMESERIES and len(time_series['t']) > 0:
+            timeseries_path = os.path.join(OUTPUT_DIR, 'timeseries.npz')
+            np.savez(timeseries_path,
+                     times=np.array(time_series['t']),
+                     rho_central=np.array(time_series['rho_c']),
+                     v_central=np.array(time_series['v_c']),
+                     Mb=np.array(time_series['Mb']),
+                     # Simulation parameters
+                     num_points=num_points,
+                     K=K,
+                     Gamma=Gamma,
+                     rho_central_initial=rho_central,
+                     r_max=r_max,
+                     dt=dt,
+                     num_steps=num_steps_total)
+            print(f"  Time series saved: {timeseries_path}")
 
     # ==================================================================
     # RECONSTRUCT FULL STATE FOR DIAGNOSTICS
@@ -447,6 +632,27 @@ def main():
     rho0_f, vr_f, p_f, _, _, _, success_f = extract_primitives(state_final)
 
     interior = slice(NUM_GHOSTS, -NUM_GHOSTS)
+
+    # ==================================================================
+    # COWLING APPROXIMATION CHECK
+    # ==================================================================
+    print(f"\n{'='*70}")
+    print("COWLING APPROXIMATION CHECK")
+    print(f"{'='*70}")
+
+    # In Cowling mode, BSSN variables should remain exactly constant
+    # since we only evolve hydro, not the metric
+    bssn_0 = initial_state_2d[:NUM_BSSN_VARS, :]
+    bssn_f = state_final[:NUM_BSSN_VARS, :]
+
+    bssn_change = np.max(np.abs(bssn_f - bssn_0) / (np.abs(bssn_0) + 1e-20))
+    print(f"  Max BSSN change (should be 0): {bssn_change:.3e}")
+
+    if bssn_change < 1e-14:
+        print("  ✓ BSSN variables constant - Cowling approximation verified")
+    else:
+        print(f"  ⚠ BSSN variables changed by {bssn_change:.3e}")
+        print("    (This should not happen in Cowling mode!)")
 
     # ==================================================================
     # DIAGNOSTICS

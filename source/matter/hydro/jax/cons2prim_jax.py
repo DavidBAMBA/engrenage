@@ -70,7 +70,7 @@ def _newton_kernel_jax(D, Sr, tau, gamma_rr, alpha, p_init,
         v2 = gamma_rr * vr * vr
 
         # Clamp v2 for safety
-        v2 = jnp.clip(v2, 0.0, 1.0 - 1e-16)
+        v2 = jnp.clip(v2, 0.0, 1.0 - 1e-12)
         W = 1.0 / jnp.sqrt(1.0 - v2)
 
         # Check Lorentz factor bounds - if violated, adjust p and continue
@@ -232,7 +232,7 @@ def _newton_kernel_polytropic_jax(D, Sr, tau, gamma_rr, alpha, rho_init,
         v2 = gamma_rr * vr * vr
 
         # Clamp v2 for safety
-        v2 = jnp.clip(v2, 0.0, 1.0 - 1e-16)
+        v2 = jnp.clip(v2, 0.0, 1.0 - 1e-12)
         W = 1.0 / jnp.sqrt(1.0 - v2)
 
         # Check Lorentz factor bounds
@@ -252,7 +252,7 @@ def _newton_kernel_polytropic_jax(D, Sr, tau, gamma_rr, alpha, rho_init,
         Q2 = tau + D + p2
         vr2 = alpha_safe * Sr / (Q2 * gamma_rr)
         v2_2 = gamma_rr * vr2 * vr2
-        v2_2 = jnp.clip(v2_2, 0.0, 1.0 - 1e-16)
+        v2_2 = jnp.clip(v2_2, 0.0, 1.0 - 1e-12)
         W2 = 1.0 / jnp.sqrt(1.0 - v2_2)
         f2 = D - rho2 * W2
 

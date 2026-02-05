@@ -7,20 +7,24 @@ import numpy as np
 import matplotlib.pyplot as plt
 import h5py
 import os
+import argparse
+from scipy.interpolate import interp1d
 
 # Resolutions - UPDATE THESE TO CHANGE RESOLUTIONS
-N_low = 500
-N_med = 1000
-N_high = 2000
+N_very_low = 1000
+N_low = 2000
+N_med = 4000
+N_high = 8000
+#N_very_high = 800
 
 # Data paths - constructed from resolution values
 FOLDERS = {
-    f'N={N_low}': f'/home/davidbamba/repositories/engrenage/examples/TOV/tov_evolution_data_last_domain/tov_star_rhoc1p28em03_N{N_low}_K100_G2_cow_mp5',
-    f'N={N_med}': f'/home/davidbamba/repositories/engrenage/examples/TOV/tov_evolution_data_last_domain/tov_star_rhoc1p28em03_N{N_med}_K100_G2_cow_mp5',
-    f'N={N_high}': f'/home/davidbamba/repositories/engrenage/examples/TOV/tov_evolution_data_last_domain/tov_star_rhoc1p28em03_N{N_high}_K100_G2_cow_mp5',
+    f'N={N_very_low}': f'/home/davidbamba/repositories/engrenage/examples/TOV/tov_evolution_data_rmax100_TEST_long_domain_16/tov_star_rhoc1p28em03_N{N_very_low}_K100_G2_cow_mp5',
+    f'N={N_low}': f'/home/davidbamba/repositories/engrenage/examples/TOV/tov_evolution_data_rmax100_TEST_long_domain_16/tov_star_rhoc1p28em03_N{N_low}_K100_G2_cow_mp5',
+    f'N={N_med}': f'/home/davidbamba/repositories/engrenage/examples/TOV/tov_evolution_data_rmax100_TEST_long_domain_16/tov_star_rhoc1p28em03_N{N_med}_K100_G2_cow_mp5',
+    f'N={N_high}': f'/home/davidbamba/repositories/engrenage/examples/TOV/tov_evolution_data_rmax100_TEST_long_domain_16/tov_star_rhoc1p28em03_N{N_high}_K100_G2_cow_mp5',
 }
-
-# Resolution labels (keys to FOLDERS dictionary)
+# Resolution labels for convergence order calculation (uses first 3 resolutions)
 low_res = f'N={N_low}'
 med_res = f'N={N_med}'
 high_res = f'N={N_high}'
@@ -79,7 +83,7 @@ def load_snapshots(folder_path):
 def l1_error(a, b):
     """
     Compute L1 error between two arrays, interpolating if sizes differ.
-    The finer array is interpolated to the coarser grid.
+    The finer array is interpolated to the coarser grid using cubic interpolation.
     """
     if len(a) == len(b):
         return np.mean(np.abs(a - b))
@@ -94,19 +98,108 @@ def l1_error(a, b):
     x_coarse = np.linspace(0, 1, len(coarse))
     x_fine = np.linspace(0, 1, len(fine))
 
-    # Interpolate fine solution to coarse grid
-    fine_interp = np.interp(x_coarse, x_fine, fine)
+    # Interpolate fine solution to coarse grid using cubic interpolation (3rd order)
+    interp_func = interp1d(x_fine, fine, kind='cubic', bounds_error=False, fill_value='extrapolate')
+    fine_interp = interp_func(x_coarse)
 
     return np.mean(np.abs(coarse - fine_interp))
+
+
+def find_nearest_snapshots(t_target, t_source, rho_list):
+    """
+    Find nearest neighbor snapshots in time (no temporal interpolation).
+
+    Args:
+        t_target: Target time array
+        t_source: Source time array
+        rho_list: List of density fields at source times
+
+    Returns:
+        List of density fields at nearest source times
+    """
+    rho_nearest = []
+
+    for t_tgt in t_target:
+        # Find nearest time index
+        idx = np.argmin(np.abs(t_source - t_tgt))
+        rho_nearest.append(rho_list[idx].copy())
+
+    return rho_nearest
 
 
 # ============================================================
 # MAIN
 # ============================================================
 
-def main():
+def extract_resolution_from_dirname(dirname):
+    """Extract resolution number from directory name."""
+    import re
+    match = re.search(r'[Nn]r?[=_]?(\d+)', dirname)
+    if match:
+        return int(match.group(1))
+    return None
 
-    t_max = 2000.0
+
+def main():
+    parser = argparse.ArgumentParser(
+        description='Convergence analysis (requires exactly 3 resolutions)',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog='''
+Examples:
+  python plot_convergence.py                       # Use default folders
+  python plot_convergence.py --data-dirs D1 D2 D3  # Exactly 3 directories
+'''
+    )
+    parser.add_argument('--data-dirs', nargs='+', default=None,
+                        help='List of data directories (exactly 3 required). Default: use FOLDERS')
+    parser.add_argument('--output-dir', default=None,
+                        help='Output directory for plots. Default: script_dir/plots')
+    parser.add_argument('--t-max', type=float, default=2000.0,
+                        help='Maximum time to plot. Default: 2000.0')
+    args = parser.parse_args()
+
+    t_max = args.t_max
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+
+    # Determine output directory
+    if args.output_dir:
+        plots_dir = args.output_dir
+    else:
+        plots_dir = os.path.join(script_dir, 'plots')
+    os.makedirs(plots_dir, exist_ok=True)
+
+    # Determine data folders
+    if args.data_dirs:
+        # Validate exactly 3 directories
+        if len(args.data_dirs) != 3:
+            print(f"Error: This script requires exactly 3 directories, got {len(args.data_dirs)}")
+            return
+
+        # Use command-line provided directories
+        folders_dict = {}
+        for folder_path in args.data_dirs:
+            if os.path.exists(folder_path):
+                folder_name = os.path.basename(folder_path)
+                res_num = extract_resolution_from_dirname(folder_name)
+                label = f'N={res_num}' if res_num else folder_name
+                folders_dict[label] = folder_path
+            else:
+                print(f"Warning: Folder not found: {folder_path}")
+
+        if len(folders_dict) != 3:
+            print("Error: Need exactly 3 valid directories")
+            return
+
+        # Sort by resolution to assign low/med/high
+        sorted_items = sorted(folders_dict.items(), key=lambda x: extract_resolution_from_dirname(x[0]) or 0)
+        low_res, med_res, high_res = sorted_items[0][0], sorted_items[1][0], sorted_items[2][0]
+        folders_dict = dict(sorted_items)
+    else:
+        # Use default FOLDERS (backward compatibility)
+        folders_dict = FOLDERS
+        low_res = f'N={N_very_low}'
+        med_res = f'N={N_low}'
+        high_res = f'N={N_med}'
 
     # =========================================================
     # Create single figure with 2x2 subplots
@@ -121,7 +214,7 @@ def main():
     l1_data = {}
     l2_data = {}
 
-    for (label, folder_path), color in zip(FOLDERS.items(), COLORS):
+    for (label, folder_path), color in zip(folders_dict.items(), COLORS):
         t, rho_c, l1_rho, l2_rho = load_timeseries(folder_path)
         if t is None:
             continue
@@ -151,43 +244,61 @@ def main():
     # Plot 2: L1 error
     if l1_data:
         for label, (t, l1_rho, color) in l1_data.items():
-            ax2.plot(t, l1_rho * 1e5, label=label, color=color, linewidth=0.8)
+            ax2.plot(t, l1_rho, label=label, color=color, linewidth=0.8)
         ax2.set_xlabel(r'$t$ [M$_\odot$]')
-        ax2.set_ylabel(r'$L_1(\rho)$ error $[\times 10^{-5}]$')
+        ax2.set_ylabel(r'$L_1(\rho)$ error')
         ax2.set_title(r'(b) $L_1$ Norm of Density Error')
+        ax2.set_yscale('log')
         ax2.legend(fontsize=8)
         ax2.grid(alpha=0.3)
 
     # Plot 3: L2 error
     if l2_data:
         for label, (t, l2_rho, color) in l2_data.items():
-            ax3.plot(t, l2_rho * 1e5, label=label, color=color, linewidth=0.8)
+            ax3.plot(t, l2_rho, label=label, color=color, linewidth=0.8)
         ax3.set_xlabel(r'$t$ [M$_\odot$]')
-        ax3.set_ylabel(r'$L_2(\rho)$ error $[\times 10^{-5}]$')
+        ax3.set_ylabel(r'$L_2(\rho)$ error')
         ax3.set_title(r'(c) $L_2$ Norm of Density Error')
+        ax3.set_yscale('log')
         ax3.legend(fontsize=8)
         ax3.grid(alpha=0.3)
 
     # =========================================================
     # Plot 4: Convergence order
     # =========================================================
-    t1, rho1 = load_snapshots(FOLDERS[low_res])
-    t2, rho2 = load_snapshots(FOLDERS[med_res])
-    t3, rho3 = load_snapshots(FOLDERS[high_res])
+    t1, rho1 = load_snapshots(folders_dict[low_res])
+    t2, rho2 = load_snapshots(folders_dict[med_res])
+    t3, rho3 = load_snapshots(folders_dict[high_res])
 
-    # Assume snapshots are synchronized
+    # Use coarsest time grid as reference (has fewest snapshots)
     mask = t1 <= t_max
     t_snap = t1[mask]
+    rho1 = [rho1[i] for i in range(len(t1)) if t1[i] <= t_max]
 
+    print(f"\nSynchronizing snapshots:")
+    print(f"  {low_res}: {len(t1)} snapshots, dt ≈ {np.mean(np.diff(t1)):.3f}")
+    print(f"  {med_res}: {len(t2)} snapshots, dt ≈ {np.mean(np.diff(t2)):.3f}")
+    print(f"  {high_res}: {len(t3)} snapshots, dt ≈ {np.mean(np.diff(t3)):.3f}")
+    print(f"  Using {low_res} times as reference ({len(t_snap)} points)")
+
+    # Find nearest neighbor snapshots (no temporal interpolation)
+    print(f"  Finding nearest {med_res} snapshots to reference times...")
+    rho2_interp = find_nearest_snapshots(t_snap, t2, rho2)
+    print(f"  Finding nearest {high_res} snapshots to reference times...")
+    rho3_interp = find_nearest_snapshots(t_snap, t3, rho3)
+
+    # Compute errors at synchronized times
     E12 = []
     E23 = []
 
     for i in range(len(t_snap)):
-        E12.append(l1_error(rho1[i], rho2[i]))
-        E23.append(l1_error(rho2[i], rho3[i]))
+        E12.append(l1_error(rho1[i], rho2_interp[i]))
+        E23.append(l1_error(rho2_interp[i], rho3_interp[i]))
 
     E12 = np.array(E12)
     E23 = np.array(E23)
+
+    print(f"  Computed L1 errors: E12 mean={np.mean(E12):.3e}, E23 mean={np.mean(E23):.3e}")
 
     with np.errstate(divide='ignore', invalid='ignore'):
         p = np.log(E12 / E23) / np.log(2.0)
@@ -213,12 +324,12 @@ def main():
     ax4.grid(alpha=0.3)
 
     plt.tight_layout()
-    # Save in the same directory as the script
-    script_dir = os.path.dirname(os.path.abspath(__file__))
-    plots_dir = os.path.join(script_dir, 'plots')
-    os.makedirs(plots_dir, exist_ok=True)
-    plt.savefig(os.path.join(plots_dir, 'convergence_analysis.png'), dpi=150, bbox_inches='tight')
+    # Save plot
+    output_path = os.path.join(plots_dir, 'convergence_analysis.png')
+    plt.savefig(output_path, dpi=150, bbox_inches='tight')
+    print(f"Saved: {output_path}")
     plt.show()
+    #plt.close('all')
 
     # =========================================================
     # Print convergence analysis

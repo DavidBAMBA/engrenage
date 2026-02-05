@@ -19,7 +19,7 @@ from glob import glob
 
 # Directorio del script
 script_dir = os.path.dirname(os.path.abspath(__file__))
-data_dir = os.path.join(script_dir, 'tov_evolution_data')
+data_dir = '/home/davidbamba/repositories/engrenage/examples/TOV/tov_evolution_data_rmax20_TEST_kas_ideal_long_domain_lasttest'
 plots_dir = os.path.join(script_dir, 'plots')
 
 # Crear directorio de plots si no existe
@@ -225,7 +225,7 @@ def plot_density_evolution(snapshots, metadata=None):
     plt.savefig(output_file, dpi=150, bbox_inches='tight')
     print(f"\n✓ Gráfica guardada en: {output_file}")
 
-    plt.show()
+    plt.close(fig)
 
     return fig
 

@@ -194,7 +194,7 @@ class SimulationDataManager:
         # Handle both TOVSolution objects and dicts
         if hasattr(tov_solution, 'M_star'):
             M_star = tov_solution.M_star
-            R = tov_solution.R
+            R = tov_solution.R_iso
             C = tov_solution.C
             K_val = tov_solution.K if K is None else K
             Gamma_val = tov_solution.Gamma if Gamma is None else Gamma
@@ -1298,8 +1298,8 @@ def plot_evolution(states, times, grid, hydro, rho_ref, p_ref,
     plt.tight_layout()
     out_path = os.path.join(plots_dir, f'tov_evolution{suffix}.png')
     plt.savefig(out_path, dpi=150, bbox_inches='tight')
-    #plt.close(fig)
-    plt.show()
+    plt.close(fig)
+    #plt.show()
     print(f"Saved: {out_path}")
 
 
@@ -1443,14 +1443,14 @@ def plot_tov_vs_initial_data_zoom(tov_solution, initial_state_2d, grid, primitiv
     from scipy.interpolate import interp1d
 
     # Handle both TOVSolution objects and dicts
-    if hasattr(tov_solution, 'R'):
-        R = float(tov_solution.R)
-        r_tov = tov_solution.r
+    if hasattr(tov_solution, 'R_iso'):
+        R = float(tov_solution.R_iso)
+        r_tov = tov_solution.r_iso
         rho_tov = tov_solution.rho_baryon
         P_tov = tov_solution.P
     else:
-        R = float(tov_solution['R'])
-        r_tov = tov_solution['r']
+        R = float(tov_solution['R_iso'])
+        r_tov = tov_solution['r_iso']
         rho_tov = tov_solution['rho_baryon']
         P_tov = tov_solution['P']
 
