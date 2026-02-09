@@ -21,16 +21,17 @@ FREQ_CONVERSION = 1.0 / (M_SUN_SECONDS * 1e3)
 ANALYSIS_VAR = 1
 
 # Time to start analysis (in M_sun units) - data before this is discarded
-T_START = 0.0
+T_START = 100.0
 
 # =============================================================================
 # FOLDERS TO ANALYZE - Specify the exact folders you want to analyze
 # =============================================================================
 FOLDERS_TO_ANALYZE = [
-    '../tov_evolution_data_rmax20_TEST_kas_ideal_long_domain_lasttest/tov_star_rhoc1p28em03_N100_K100_G2_cow_mp5',
-    '../tov_evolution_data_rmax20_TEST_kas_ideal_long_domain_lasttest/tov_star_rhoc1p28em03_N200_K100_G2_cow_mp5',
-    '../tov_evolution_data_rmax20_TEST_kas_ideal_long_domain_lasttest/tov_star_rhoc1p28em03_N400_K100_G2_cow_mp5',
-    '../tov_evolution_data_rmax20_TEST_kas_ideal_long_domain_lasttest/tov_star_rhoc1p28em03_N800_K100_G2_cow_mp5',
+    '/home/davidbamba/repositories/engrenage/examples/TOV/tov_evolution_data_rmax100.0_jax/tov_star_rhoc1p28em03_N16000_K100_G2_cow_mp5'
+
+ # '../tov_evolution_data_rmax20_TEST_kas_ideal_long_domain_lasttest/tov_star_rhoc1p28em03_N200_K100_G2_cow_mp5',
+    #'../tov_evolution_data_rmax20_TEST_kas_ideal_long_domain_lasttest/tov_star_rhoc1p28em03_N400_K100_G2_cow_mp5',
+    #'../tov_evolution_data_rmax20_TEST_kas_ideal_long_domain_lasttest/tov_star_rhoc1p28em03_N800_K100_G2_cow_mp5',
 ]
 
 # Theoretical frequencies (Font et al. 2002)
@@ -208,11 +209,12 @@ def find_all_peaks(freq_khz, power, min_freq=1.0, max_freq=14.0, max_peaks=10):
 
 def plot_qnm_v3(t, signal_data, freq_khz, power, peak_freqs, peak_powers,
                 theoretical_freqs, output_path=None, title=None, var_name='rho_central'):
-    from mpl_toolkits.axes_grid1.inset_locator import inset_axes
-
     fig, axes = plt.subplots(1, 2, figsize=(14, 4))
     if title:
         fig.suptitle(title, fontsize=14, fontweight='bold', y=0.98)
+
+    # Convert time to milliseconds for main plot
+    t_ms = t * M_SUN_SECONDS * 1e3
 
     # Left: signal evolution
     ax1 = axes[0]
@@ -220,34 +222,18 @@ def plot_qnm_v3(t, signal_data, freq_khz, power, peak_freqs, peak_powers,
         # Velocity: plot directly or subtract mean
         signal_0 = np.mean(signal_data)
         delta_signal = signal_data - signal_0
-        ax1.plot(t, delta_signal, color='darkblue', linewidth=0.8)
-        ax1.set_xlabel(r'$t$ [M$_\odot$]', fontsize=12)
+        ax1.plot(t_ms, delta_signal, color='darkblue', linewidth=0.8)
+        ax1.set_xlabel(r'$t$ [ms]', fontsize=12)
         ax1.set_ylabel(r'$v_c - \bar{v}_c$', fontsize=12)
         ax1.set_title('Central Radial Velocity', fontsize=14)
-        # Inset
-        ax_inset = inset_axes(ax1, width="30%", height="25%", loc='lower right')
-        mask_zoom = t <= min(1000, t[-1]/10)
-        if np.sum(mask_zoom) > 10:
-            ax_inset.plot(t[mask_zoom], signal_data[mask_zoom], 'k-', linewidth=0.6)
-            ax_inset.set_xlabel('Time', fontsize=8)
-            ax_inset.set_ylabel(r'$v_c$', fontsize=8)
-            ax_inset.tick_params(labelsize=7)
     else:
         # Density: relative change
         signal_0 = signal_data[0]
         delta_signal = (signal_data - signal_0) / signal_0
-        ax1.plot(t, delta_signal, color='darkred', linewidth=0.8)
-        ax1.set_xlabel(r'$t$ [M$_\odot$]', fontsize=12)
+        ax1.plot(t_ms, delta_signal, color='darkred', linewidth=0.8)
+        ax1.set_xlabel(r'$t$ [ms]', fontsize=12)
         ax1.set_ylabel(r'$(\rho_c - \rho_{c,0})/\rho_{c,0}$', fontsize=12)
         ax1.set_title('Central Density Relative Change', fontsize=14)
-        # Inset
-        ax_inset = inset_axes(ax1, width="30%", height="25%", loc='lower right')
-        mask_zoom = t <= min(1000, t[-1]/10)
-        if np.sum(mask_zoom) > 10:
-            ax_inset.plot(t[mask_zoom], signal_data[mask_zoom]/signal_0, 'k-', linewidth=0.6)
-            ax_inset.set_xlabel('Time', fontsize=8)
-            ax_inset.set_ylabel(r'$\rho_c/\rho_{c,0}$', fontsize=8)
-            ax_inset.tick_params(labelsize=7)
 
     ax1.grid(True, alpha=0.3)
 
@@ -284,7 +270,7 @@ def plot_qnm_v3(t, signal_data, freq_khz, power, peak_freqs, peak_powers,
         pv = power[valid]
         ax2.set_ylim(np.min(pv[pv > 0]) * 0.1, np.max(pv) * 10)
     
-    plt.subplots_adjust(top=0.88, bottom=0.15, left=0.08, right=0.95, wspace=0.25)
+    plt.subplots_adjust(top=0.88, bottom=0.15, left=0.08, right=0.9, wspace=0.25)
     if output_path:
         plt.savefig(output_path, dpi=150)
         print(f"Saved: {output_path}")
@@ -527,7 +513,8 @@ def create_comparison_table(results_list, plot_dir, var_name='rho_central'):
 
     output_path = os.path.join(plot_dir, f'qnm_comparison_table_{var_name}.png')
     plt.savefig(output_path, dpi=150, bbox_inches='tight')
-    plt.close(fig)
+    plt.show()
+    #plt.close(fig)
     print(f"\nSaved comparison table: {output_path}")
 
     return output_path
@@ -544,8 +531,8 @@ Examples:
   python plot_qnm_analysis.py --data-dirs DIR1 DIR2 --output-dir OUT  # Custom paths
 '''
     )
-    parser.add_argument('--delta-t', type=float, default=None,
-                        help='Time interval for subsampling (e.g., 1 for t=0,1,2,...). Default: None (use all data)')
+    parser.add_argument('--delta-t', type=float, default=1.0,
+                        help='Time interval for subsampling (e.g., 1 for t=0,1,2,...). Default: 1.0')
     parser.add_argument('--data-dirs', nargs='+', default=None,
                         help='List of data directories to analyze. Default: use FOLDERS_TO_ANALYZE')
     parser.add_argument('--output-dir', default=None,
@@ -625,8 +612,8 @@ Examples:
     if comparison_table_path:
         print(f"\nComparison table:")
         print(f"  - {comparison_table_path}")
-
-    plt.close('all')
+    plt.show()
+    #plt.close('all')
 
 
 if __name__ == "__main__":

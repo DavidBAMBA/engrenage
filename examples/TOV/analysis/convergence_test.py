@@ -17,6 +17,13 @@ Expected Q values for different orders (uniform refinement factor 2):
 - 2nd order: Q = 4
 - 3rd order: Q = 8
 - 5th order: Q = 32
+
+Spatial and Temporal alignment:
+  - All resolutions aligned to common physical radius using cubic spatial interpolation
+  - Common radius: r[3] from finest resolution
+  - Common time grid: coarsest resolution as reference
+  - Cubic spline interpolation used for both spatial and temporal alignment
+  - Ensures all resolutions evaluated at exactly the same physical position and times
 """
 
 import numpy as np
@@ -25,6 +32,7 @@ import h5py
 import os
 import argparse
 from scipy.signal import savgol_filter
+from scipy.interpolate import interp1d
 
 # Resolutions - UPDATE THESE TO CHANGE RESOLUTIONS
 N_low = 2000
@@ -68,21 +76,33 @@ def get_color(label, all_labels):
     return color_map[idx % len(color_map)]
 
 
-def load_evolution_data(folder_path, suffix="_cow"):
+def load_snapshots(folder_path, suffix="_cow"):
     """
-    Load evolution data (time series) from HDF5 file.
-    
+    Load snapshots with density profiles and times.
+
     Returns:
-        times: array of time values
-        rho_central: array of central density values
+        times: array of snapshot times
+        r: radial grid
+        rho_list: list of density profiles rho0(r) at each time
     """
-    evolution_file = os.path.join(folder_path, f'tov_evolution{suffix}.h5')
-    
-    with h5py.File(evolution_file, 'r') as f:
-        times = f['time'][:]
-        rho_central = f['rho_central'][:]
-    
-    return times, rho_central
+    h5_file = os.path.join(folder_path, f'tov_snapshots{suffix}.h5')
+
+    times = []
+    rho_list = []
+
+    with h5py.File(h5_file, 'r') as f:
+        # Load grid
+        r = f['grid/r'][:]
+
+        # Get sorted snapshot keys
+        snap_keys = sorted([k for k in f['snapshots'].keys()])
+
+        for key in snap_keys:
+            snap = f[f'snapshots/{key}']
+            times.append(snap.attrs['time'])
+            rho_list.append(snap['primitives/rho0'][:])
+
+    return np.array(times), r, rho_list
 
 
 def compute_expected_Q(dr_l, dr_m, dr_h, order):
@@ -103,23 +123,6 @@ def compute_expected_Q(dr_l, dr_m, dr_h, order):
     numerator = dr_l**order - dr_m**order
     denominator = dr_m**order - dr_h**order
     return numerator / denominator
-
-
-def find_nearest_time_indices(t_target, t_source):
-    """
-    Find indices in t_source that are closest to each point in t_target.
-
-    Args:
-        t_target: target time array
-        t_source: source time array
-
-    Returns:
-        Array of indices into t_source
-    """
-    indices = np.zeros(len(t_target), dtype=int)
-    for i, t in enumerate(t_target):
-        indices[i] = np.argmin(np.abs(t_source - t))
-    return indices
 
 
 def smooth_data(y, window=51, polyorder=3):
@@ -192,15 +195,18 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog='''
 Examples:
-  python convergence_test.py                       # Use default folders
-  python convergence_test.py --data-dirs D1 D2 D3  # Exactly 3 directories
-  python convergence_test.py --r-max 100           # Different domain size
+  python convergence_test.py                                    # Use default folders
+  python convergence_test.py --data-dirs D1 D2 D3              # Exactly 3 directories
+  python convergence_test.py --t-min 50 --t-max 500            # Analyze from t=50 to t=500
+  python convergence_test.py --r-max 100 --window-size 50      # Different domain and window
 '''
     )
     parser.add_argument('--data-dirs', nargs='+', default=None,
                         help='List of data directories (exactly 3 required). Default: use FOLDERS')
     parser.add_argument('--output-dir', default=None,
                         help='Output directory for plots. Default: script_dir/plots')
+    parser.add_argument('--t-min', type=float, default=0.0,
+                        help='Minimum time to analyze. Default: 0.0')
     parser.add_argument('--t-max', type=float, default=2000.0,
                         help='Maximum time to plot. Default: 2000.0')
     parser.add_argument('--r-max', type=float, default=40.0,
@@ -209,6 +215,7 @@ Examples:
                         help='Window size for L2 windowed Q-factor. Default: 100')
     args = parser.parse_args()
 
+    t_min = args.t_min
     t_max = args.t_max
     r_max = args.r_max
     script_dir = os.path.dirname(os.path.abspath(__file__))
@@ -260,25 +267,25 @@ Examples:
         high_res = f'N={N_high}'
 
     # =========================================================
-    # Load evolution data for all resolutions
+    # Load snapshots for all resolutions
     # =========================================================
-    print("Loading evolution data...")
+    print("Loading snapshots...")
 
     data = {}
     for label, folder_path in folders_dict.items():
         print(f"  Loading {label}...")
-        times, rho_central = load_evolution_data(folder_path)
+        times, r, rho_list = load_snapshots(folder_path)
 
         # Apply time mask
-        mask = times <= t_max
+        mask = (times >= t_min) & (times <= t_max)
         data[label] = {
             't': times[mask],
-            'rho_c': rho_central[mask],
-            'rho_c_0': rho_central[0],  # Initial central density
+            'r': r,
+            'rho': [rho_list[i] for i in range(len(times)) if mask[i]],
             'dr': resolutions_dict[label]['dr'],
             'N': resolutions_dict[label]['N'],
         }
-        print(f"    {len(times[mask])} points, ρ_c(0) = {rho_central[0]:.6e}")
+        print(f"    {len(times[mask])} snapshots, N={len(r)} points, r range: [{r[0]:.6f}, {r[-1]:.6f}]")
     
     # =========================================================
     # Get grid spacings
@@ -301,19 +308,56 @@ Examples:
         print(f"  Order {order}: Q = {Q_expected:.2f}")
     
     # =========================================================
-    # Find nearest time points (no interpolation)
+    # Interpolate central density: spatial then temporal
     # =========================================================
-    print("\nFinding nearest time points for comparison...")
+    print("\nInterpolating central density (spatial + temporal cubic interpolation)...")
+
+    # Step 1: Define common radius for spatial interpolation
+    # Use r[3] from the finest resolution as reference
+    r_common = data[high_res]['r'][3]
+    print(f"  Using common radius from finest resolution: r_common = r[3] = {r_common:.6f}")
+    print(f"  Grid positions r[3] for comparison:")
+    for label in [low_res, med_res, high_res]:
+        print(f"    {label}: r[3] = {data[label]['r'][3]:.6f}")
+
+    # Helper function: interpolate density to fixed physical position
+    def get_rhoc_at_r(r_grid, rho_profile, r_target):
+        """Interpolate density profile to target radius using cubic interpolation."""
+        interp_func = interp1d(r_grid, rho_profile, kind='cubic',
+                               bounds_error=False, fill_value='extrapolate')
+        return interp_func(r_target)
+
+    # Step 2: Extract central density at common radius for each snapshot
+    print(f"  Extracting ρ(r={r_common:.6f}) for each snapshot (spatial cubic interpolation)...")
+    rhoc_l_native = np.array([get_rhoc_at_r(data[low_res]['r'], rho, r_common)
+                              for rho in data[low_res]['rho']])
+    rhoc_m_native = np.array([get_rhoc_at_r(data[med_res]['r'], rho, r_common)
+                              for rho in data[med_res]['rho']])
+    rhoc_h_native = np.array([get_rhoc_at_r(data[high_res]['r'], rho, r_common)
+                              for rho in data[high_res]['rho']])
+
+    # Step 3: Interpolate central density to common times (temporal)
+    def interpolate_rhoc_in_time(times_source, rhoc_source, times_target):
+        """Interpolate central density to target times using cubic interpolation."""
+        # Remove duplicate times
+        unique_indices = np.unique(times_source, return_index=True)[1]
+        unique_indices = np.sort(unique_indices)
+        times_unique = times_source[unique_indices]
+        rhoc_unique = rhoc_source[unique_indices]
+
+        interp_func = interp1d(times_unique, rhoc_unique, kind='cubic',
+                               bounds_error=False, fill_value='extrapolate')
+        return interp_func(times_target)
 
     # Use the coarsest time grid (low_res) as reference
     t_common = data[low_res]['t']
 
-    # Find nearest time points in medium and high resolution data
-    rho_l = data[low_res]['rho_c']  # Already on common grid
-    indices_m = find_nearest_time_indices(t_common, data[med_res]['t'])
-    indices_h = find_nearest_time_indices(t_common, data[high_res]['t'])
-    rho_m = data[med_res]['rho_c'][indices_m]
-    rho_h = data[high_res]['rho_c'][indices_h]
+    print(f"  Interpolating ρ_c to common time grid (temporal cubic interpolation)...")
+    rho_l = interpolate_rhoc_in_time(data[low_res]['t'], rhoc_l_native, t_common)
+    rho_m = interpolate_rhoc_in_time(data[med_res]['t'], rhoc_m_native, t_common)
+    rho_h = interpolate_rhoc_in_time(data[high_res]['t'], rhoc_h_native, t_common)
+
+    print(f"  Central density at r={r_common:.6f} interpolated for {len(t_common)} time points")
     
     # =========================================================
     # Compute Q(t) = (ρ_l - ρ_m) / (ρ_m - ρ_h)
@@ -352,19 +396,27 @@ Examples:
     # Top panel: Central density evolution (normalized)
     # ρ_c(t) / ρ_c(0)
     # ---------------------------------------------------------
-    for label in [high_res, med_res, low_res]:  # Plot finest first (bottom of legend)
-        d = data[label]
-        rho_normalized = d['rho_c'] / d['rho_c_0']
-        N = d['N']
-        dr = d['dr']
-        ax1.plot(d['t'], rho_normalized,
-                label=f'Δr = {dr}',
-                color=get_color(label, data.keys()),
-                linewidth=1.0)
-    
+    # Calculate normalized density for all resolutions
+    rho_l_normalized = rho_l / rho_l[0]
+    rho_m_normalized = rho_m / rho_m[0]
+    rho_h_normalized = rho_h / rho_h[0]
+
+    # Plot all three resolutions
+    ax1.plot(t_common, rho_h_normalized, label=f'Δr = {data[high_res]["dr"]}',
+            color='#d62728', linewidth=1.0)  # red (finest)
+    ax1.plot(t_common, rho_m_normalized, label=f'Δr = {data[med_res]["dr"]}',
+            color='#1f77b4', linewidth=1.0)  # blue (medium)
+    ax1.plot(t_common, rho_l_normalized, label=f'Δr = {data[low_res]["dr"]}',
+            color='#2ca02c', linewidth=1.0)  # green (coarse)
+
+    # Set y-limits based on low resolution oscillations (noisiest)
+    rho_low_min = np.min(rho_l_normalized)
+    rho_low_max = np.max(rho_l_normalized)
+    margin = (rho_low_max - rho_low_min) * 0.1  # 10% margin on each side
+    ax1.set_ylim(rho_low_min - margin, rho_low_max + margin)
+
     ax1.set_ylabel(r'$\rho_c(t) / \rho_c(0)$', fontsize=12)
     ax1.legend(loc='upper right', fontsize=10)
-    ax1.set_ylim(0.995, 1.005)  # Wider range to see general behavior
     ax1.ticklabel_format(axis='y', style='plain', useOffset=False)
     
     # ---------------------------------------------------------
@@ -427,6 +479,7 @@ Examples:
 
     print(f"\nGrid configuration:")
     print(f"  r_max = {r_max}")
+    print(f"  Time range: t = [{t_min}, {t_max}]")
     print(f"  Resolutions: {low_res}, {med_res}, {high_res}")
     print(f"  Δr = [{dr_l}, {dr_m}, {dr_h}]")
     print(f"  dt = 0.1 * Δr = [{0.1*dr_l}, {0.1*dr_m}, {0.1*dr_h}]")

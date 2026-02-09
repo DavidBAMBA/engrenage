@@ -39,7 +39,7 @@ def wenoz_face_kernel_jax(um2, um1, u0, up1, up2):
 
     # Ideal weights
     d0, d1, d2 = 0.1, 0.6, 0.3
-    eps = 1.0e-6
+    eps = 1.0e-20  # Match Numba implementation
 
     # Modified alpha weights with tau enhancement
     alpha0 = d0 * (1.0 + (tau5 / (beta0 + eps))**2)
@@ -74,7 +74,7 @@ def weno5_face_kernel_jax(um2, um1, u0, up1, up2):
 
     # Ideal weights
     d0, d1, d2 = 0.1, 0.6, 0.3
-    eps = 1.0e-6
+    eps = 1.0e-20  # Match Numba implementation
 
     # Alpha weights
     alpha0 = d0 / (eps + beta0)**2
@@ -158,7 +158,7 @@ def mp5_face_kernel_jax(um2, um1, u0, up1, up2):
     """
     # Parameters
     alpha = 4.0
-    eps = 1e-10
+    eps = 1.0e-20  # Match Numba implementation
 
     # Norm for switching criterion
     vnorm = jnp.sqrt(um2**2 + um1**2 + u0**2 + up1**2 + up2**2) + 1e-30

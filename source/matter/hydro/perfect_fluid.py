@@ -65,8 +65,8 @@ class PerfectFluid:
         self.cons2prim_solver = Cons2PrimSolver(
             self.eos,
             atmosphere=self.atmosphere,
-            tol=1e-18,
-            max_iter=200,
+            tol=1e-10,
+            max_iter=100,
             solver_method=solver_method
         )
 

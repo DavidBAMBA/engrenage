@@ -185,58 +185,67 @@ def entropy_fix_jax(lam_minus, lam_plus, delta=1e-8):
 
 
 @jit
-def physical_flux_1d_jax(rho0, vr, pressure, W, h, alpha, e6phi, gamma_rr):
+def physical_flux_1d_jax(rho0, vr, pressure, W, h, alpha, e6phi, gamma_rr, beta_r):
     """
     Compute physical flux for 1D radial direction (JAX version).
 
-    Inlines the Valencia flux computation for better performance.
+    Implements Valencia flux formulas with full shift support:
+        vtilde^r = v^r - β^r/α
+        F̃_D^r   = e^{6φ} α D vtilde^r
+        F̃_Sr^r  = e^{6φ} α T^r_r
+        F̃_τ^r   = e^{6φ} (α² T^{0r} - α D vtilde^r)
 
     Args:
         rho0: (M,) rest-mass density
-        vr: (M,) radial velocity
+        vr: (M,) radial velocity v^r
         pressure: (M,) pressure
         W: (M,) Lorentz factor
         h: (M,) specific enthalpy
         alpha: (M,) lapse
         e6phi: (M,) conformal factor e^{6phi}
-        gamma_rr: (M,) radial metric component
+        gamma_rr: (M,) radial metric component γ_rr
+        beta_r: (M,) radial shift β^r
 
     Returns:
         F: (M, 3) physical flux [F_D, F_Sr, F_tau]
     """
-    # For spherical symmetry with zero shift: vtilde^r = v^r
-    vtilde_r = vr
+    # Valencia velocity: vtilde^r = v^r - β^r/α
+    vtilde_r = vr - beta_r / alpha
 
-    # 4-velocity components: u^0 = W/alpha, u^r = W * v^r
+    # 4-velocity components: u^0 = W/α, u^r = W * vtilde^r
     u0 = W / alpha
     ur = W * vtilde_r
 
-    # Conservative density: D = rho * W
+    # Conservative density: D = ρ W
     D = rho0 * W
 
-    # Stress-energy tensor components needed for flux
-    # T^{0r} = rho*h*u^0*u^r + P*g^{0r}
-    # For zero shift: g^{0r} = 0
+    # Inverse metric components with shift
+    alpha_sq = alpha * alpha
+
+    # g^{0r} = β^r/α²
+    g4UU_0r = beta_r / alpha_sq
+
+    # Stress-energy tensor components
     rho_h = rho0 * h
-    T0r = rho_h * u0 * ur
 
-    # T^{rr} = rho*h*u^r*u^r + P*g^{rr}
-    # g^{rr} = 1/gamma_rr (for diagonal metric)
-    grr_inv = 1.0 / gamma_rr
-    Trr = rho_h * ur * ur + pressure * grr_inv
+    # T^{0r} = ρh u^0 u^r + P g^{0r}
+    T0r = rho_h * u0 * ur + pressure * g4UU_0r
 
-    # T^r_r = T^{rr} * gamma_rr = rho*h*u^r*u^r*gamma_rr + P
-    Tr_r = rho_h * ur * ur * gamma_rr + pressure
+    # v_r = γ_{rr} v^r (covariant velocity component)
+    v_r = gamma_rr * vr
 
-    # Fluxes (densitized by e^{6phi})
-    # F_D = e6phi * alpha * D * vtilde^r
+    # T^r_r = ρh W² v_r vtilde^r + p (equation 27 from Valencia formulation)
+    Tr_r = rho_h * W * W * v_r * vtilde_r + pressure
+
+    # Fluxes (densitized by e^{6φ})
+    # F̃_D = e^{6φ} α D vtilde^r
     F_D = e6phi * alpha * D * vtilde_r
 
-    # F_Sr = e6phi * alpha * T^r_r
+    # F̃_Sr = e^{6φ} α T^r_r
     F_Sr = e6phi * alpha * Tr_r
 
-    # F_tau = e6phi * (alpha^2 * T^{0r} - alpha * D * vtilde^r)
-    F_tau = e6phi * (alpha * alpha * T0r - alpha * D * vtilde_r)
+    # F̃_τ = e^{6φ} (α² T^{0r} - α D vtilde^r)
+    F_tau = e6phi * (alpha_sq * T0r - alpha * D * vtilde_r)
 
     return jnp.stack([F_D, F_Sr, F_tau], axis=1)
 
@@ -451,9 +460,9 @@ class HLLRiemannSolverJAX:
         # Entropy fix
         lam_minus, lam_plus = entropy_fix_jax(lam_minus, lam_plus)
 
-        # Compute physical fluxes
-        FL = physical_flux_1d_jax(rho0L, vrL, pL, WL, hL, alpha, e6phi, gamma_rr)
-        FR = physical_flux_1d_jax(rho0R, vrR, pR, WR, hR, alpha, e6phi, gamma_rr)
+        # Compute physical fluxes (with full shift support)
+        FL = physical_flux_1d_jax(rho0L, vrL, pL, WL, hL, alpha, e6phi, gamma_rr, beta_r)
+        FR = physical_flux_1d_jax(rho0R, vrR, pR, WR, hR, alpha, e6phi, gamma_rr, beta_r)
 
         # HLL flux combination
         flux = hll_flux_jax(DL, SrL, tauL, DR, SrR, tauR, FL, FR, lam_minus, lam_plus)
@@ -574,9 +583,9 @@ class LLFRiemannSolverJAX:
         # Entropy fix (for robustness)
         lam_minus, lam_plus = entropy_fix_jax(lam_minus, lam_plus)
 
-        # Compute physical fluxes
-        FL = physical_flux_1d_jax(rho0L, vrL, pL, WL, hL, alpha, e6phi, gamma_rr)
-        FR = physical_flux_1d_jax(rho0R, vrR, pR, WR, hR, alpha, e6phi, gamma_rr)
+        # Compute physical fluxes (with full shift support)
+        FL = physical_flux_1d_jax(rho0L, vrL, pL, WL, hL, alpha, e6phi, gamma_rr, beta_r)
+        FR = physical_flux_1d_jax(rho0R, vrR, pR, WR, hR, alpha, e6phi, gamma_rr, beta_r)
 
         # LLF flux combination (the only difference from HLL)
         flux = llf_flux_jax(DL, SrL, tauL, DR, SrR, tauR, FL, FR, lam_minus, lam_plus)

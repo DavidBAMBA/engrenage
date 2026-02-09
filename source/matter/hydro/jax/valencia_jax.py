@@ -15,7 +15,11 @@ from jax import jit
 from functools import partial
 import numpy as np
 
-from source.matter.hydro.jax.cons2prim_jax import _solve_newton_batch_jax, _solve_newton_batch_polytropic_jax
+from source.matter.hydro.jax.cons2prim_jax import (
+    _solve_newton_batch_jax,
+    _solve_newton_batch_polytropic_jax,
+    _solve_kastaun_batch_jax,
+)
 from source.matter.hydro.jax.reconstruction_jax import (
     wenoz_reconstruct_3vars_jax,
     weno5_reconstruct_3vars_jax,
@@ -255,6 +259,44 @@ def cons2prim_batch_polytropic(D, Sr, tau, gamma_rr,
     return rho0, vr, p, eps, W, h
 
 
+@partial(jit, static_argnums=(4, 5, 6, 7, 8, 9, 10))
+def cons2prim_batch_kastaun_ideal(D, Sr, tau, gamma_rr,
+                                   eos_gamma, rho_floor, p_floor, v_max, W_max, tol, max_iter):
+    """
+    Full cons2prim for ideal gas using Kastaun et al. (2021) bracketed solver.
+    Atmosphere detection + Kastaun solve + floors.
+    """
+    gm1 = eos_gamma - 1.0
+
+    # Atmosphere detection (branchless)
+    atm_mask = D < 100.0 * rho_floor
+
+    # Solve with vmap Kastaun
+    rho0_s, vr_s, p_s, eps_s, W_s, h_s, conv_s = _solve_kastaun_batch_jax(
+        D, Sr, tau, gamma_rr,
+        eos_gamma, rho_floor, p_floor, v_max, W_max, tol, max_iter
+    )
+
+    # Atmosphere values
+    eps_atm = p_floor / (rho_floor * gm1)
+    h_atm = 1.0 + eps_atm + p_floor / rho_floor
+
+    # Apply atmosphere for low-D points and failed points
+    failed_mask = ~conv_s | atm_mask
+    rho0 = jnp.where(failed_mask, rho_floor, rho0_s)
+    vr = jnp.where(failed_mask, 0.0, vr_s)
+    p = jnp.where(failed_mask, p_floor, p_s)
+    eps = jnp.where(failed_mask, eps_atm, eps_s)
+    W = jnp.where(failed_mask, 1.0, W_s)
+    h = jnp.where(failed_mask, h_atm, h_s)
+
+    # Final floors
+    rho0 = jnp.maximum(rho0, rho_floor)
+    p = jnp.maximum(p, p_floor)
+
+    return rho0, vr, p, eps, W, h
+
+
 # =============================================================================
 # Reconstruction wrapper (dispatches to correct method)
 # =============================================================================
@@ -407,9 +449,9 @@ def compute_hll_flux(rhoL, vrL, pL, rhoR, vrR, pR,
     lam_plus = jnp.maximum(0.0, jnp.maximum(cpL, cpR))
     lam_minus, lam_plus = entropy_fix_jax(-lam_minus, lam_plus)
 
-    # Physical fluxes
-    FL = physical_flux_1d_jax(rhoL, vrL, pL, WL, hL, alpha, e6phi, gamma_rr)
-    FR = physical_flux_1d_jax(rhoR, vrR, pR, WR, hR, alpha, e6phi, gamma_rr)
+    # Physical fluxes (with full shift support)
+    FL = physical_flux_1d_jax(rhoL, vrL, pL, WL, hL, alpha, e6phi, gamma_rr, beta_r)
+    FR = physical_flux_1d_jax(rhoR, vrR, pR, WR, hR, alpha, e6phi, gamma_rr, beta_r)
 
     # HLL combination
     return hll_flux_jax(DL, SrL, tauL, DR, SrR, tauR, FL, FR, lam_minus, lam_plus)
@@ -559,12 +601,13 @@ def compute_connection_terms(rho0, vr, pressure, W, h,
 # Main RHS function (Cowling approximation)
 # =============================================================================
 
-@partial(jit, static_argnums=(4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16))
+@partial(jit, static_argnums=(4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17))
 def _compute_hydro_rhs_impl(D, Sr, tau, geom,
                              eos_type, eos_gamma, eos_K,
                              rho_floor, p_floor, v_max, W_max, tol, max_iter,
                              recon_method, riemann_type,
-                             use_connections, use_sources):
+                             use_connections, use_sources,
+                             solver_method):
     """
     JIT-compiled hydro RHS implementation for Cowling evolution.
 
@@ -577,16 +620,29 @@ def _compute_hydro_rhs_impl(D, Sr, tau, geom,
     inv_dx = 1.0 / dx
 
     # =========================================================================
-    # 1. Cons2Prim
+    # 1. De-densitize conservative variables (D̃ = e^{6φ} D_phys)
+    # State stores DENSITIZED conservatives; cons2prim expects PHYSICAL
     # =========================================================================
-    if eos_type == 'ideal_gas':
+    D_phys = D / geom.e6phi
+    Sr_phys = Sr / geom.e6phi
+    tau_phys = tau / geom.e6phi
+
+    # =========================================================================
+    # 2. Cons2Prim (on PHYSICAL conservatives)
+    # =========================================================================
+    if eos_type == 'ideal_gas' and solver_method == 'kastaun':
+        rho0, vr, p, eps, W, h = cons2prim_batch_kastaun_ideal(
+            D_phys, Sr_phys, tau_phys, geom.gamma_rr,
+            eos_gamma, rho_floor, p_floor, v_max, W_max, tol, max_iter
+        )
+    elif eos_type == 'ideal_gas':
         rho0, vr, p, eps, W, h = cons2prim_batch_ideal(
-            D, Sr, tau, geom.gamma_rr,
+            D_phys, Sr_phys, tau_phys, geom.gamma_rr,
             eos_gamma, rho_floor, p_floor, W_max, tol, max_iter
         )
     else:  # polytropic
         rho0, vr, p, eps, W, h = cons2prim_batch_polytropic(
-            D, Sr, tau, geom.gamma_rr,
+            D_phys, Sr_phys, tau_phys, geom.gamma_rr,
             eos_K, eos_gamma, rho_floor, p_floor, W_max, tol, max_iter
         )
 
@@ -676,7 +732,8 @@ def _compute_hydro_rhs_impl(D, Sr, tau, geom,
 
 
 def compute_hydro_rhs_cowling(D, Sr, tau, geom, eos_type, eos_params,
-                              atm_params, recon_method, riemann_type="hll"):
+                              atm_params, recon_method, riemann_type="hll",
+                              solver_method="newton"):
     """
     Compute the full hydro RHS for Cowling evolution.
 
@@ -692,6 +749,7 @@ def compute_hydro_rhs_cowling(D, Sr, tau, geom, eos_type, eos_params,
         atm_params: dict with atmosphere parameters (rho_floor, p_floor, v_max, W_max)
         recon_method: "wenoz", "weno5", "mp5", "mc", "minmod"
         riemann_type: "hll" or "llf"
+        solver_method: "newton" or "kastaun"
 
     Returns:
         rhs_D, rhs_Sr, rhs_tau: (N,) time derivatives of conservative variables
@@ -711,4 +769,5 @@ def compute_hydro_rhs_cowling(D, Sr, tau, geom, eos_type, eos_params,
         riemann_type,
         geom.has_connections,  # Pass as static argument
         geom.has_sources,      # Pass as static argument
+        solver_method,
     )

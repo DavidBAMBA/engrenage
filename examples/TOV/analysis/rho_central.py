@@ -9,6 +9,7 @@ import h5py
 import os
 import argparse
 from scipy.signal import savgol_filter
+from scipy.interpolate import interp1d
 
 # Resolutions - UPDATE THESE TO CHANGE RESOLUTIONS
 N_very_low = 1000
@@ -17,10 +18,10 @@ N_med = 4000
 N_high = 8000
 # Data paths - constructed from resolution values
 FOLDERS = {
-    f'N={N_very_low}': f'/home/davidbamba/repositories/engrenage/examples/TOV/tov_evolution_data_rmax100_TEST_long_domain_16/tov_star_rhoc1p28em03_N{N_very_low}_K100_G2_cow_mp5',
-    f'N={N_low}': f'/home/davidbamba/repositories/engrenage/examples/TOV/tov_evolution_data_rmax100_TEST_long_domain_16/tov_star_rhoc1p28em03_N{N_low}_K100_G2_cow_mp5',
-    f'N={N_med}': f'/home/davidbamba/repositories/engrenage/examples/TOV/tov_evolution_data_rmax100_TEST_long_domain_16/tov_star_rhoc1p28em03_N{N_med}_K100_G2_cow_mp5',
-    f'N={N_high}': f'/home/davidbamba/repositories/engrenage/examples/TOV/tov_evolution_data_rmax100_TEST_long_domain_16/tov_star_rhoc1p28em03_N{N_high}_K100_G2_cow_mp5',
+    f'N={N_very_low}': f'/home/davidbamba/repositories/engrenage/examples/TOV/tov_evolution_data_rmax100.0_jax_reconstructor/tov_star_rhoc1p28em03_N1000_K100_G2_cow_wz',
+    f'N={N_low}': f'/home/davidbamba/repositories/engrenage/examples/TOV/tov_evolution_data_rmax100.0_jax_reconstructor/tov_star_rhoc1p28em03_N2000_K100_G2_cow_wz',
+    f'N={N_med}': f'/home/davidbamba/repositories/engrenage/examples/TOV/tov_evolution_data_rmax100.0_jax_reconstructor/tov_star_rhoc1p28em03_N4000_K100_G2_cow_wz',
+    f'N={N_high}': f'/home/davidbamba/repositories/engrenage/examples/TOV/tov_evolution_data_rmax100.0_jax_reconstructor/tov_star_rhoc1p28em03_N8000_K100_G2_cow_wz',
 }
 COLORS = ['#1f77b4', "#ff7f0e", '#2ca02c', "#d62728",
           "#9467bd", "#8c564b", "#e377c2", "#17becf"]
@@ -90,6 +91,30 @@ def extract_resolution_from_dirname(dirname):
     return None
 
 
+def subsample_to_dt(t, *arrays, dt=1.0):
+    """
+    Subsample data to regular time intervals.
+
+    Args:
+        t: time array
+        *arrays: data arrays to subsample
+        dt: time interval (default 1.0)
+
+    Returns:
+        t_sub, array1_sub, array2_sub, ...
+    """
+    # Create regular time grid
+    t_regular = np.arange(t[0], t[-1], dt)
+
+    # Interpolate each array to regular grid
+    results = [t_regular]
+    for arr in arrays:
+        interp_func = interp1d(t, arr, kind='linear', bounds_error=False, fill_value='extrapolate')
+        results.append(interp_func(t_regular))
+
+    return results
+
+
 def main():
     parser = argparse.ArgumentParser(
         description='Plot central density relative change for TOV star evolution',
@@ -105,7 +130,7 @@ Examples:
                         help='List of data directories to analyze. Default: use FOLDERS')
     parser.add_argument('--output-dir', default=None,
                         help='Output directory for plots. Default: script_dir/plots')
-    parser.add_argument('--t-max', type=float, default=1000.0,
+    parser.add_argument('--t-max', type=float, default=4000.0,
                         help='Maximum time to plot. Default: 1000.0')
     args = parser.parse_args()
 
@@ -139,9 +164,13 @@ Examples:
         # Use default FOLDERS (backward compatibility)
         folders_dict = FOLDERS
 
-    fig, axes = plt.subplots(2, 2, figsize=(14, 10))
-    ax1, ax2 = axes[0]
-    ax3, ax4 = axes[1]
+    fig, axes = plt.subplots(3, 2, figsize=(14, 14))
+    ax1, ax2 = axes[0]  # Central density absolute
+    ax3, ax4 = axes[1]  # Central density relative change
+    ax5, ax6 = axes[2]  # Mass conservation and L1 norm
+
+    # Time interval for subsampling
+    dt_plot = 1.0  # Plot every dt=1 M_sun
 
     for (label, folder_path), color in zip(folders_dict.items(), COLORS):
         t, rho_c, M_b = load_timeseries(folder_path)
@@ -152,29 +181,45 @@ Examples:
         t = t[mask]
         rho_c = rho_c[mask]
 
-        # Plot 1: Central density relative change (raw)
+        # Compute relative change
         rho_c_0 = rho_c[0]
         delta_rho_rel = (rho_c - rho_c_0) / rho_c_0
-        ax1.plot(t, delta_rho_rel, label=label, color=color, linewidth=0.8)
 
-        # Plot 2: Central density relative change (smoothed)
-        # Apply Savitzky-Golay filter to reduce noise
-        window = min(101, len(delta_rho_rel) // 10 * 2 + 1)  # Must be odd
-        if window >= 5:
-            delta_rho_smooth = savgol_filter(delta_rho_rel, window, 3)
-            ax2.plot(t, delta_rho_smooth, label=label, color=color, linewidth=0.8)
+        # Subsample to dt=1 for plotting
+        t_sub, rho_c_sub, delta_rho_sub = subsample_to_dt(t, rho_c, delta_rho_rel, dt=dt_plot)
 
-        # Plot 3: Mass conservation
+        # Window for smoothing (based on subsampled data)
+        window_large = min(501, len(t_sub) // 5 * 2 + 1)
+        window_large = max(5, window_large)
+
+        # Plot 1: Central density absolute (subsampled)
+        ax1.plot(t_sub, rho_c_sub, label=label, color=color, linewidth=0.8)
+
+        # Plot 2: Central density absolute (smoothed)
+        if len(rho_c_sub) >= window_large:
+            rho_c_smooth = savgol_filter(rho_c_sub, window_large, 3)
+            ax2.plot(t_sub, rho_c_smooth, label=label, color=color, linewidth=1.5)
+
+        # Plot 3: Central density relative change (subsampled)
+        ax3.plot(t_sub, delta_rho_sub, label=label, color=color, linewidth=0.8)
+
+        # Plot 4: Central density relative change (smoothed)
+        if len(delta_rho_sub) >= window_large:
+            delta_rho_smooth = savgol_filter(delta_rho_sub, window_large, 3)
+            ax4.plot(t_sub, delta_rho_smooth, label=label, color=color, linewidth=1.5)
+
+        # Plot 5: Mass conservation
         if M_b is not None:
             M_b = M_b[mask]
             M_b_0 = M_b[0]
+            log_abs_delta_M = np.log10(np.abs(M_b / M_b_0 - 1.0) + 1e-20)
 
-            # Plot 3: log(abs(M_b - M_b_0))
-            log_abs_delta_M = np.log10(np.abs(M_b / M_b_0 -1.0) + 1e-20)
-            ax3.plot(t, log_abs_delta_M, label=label, color=color, linewidth=0.8)
+            # Subsample mass conservation
+            t_sub_m, log_delta_M_sub = subsample_to_dt(t, log_abs_delta_M, dt=dt_plot)
+            ax5.plot(t_sub_m, log_delta_M_sub, label=label, color=color, linewidth=0.8)
 
     # =========================================================
-    # Plot 4: L1 norm of rest-mass density evolution
+    # Plot 6: L1 norm of rest-mass density evolution
     # Plot ALL available resolutions
     # =========================================================
     resolutions_to_plot = []
@@ -203,36 +248,52 @@ Examples:
             L1_norm = compute_L1_norm_discrete(delta_rho, r=r)
             L1_norms.append(L1_norm * scale_factor)  # Apply scaling
 
-        ax4.plot(t_snap_filtered, L1_norms, label=legend_label, color=color, linewidth=0.8)
+        ax6.plot(t_snap_filtered, L1_norms, label=legend_label, color=color, linewidth=0.8)
 
-    # Configure ax1
+    # Configure ax1 - Central density absolute (raw)
     ax1.set_xlabel(r'$t$ [M$_\odot$]')
-    ax1.set_ylabel(r'$(\rho_c-\rho_{c,0})/\rho_{c,0}$')
-    ax1.set_title('(a) Central Density Relative Change (raw)')
+    ax1.set_ylabel(r'$\rho_c$')
+    ax1.set_title('(a) Central Density (raw)')
     ax1.legend(fontsize=8)
     ax1.grid(alpha=0.3)
+    ax1.ticklabel_format(style='scientific', axis='y', scilimits=(0, 0))
 
-    # Configure ax2
+    # Configure ax2 - Central density absolute (smoothed)
     ax2.set_xlabel(r'$t$ [M$_\odot$]')
-    ax2.set_ylabel(r'$(\rho_c-\rho_{c,0})/\rho_{c,0}$')
-    ax2.set_title('(b) Central Density Relative Change (smoothed)')
+    ax2.set_ylabel(r'$\rho_c$')
+    ax2.set_title('(b) Central Density (smoothed)')
     ax2.legend(fontsize=8)
     ax2.grid(alpha=0.3)
+    ax2.ticklabel_format(style='scientific', axis='y', scilimits=(0, 0))
 
-    # Configure ax3
+    # Configure ax3 - Relative change (raw)
     ax3.set_xlabel(r'$t$ [M$_\odot$]')
-    ax3.set_ylabel(r'$\log_{10}|M_b / M_{b,0} - 1.0|$')
-    ax3.set_title('(c) Baryon Mass Absolute Error (log scale)')
+    ax3.set_ylabel(r'$(\rho_c-\rho_{c,0})/\rho_{c,0}$')
+    ax3.set_title('(c) Central Density Relative Change (raw)')
     ax3.legend(fontsize=8)
     ax3.grid(alpha=0.3)
 
-    # Configure ax4
-    ax4.set_xlabel(r'Time [M$_\odot$]', fontsize=12)
-    ax4.set_ylabel(r'$||\rho(t)-\rho(0)||_1$', fontsize=12)
-    ax4.set_title('(d) L1 Norm of Rest-Mass Density Evolution')
-    ax4.legend(fontsize=9, loc='upper left')
+    # Configure ax4 - Relative change (smoothed)
+    ax4.set_xlabel(r'$t$ [M$_\odot$]')
+    ax4.set_ylabel(r'$(\rho_c-\rho_{c,0})/\rho_{c,0}$')
+    ax4.set_title('(d) Central Density Relative Change (smoothed)')
+    ax4.legend(fontsize=8)
     ax4.grid(alpha=0.3)
-    ax4.set_xlim(0, t_max)
+
+    # Configure ax5 - Mass conservation
+    ax5.set_xlabel(r'$t$ [M$_\odot$]')
+    ax5.set_ylabel(r'$\log_{10}|M_b / M_{b,0} - 1.0|$')
+    ax5.set_title('(e) Baryon Mass Absolute Error (log scale)')
+    ax5.legend(fontsize=8)
+    ax5.grid(alpha=0.3)
+
+    # Configure ax6 - L1 norm
+    ax6.set_xlabel(r'$t$ [M$_\odot$]')
+    ax6.set_ylabel(r'$||\rho(t)-\rho(0)||_1$')
+    ax6.set_title('(f) L1 Norm of Rest-Mass Density Evolution')
+    ax6.legend(fontsize=8, loc='upper left')
+    ax6.grid(alpha=0.3)
+    ax6.set_xlim(0, t_max)
 
     plt.tight_layout()
 

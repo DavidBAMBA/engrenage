@@ -51,12 +51,15 @@ N2 = 2000
 N3 = 4000
 N4 = 8000
 
+# Base data directory
+DATA_DIR = '/home/davidbamba/repositories/engrenage/examples/TOV/tov_evolution_data_rmax100.0_TEST_long_domain_long_time'
+
 # Data paths - constructed from resolution values
 FOLDERS = {
-    f'N={N1}': f'/home/davidbamba/repositories/engrenage/examples/TOV/tov_evolution_data_rmax100_TEST_long_domain/tov_star_rhoc1p28em03_N{N1}_K100_G2_cow_mp5',
-    f'N={N2}': f'/home/davidbamba/repositories/engrenage/examples/TOV/tov_evolution_data_rmax100_TEST_long_domain/tov_star_rhoc1p28em03_N{N2}_K100_G2_cow_mp5',
-    f'N={N3}': f'/home/davidbamba/repositories/engrenage/examples/TOV/tov_evolution_data_rmax100_TEST_long_domain/tov_star_rhoc1p28em03_N{N3}_K100_G2_cow_mp5',
-    f'N={N4}': f'/home/davidbamba/repositories/engrenage/examples/TOV/tov_evolution_data_rmax100_TEST_long_domain/tov_star_rhoc1p28em03_N{N4}_K100_G2_cow_mp5',
+    f'N={N1}': f'/home/davidbamba/repositories/engrenage/examples/TOV/tov_evolution_data_rmax100.0_jax_reconstructor/tov_star_rhoc1p28em03_N1000_K100_G2_cow_wz',
+    f'N={N2}': f'/home/davidbamba/repositories/engrenage/examples/TOV/tov_evolution_data_rmax100.0_jax_reconstructor/tov_star_rhoc1p28em03_N2000_K100_G2_cow_wz',
+    f'N={N3}': f'/home/davidbamba/repositories/engrenage/examples/TOV/tov_evolution_data_rmax100.0_jax_reconstructor/tov_star_rhoc1p28em03_N4000_K100_G2_cow_wz',
+    f'N={N4}': f'/home/davidbamba/repositories/engrenage/examples/TOV/tov_evolution_data_rmax100.0_jax_reconstructor/tov_star_rhoc1p28em03_N8000_K100_G2_cow_wz'
 }
 
 # Resolution labels (keys to FOLDERS dictionary)
@@ -167,6 +170,10 @@ def find_stellar_radius(r, rho, rho_atm=1e-16):
 
 def running_average(x, window):
     """Compute running average with given window size."""
+    if window <= 1 or len(x) == 0:
+        return x
+    # Adjust window if larger than data
+    window = min(window, len(x))
     if window <= 1:
         return x
     kernel = np.ones(window) / window
@@ -303,12 +310,15 @@ Examples:
                         help='List of data directories (exactly 4 required). Default: use FOLDERS')
     parser.add_argument('--output-dir', default=None,
                         help='Output directory for plots. Default: script_dir/plots')
-    parser.add_argument('--t-max', type=float, default=1000.0,
-                        help='Maximum time to plot. Default: 1000.0')
+    parser.add_argument('--t-min', type=float, default=0.0,
+                        help='Minimum time to analyze. Default: 0.0')
+    parser.add_argument('--t-max', type=float, default=6000.0,
+                        help='Maximum time to plot. Default: 4000.0')
     parser.add_argument('--tov-cache', default=None,
                         help='Path to TOV cache directory. Required if using --data-dirs.')
     args = parser.parse_args()
 
+    t_min = 1000#args.t_min
     t_max = args.t_max
     script_dir = os.path.dirname(os.path.abspath(__file__))
 
@@ -394,10 +404,10 @@ Examples:
 
     # Use coarsest resolution as reference time grid
     t_ref = data[res1]['t']
-    time_mask = t_ref <= t_max
+    time_mask = (t_ref >= t_min) & (t_ref <= t_max)
     common_times = t_ref[time_mask]
 
-    print(f"  Using {res1} as reference: {len(common_times)} time points up to t={t_max}")
+    print(f"  Using {res1} as reference: {len(common_times)} time points in range t=[{t_min}, {t_max}]")
     print(f"  Finding nearest snapshots for {res2}, {res3}, and {res4}...")
 
     # Get source data
@@ -517,10 +527,10 @@ Examples:
         p23_paper = np.log(E2_paper / E3_paper) / np.log(2.0)  # N400 vs N800
 
     # Compute running averages
-    p12_disc_avg = running_average(p12_disc, window=30)
-    p23_disc_avg = running_average(p23_disc, window=30)
-    p12_paper_avg = running_average(p12_paper, window=30)
-    p23_paper_avg = running_average(p23_paper, window=30)
+    p12_disc_avg = running_average(p12_disc, window=100)
+    p23_disc_avg = running_average(p23_disc, window=100)
+    p12_paper_avg = running_average(p12_paper, window=100)
+    p23_paper_avg = running_average(p23_paper, window=100)
 
     valid = common_times > 50  # Skip initial transient
 
@@ -889,7 +899,7 @@ Examples:
     # Use a small value that is well within all grids (> largest dr * 3)
     # For r_max=100, N=1000: dr=0.1, so r[3]=0.3
     # We choose r_fixed=0.5 to be safely within all resolutions
-    r_fixed = 0.5  # Fixed physical position for all resolutions
+    r_fixed = 0.007  # Fixed physical position for all resolutions
 
     print(f"  Using fixed physical position: r_fixed = {r_fixed}")
     print(f"  Grid positions r[3] for comparison:")
@@ -949,10 +959,10 @@ Examples:
         p23_rhoc_paper = np.log(E2_rhoc_paper / E3_rhoc_paper) / np.log(2.0)
 
     # Running averages
-    p12_rhoc_avg = running_average(p12_rhoc, window=30)
-    p23_rhoc_avg = running_average(p23_rhoc, window=30)
-    p12_rhoc_paper_avg = running_average(p12_rhoc_paper, window=30)
-    p23_rhoc_paper_avg = running_average(p23_rhoc_paper, window=30)
+    p12_rhoc_avg = running_average(p12_rhoc, window=100)
+    p23_rhoc_avg = running_average(p23_rhoc, window=100)
+    p12_rhoc_paper_avg = running_average(p12_rhoc_paper, window=100)
+    p23_rhoc_paper_avg = running_average(p23_rhoc_paper, window=100)
 
     # =========================================================
     # Figure 4: Central density evolution and errors (consecutive)
@@ -1358,6 +1368,58 @@ Examples:
     print(f"    {res4}: {np.max(rhoc_4) - np.min(rhoc_4):.6e}")
 
     print("\n" + "="*70 + "\n")
+
+    # =========================================================
+    # FINAL SUMMARY: Convergence orders for both methods
+    # =========================================================
+    print("\n" + "="*70)
+    print("SUMMARY: CONVERGENCE ORDERS")
+    print("="*70)
+
+    # Compute mean convergence orders (excluding initial transient and NaN/Inf)
+    def compute_mean_order(p_array, valid_mask):
+        p_valid = p_array[valid_mask]
+        finite_mask = np.isfinite(p_valid)
+        if np.sum(finite_mask) > 0:
+            return np.mean(p_valid[finite_mask]), np.std(p_valid[finite_mask])
+        return np.nan, np.nan
+
+    # Profile (L1 norm) convergence orders
+    p12_disc_mean, p12_disc_std = compute_mean_order(p12_disc, valid_mask)
+    p23_disc_mean, p23_disc_std = compute_mean_order(p23_disc, valid_mask)
+    p12_paper_mean, p12_paper_std = compute_mean_order(p12_paper, valid_mask)
+    p23_paper_mean, p23_paper_std = compute_mean_order(p23_paper, valid_mask)
+
+    # Central density convergence orders
+    p12_rhoc_mean, p12_rhoc_std = compute_mean_order(p12_rhoc, valid_mask)
+    p23_rhoc_mean, p23_rhoc_std = compute_mean_order(p23_rhoc, valid_mask)
+    p12_rhoc_paper_mean, p12_rhoc_paper_std = compute_mean_order(p12_rhoc_paper, valid_mask)
+    p23_rhoc_paper_mean, p23_rhoc_paper_std = compute_mean_order(p23_rhoc_paper, valid_mask)
+
+    print(f"""
+┌─────────────────────────────────────────────────────────────────────┐
+│                    DENSITY PROFILE (L1 norm)                        │
+├─────────────────────────────────────────────────────────────────────┤
+│  Method                        │  p(N{N1},N{N2})     │  p(N{N2},N{N3})     │
+├────────────────────────────────┼─────────────────┼─────────────────┤
+│  Richardson (consecutive)      │  {p12_disc_mean:5.2f} ± {p12_disc_std:4.2f}   │  {p23_disc_mean:5.2f} ± {p23_disc_std:4.2f}   │
+│  Paper method (vs {res4})     │  {p12_paper_mean:5.2f} ± {p12_paper_std:4.2f}   │  {p23_paper_mean:5.2f} ± {p23_paper_std:4.2f}   │
+└─────────────────────────────────────────────────────────────────────┘
+
+┌─────────────────────────────────────────────────────────────────────┐
+│                    CENTRAL DENSITY (ρ_c)                            │
+├─────────────────────────────────────────────────────────────────────┤
+│  Method                        │  p(N{N1},N{N2})     │  p(N{N2},N{N3})     │
+├────────────────────────────────┼─────────────────┼─────────────────┤
+│  Richardson (consecutive)      │  {p12_rhoc_mean:5.2f} ± {p12_rhoc_std:4.2f}   │  {p23_rhoc_mean:5.2f} ± {p23_rhoc_std:4.2f}   │
+│  Paper method (vs {res4})     │  {p12_rhoc_paper_mean:5.2f} ± {p12_rhoc_paper_std:4.2f}   │  {p23_rhoc_paper_mean:5.2f} ± {p23_rhoc_paper_std:4.2f}   │
+└─────────────────────────────────────────────────────────────────────┘
+
+Note: Expected order for 2nd order scheme: p ≈ 2
+      Expected order for 5th order scheme (MP5): p ≈ 5
+      Time range: t = [{t_valid[0]:.1f}, {t_valid[-1]:.1f}] M_sun
+""")
+    print("="*70 + "\n")
 
 
 if __name__ == "__main__":

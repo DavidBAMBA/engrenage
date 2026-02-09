@@ -13,7 +13,6 @@ import numpy as np
 import sys
 import os
 import time
-import json
 from functools import partial
 
 # Get the directory where this script is located
@@ -42,7 +41,7 @@ from source.bssn.tensoralgebra import get_bar_gamma_LL, get_bar_A_LL, get_hat_D_
 
 # Hydro (for initial data setup and reference)
 from source.matter.hydro.perfect_fluid import PerfectFluid
-from source.matter.hydro.eos import PolytropicEOS, IdealGasEOS
+from source.matter.hydro.eos import IdealGasEOS, PolytropicEOS
 from source.matter.hydro.reconstruction import create_reconstruction
 from source.matter.hydro.riemann import HLLRiemannSolver
 from source.matter.hydro.atmosphere import AtmosphereParams
@@ -52,16 +51,16 @@ from source.matter.hydro.jax.valencia_jax import (
     CowlingGeometry,
     compute_hydro_rhs_cowling,
 )
-from source.core.timeintegration_jax import (
-    rk4_step,
-    apply_atmosphere_reset_jax,
+from source.core.timeintegration_jax import (  # noqa: F401 - available for future lax.scan use
     evolve_scan,
-    evolve_python_loop,
 )
 
 # TOV initial data
 from examples.TOV.tov_solver import load_or_solve_tov_iso
 import examples.TOV.tov_initial_data_interpolated as tov_id
+import examples.TOV.utils_TOVEvolution as utils
+from examples.TOV.utils_TOVEvolution import (SimulationDataManager, get_star_folder_name,
+                                              compute_baryon_mass, compute_constraints)
 
 
 # =============================================================================
@@ -184,33 +183,34 @@ def main():
     """Main execution."""
 
     # ==================================================================
-    # CONFIGURATION
+    # CONFIGURATION (production parameters matching TOVEvolution.py)
     # ==================================================================
-    r_max = 20.0
-    num_points = 100
+    r_max = 100.0
+    num_points = int(os.environ.get("NUM_POINTS", 1000))
     K = 100.0
     Gamma = 2.0
     rho_central = 1.28e-3
-    t_final = 100  # Performance test
+    t_final = 10  # Start with short evolution for testing
+    FOLDER_NAME_EVOL = f"tov_evolution_data_rmax{r_max}_jax_reconstructor_mc"  # Folder name for evolution data
 
     # Data saving
-    FOLDER_NAME_EVOL = "tov_evolution_data_performance_JAX"
+    PLOT_SUFFIX = "_cow"  # Suffix for plots and data files (matches Numba convention)
     SNAPSHOT_INTERVAL = 100  # Save full domain every N timesteps (None to disable)
-    EVOLUTION_INTERVAL = 100  # Save time series every N timesteps (None to disable)
+    EVOLUTION_INTERVAL = 100  # Save time series every N timesteps
     ENABLE_DATA_SAVING = True
     SAVE_TIMESERIES = True
 
     # Reconstruction: "wenoz" (wz), "weno5" (w5), "mp5" (mp5), "minmod" (md), "mc" (mc)
-    RECONSTRUCTOR_NAME = "mp5"
+    RECONSTRUCTOR_NAME = "mc"
 
     # Cons2prim solver: "newton" (fast, needs good guess) or "kastaun" (robust, guaranteed convergence)
-    SOLVER_METHOD = "kastaun"
+    SOLVER_METHOD = "newton"
 
     # Riemann solver: "hll", "hllc", or "llf"
     RIEMANN_SOLVER = "hll"
 
     # Evolution mode: "cowling" or "dynamic"
-    EVOLUTION_MODE = "cowling"  # JAX only supports Cowling for now
+    EVOLUTION_MODE = "dynamic"  # JAX only supports Cowling for now
 
     # Atmosphere config
     rho_floor_base = 1e-13
@@ -224,7 +224,8 @@ def main():
     # SETUP (reuse engrenage infrastructure for initial data)
     # ==================================================================
     spacing = LinearSpacing(num_points, r_max)
-    eos = IdealGasEOS(gamma=Gamma)  # Use ideal gas for evolution (production default)
+    eos = IdealGasEOS(gamma=Gamma)
+    #eos = PolytropicEOS(K=K, gamma=Gamma)
     base_recon = create_reconstruction(RECONSTRUCTOR_NAME)
     riemann = HLLRiemannSolver(atmosphere=ATMOSPHERE)
 
@@ -279,6 +280,60 @@ def main():
     )
 
     # ==================================================================
+    # INITIALIZE DATA MANAGER (same structure as TOVEvolution.py)
+    # ==================================================================
+    DATA_ROOT_DIR = os.path.join(script_dir, FOLDER_NAME_EVOL)
+    star_folder = get_star_folder_name(
+        rho_central, num_points, K, Gamma, EVOLUTION_MODE, RECONSTRUCTOR_NAME
+    )
+    OUTPUT_DIR = os.path.join(DATA_ROOT_DIR, star_folder)
+
+    data_manager = SimulationDataManager(
+        OUTPUT_DIR, grid, hydro,
+        enable_saving=ENABLE_DATA_SAVING,
+        suffix=PLOT_SUFFIX,
+        restart_mode=False
+    )
+
+    # Save metadata
+    if ENABLE_DATA_SAVING:
+        data_manager.save_metadata(
+            tov_solution, ATMOSPHERE, dt, "rk4",
+            K=K, Gamma=Gamma, rho_central=rho_central,
+            r_max=r_max, num_points=num_points, t_final=t_final,
+            reconstructor=RECONSTRUCTOR_NAME, solver_method=SOLVER_METHOD,
+            riemann_solver=RIEMANN_SOLVER, evolution_mode=EVOLUTION_MODE,
+            cfl_factor=cfl_factor
+        )
+
+    # Store reference primitives for error computation
+    # prim_tuple returns (rho0, vr, p, eps) - for static TOV, vr=0 so W=1
+    rho_ref, vr_ref, p_ref, eps_ref = prim_tuple
+    W_ref = np.ones(grid.N)  # Static initial data
+    h_ref = 1.0 + eps_ref + p_ref / (rho_ref + 1e-30)
+    success_ref = np.ones(grid.N, dtype=bool)
+
+    # Save initial snapshot (step 0) with constraints - matching reference behavior
+    if ENABLE_DATA_SAVING:
+        Ham_0, Mom_0 = compute_constraints(initial_state_2d, grid, background, hydro)
+        data_manager.save_snapshot(0, 0.0, initial_state_2d, rho_ref, vr_ref, p_ref,
+                                   eps_ref, W_ref, h_ref, Ham=Ham_0, Mom=Mom_0)
+        data_manager.add_evolution_point(0, 0.0, initial_state_2d,
+                                        rho_ref, vr_ref, p_ref, eps_ref, W_ref, h_ref, success_ref,
+                                        rho_ref, vr_ref, p_ref, eps_ref, W_ref, h_ref, success_ref,
+                                        Ham=Ham_0, Mom=Mom_0)
+
+    # Time series tracking (collected at EVOLUTION_INTERVAL for efficiency)
+    Mb0 = compute_baryon_mass(grid, initial_state_2d, rho_ref, vr_ref, p_ref, eps_ref, W_ref, h_ref)
+    all_times = [0.0]
+    all_Mb = [Mb0]
+    all_rho_c = [float(rho_ref[NUM_GHOSTS])]
+    all_v_c = [float(vr_ref[NUM_GHOSTS])]
+
+    # Preserve config value before loop variable shadowing
+    rho_central_config = rho_central
+
+    # ==================================================================
     # BUILD COWLING GEOMETRY (one-time NumPy computation)
     # ==================================================================
     print("Building CowlingGeometry from BSSN variables...")
@@ -300,7 +355,7 @@ def main():
     # ==================================================================
     # CONFIGURE JAX RHS AND ATMOSPHERE PARAMETERS
     # ==================================================================
-    eos_type = 'polytropic'
+    eos_type = 'ideal_gas'
     _rho_floor = float(ATMOSPHERE.rho_floor)
     _p_floor = float(ATMOSPHERE.p_floor)
     _v_max = float(ATMOSPHERE.v_max)
@@ -312,8 +367,8 @@ def main():
         'p_floor': _p_floor,
         'v_max': _v_max,
         'W_max': 10.0,
-        'tol': 1e-12,
-        'max_iter': 500,
+        'tol': 1e-10,
+        'max_iter': 100,
     }
 
     # ==================================================================
@@ -333,6 +388,7 @@ def main():
                 D_bc, Sr_bc, tau_bc, geom_arg,
                 eos_type, eos_params, atm_params,
                 RECONSTRUCTOR_NAME, RIEMANN_SOLVER,
+                SOLVER_METHOD,
             )
 
         # RK4 stages
@@ -393,207 +449,179 @@ def main():
     jax.block_until_ready((D_test, Sr_test, tau_test))
     bench_time = (time.perf_counter() - t0_bench) / n_bench * 1000
     print(f"  Single step execution: {bench_time:.2f} ms")
-    rk4_jit_time = jit_time
+    step_time_ms = bench_time
 
     # ==================================================================
-    # EVOLUTION (Checkpoint-based with time series tracking)
+    # EVOLUTION (single unified loop with checkpoint tracking)
     # ==================================================================
-    # Calculate checkpoints (1/3, 2/3, final)
-    checkpoint_1 = max(1, num_steps_total // 3)
-    checkpoint_2 = max(2, 2 * num_steps_total // 3)
-    checkpoint_3 = num_steps_total
+    checkpoint_steps = {
+        1: max(1, num_steps_total // 3),
+        2: max(2, 2 * num_steps_total // 3),
+        3: num_steps_total,
+    }
 
     print(f"\n{'='*70}")
     print(f"Evolution checkpoints:")
-    print(f"  step {checkpoint_1:6d}: 1/3 (~{checkpoint_1*dt:.3e})")
-    print(f"  step {checkpoint_2:6d}: 2/3 (~{checkpoint_2*dt:.3e})")
-    print(f"  step {checkpoint_3:6d}: final (~{checkpoint_3*dt:.3e})")
+    for cp_id, cp_step in checkpoint_steps.items():
+        print(f"  step {cp_step:6d}: {cp_id}/3 (~{cp_step*dt:.3e})")
     print(f"{'='*70}\n")
 
-    # Storage for checkpoints and time series
     checkpoint_states = {}
     checkpoint_times = {}
-    time_series = {'t': [], 'rho_c': [], 'v_c': [], 'Mb': []}
+
+    # BSSN data stays fixed in Cowling mode
+    bssn_fixed = initial_state_2d[:NUM_BSSN_VARS, :].copy()
+
+    def build_full_state(D_arr, Sr_arr, tau_arr):
+        """Build full state array from hydro variables."""
+        state = np.zeros((NUM_BSSN_VARS + 3, grid.N))
+        state[:NUM_BSSN_VARS, :] = bssn_fixed
+        state[NUM_BSSN_VARS + 0, :] = np.asarray(D_arr)
+        state[NUM_BSSN_VARS + 1, :] = np.asarray(Sr_arr)
+        state[NUM_BSSN_VARS + 2, :] = np.asarray(tau_arr)
+        return state
+
+    def extract_primitives(state_2d):
+        """Extract primitives from state using Numba pipeline."""
+        bssn = BSSNVars(grid.N)
+        bssn.set_bssn_vars(state_2d[:NUM_BSSN_VARS, :])
+        hydro.set_matter_vars(state_2d, bssn, grid)
+        rho0, vr, p, eps, W, h, success = hydro._get_primitives(bssn, grid.r)
+        return rho0, vr, p, eps, W, h, success
 
     # Start timing
     t0_evol = time.perf_counter()
 
-    # Extract phi from initial state for central density estimation
-    phi_bssn = initial_state_2d[5, :]  # phi is index 5 in BSSN variables
-    e6phi_central = np.exp(6.0 * phi_bssn[NUM_GHOSTS])
-
-    # Helper to extract central density (simple estimate without full cons2prim)
-    def get_central_density_estimate(D_arr):
-        """Estimate central density from D (simple: D/e6phi)."""
-        D_np = np.array(D_arr)
-        rho_c_est = D_np[NUM_GHOSTS] / e6phi_central
-        return rho_c_est
-
-    # ==================================================================
-    # Evolve to checkpoint 1
-    # ==================================================================
-    print(f"Evolving to checkpoint 1 (step {checkpoint_1})...")
     D, Sr, tau = D0, Sr0, tau0
     t = 0.0
-    print_every = max(1, checkpoint_1 // 10)
+    PRINT_INTERVAL = 1000
+    NAN_CHECK_INTERVAL = 1000
 
-    for step in range(checkpoint_1):
+    # Print header
+    print("===== Evolution diagnostics (per step) =====")
+    print("Columns: step | t | rho_central | max_drho/rho@r | max_vr@r | max_Sr@r | c2p_fails")
+    print("-" * 120)
+
+    interior = slice(NUM_GHOSTS, -NUM_GHOSTS)
+    r_interior = grid.r[interior]
+    checkpoint_set = set(checkpoint_steps.values())
+
+    for step in range(1, num_steps_total + 1):
         D, Sr, tau = jit_step(D, Sr, tau, geom)
         t += dt
 
-        # Track time series
-        if EVOLUTION_INTERVAL and (step + 1) % EVOLUTION_INTERVAL == 0:
-            rho_c_est = get_central_density_estimate(D)
-            time_series['t'].append(t)
-            time_series['rho_c'].append(rho_c_est)
-            time_series['v_c'].append(0.0)  # Placeholder
-            time_series['Mb'].append(0.0)   # Placeholder
-
-        if (step + 1) % print_every == 0:
+        # NaN detection (periodic, lightweight)
+        if step % NAN_CHECK_INTERVAL == 0:
             jax.block_until_ready(D)
-            elapsed = time.perf_counter() - t0_evol
-            pct = 100.0 * (step + 1) / checkpoint_1
-            rate = (step + 1) / elapsed
-            rho_c_est = get_central_density_estimate(D)
-            print(f"  Step {step+1:>7d}/{checkpoint_1} ({pct:5.1f}%) | "
-                  f"rate={rate:.0f} steps/s | ρ_c={rho_c_est:.6e}")
+            if bool(jnp.any(jnp.isnan(D))):
+                print(f"\nERROR: NaN detected at step {step}, t={t:.6e}. Halting evolution.")
+                break
 
-    jax.block_until_ready((D, Sr, tau))
-    checkpoint_states[1] = (np.array(D), np.array(Sr), np.array(tau))
-    checkpoint_times[1] = t
-    print(f"  -> Reached checkpoint 1, t={t:.6e}")
+        # Diagnostics and data saving
+        should_print = (step % PRINT_INTERVAL == 0)
+        should_save_evol = ENABLE_DATA_SAVING and EVOLUTION_INTERVAL and (step % EVOLUTION_INTERVAL == 0)
+        should_save_snap = ENABLE_DATA_SAVING and SNAPSHOT_INTERVAL and (step % SNAPSHOT_INTERVAL == 0)
 
-    # ==================================================================
-    # Evolve to checkpoint 2
-    # ==================================================================
-    remaining_steps = checkpoint_2 - checkpoint_1
-    print(f"\nEvolving to checkpoint 2 (step {checkpoint_2})...")
-    print_every = max(1, remaining_steps // 10)
+        if should_print or should_save_evol or should_save_snap:
+            state_2d = build_full_state(D, Sr, tau)
+            rho0, vr, p, eps, W, h, success = extract_primitives(state_2d)
 
-    for step in range(remaining_steps):
-        D, Sr, tau = jit_step(D, Sr, tau, geom)
-        t += dt
+            Ham, Mom = None, None
+            if should_save_evol or should_save_snap:
+                Ham, Mom = compute_constraints(state_2d, grid, background, hydro)
 
-        # Track time series
-        if EVOLUTION_INTERVAL and (checkpoint_1 + step + 1) % EVOLUTION_INTERVAL == 0:
-            rho_c_est = get_central_density_estimate(D)
-            time_series['t'].append(t)
-            time_series['rho_c'].append(rho_c_est)
-            time_series['v_c'].append(0.0)
-            time_series['Mb'].append(0.0)
+            if should_save_evol:
+                data_manager.add_evolution_point(
+                    step, t, state_2d,
+                    rho0, vr, p, eps, W, h, success,
+                    rho_ref, vr_ref, p_ref, eps_ref, W_ref, h_ref, success_ref,
+                    Ham=Ham, Mom=Mom
+                )
+                Mb = compute_baryon_mass(grid, state_2d, rho0, vr, p, eps, W, h)
+                all_times.append(t)
+                all_Mb.append(Mb)
+                all_rho_c.append(float(rho0[NUM_GHOSTS]))
+                all_v_c.append(float(vr[NUM_GHOSTS]))
 
-        if (step + 1) % print_every == 0:
-            jax.block_until_ready(D)
-            elapsed = time.perf_counter() - t0_evol
-            pct = 100.0 * (checkpoint_1 + step + 1) / num_steps_total
-            rate = (checkpoint_1 + step + 1) / elapsed
-            rho_c_est = get_central_density_estimate(D)
-            print(f"  Step {checkpoint_1+step+1:>7d}/{checkpoint_2} ({pct:5.1f}%) | "
-                  f"rate={rate:.0f} steps/s | ρ_c={rho_c_est:.6e}")
+                if step % (EVOLUTION_INTERVAL * 10) == 0:
+                    data_manager.flush_evolution_buffer()
 
-    jax.block_until_ready((D, Sr, tau))
-    checkpoint_states[2] = (np.array(D), np.array(Sr), np.array(tau))
-    checkpoint_times[2] = t
-    print(f"  -> Reached checkpoint 2, t={t:.6e}")
+            if should_save_snap:
+                data_manager.save_snapshot(step, t, state_2d, rho0, vr, p, eps, W, h,
+                                           Ham=Ham, Mom=Mom)
 
-    # ==================================================================
-    # Evolve to checkpoint 3 (final)
-    # ==================================================================
-    remaining_steps = checkpoint_3 - checkpoint_2
-    print(f"\nEvolving to checkpoint 3 (step {checkpoint_3}, final)...")
-    print_every = max(1, remaining_steps // 10)
+            if should_print:
+                rho_central = float(rho0[NUM_GHOSTS])
 
-    for step in range(remaining_steps):
-        D, Sr, tau = jit_step(D, Sr, tau, geom)
-        t += dt
+                rho_int = rho0[interior]
+                rho_init_int = rho_ref[interior]
+                rel_rho_err = np.abs(rho_int - rho_init_int) / (np.abs(rho_init_int) + 1e-20)
+                idx_max_rho = np.argmax(rel_rho_err)
+                max_rel_rho_err = float(rel_rho_err[idx_max_rho])
+                r_max_rho = float(r_interior[idx_max_rho])
 
-        # Track time series
-        if EVOLUTION_INTERVAL and (checkpoint_2 + step + 1) % EVOLUTION_INTERVAL == 0:
-            rho_c_est = get_central_density_estimate(D)
-            time_series['t'].append(t)
-            time_series['rho_c'].append(rho_c_est)
-            time_series['v_c'].append(0.0)
-            time_series['Mb'].append(0.0)
+                vr_int = vr[interior]
+                idx_max_v = np.argmax(np.abs(vr_int))
+                max_abs_v = float(vr_int[idx_max_v])
+                r_max_v = float(r_interior[idx_max_v])
 
-        if (step + 1) % print_every == 0:
-            jax.block_until_ready(D)
-            elapsed = time.perf_counter() - t0_evol
-            pct = 100.0 * (checkpoint_2 + step + 1) / num_steps_total
-            rate = (checkpoint_2 + step + 1) / elapsed
-            rho_c_est = get_central_density_estimate(D)
-            print(f"  Step {checkpoint_2+step+1:>7d}/{checkpoint_3} ({pct:5.1f}%) | "
-                  f"rate={rate:.0f} steps/s | ρ_c={rho_c_est:.6e}")
+                Sr_np = np.asarray(state_2d[NUM_BSSN_VARS + 1, interior])
+                idx_max_Sr = np.argmax(np.abs(Sr_np))
+                max_Sr = float(np.abs(Sr_np[idx_max_Sr]))
+                r_max_Sr = float(r_interior[idx_max_Sr])
 
-    jax.block_until_ready((D, Sr, tau))
-    checkpoint_states[3] = (np.array(D), np.array(Sr), np.array(tau))
-    checkpoint_times[3] = t
+                c2p_fail = int(np.sum(~success))
+
+                print(f"step {step:5d}  t={t:.2e}:  rho_c={rho_central:.6e}  "
+                      f"max_drho/rho={max_rel_rho_err:.2e}@r={r_max_rho:.2f}  "
+                      f"max_vr={max_abs_v:.3e}@r={r_max_v:.2f}  "
+                      f"max_Sr={max_Sr:.2e}@r={r_max_Sr:.2f}  c2p_fail={c2p_fail}")
+
+        # Save checkpoint
+        if step in checkpoint_set:
+            jax.block_until_ready((D, Sr, tau))
+            cp_id = [k for k, v in checkpoint_steps.items() if v == step][0]
+            checkpoint_states[cp_id] = (np.array(D), np.array(Sr), np.array(tau))
+            checkpoint_times[cp_id] = t
+            data_manager.flush_evolution_buffer()
+            print(f"  -> Reached checkpoint {cp_id}, t={t:.6e}")
+
     evol_time = time.perf_counter() - t0_evol
     D_final, Sr_final, tau_final = D, Sr, tau
-    print(f"  -> Reached checkpoint 3 (final), t={t:.6e}")
+    data_manager.flush_evolution_buffer()
+
+    # Fill missing checkpoints if halted early
+    for cp_id in [1, 2, 3]:
+        if cp_id not in checkpoint_states:
+            jax.block_until_ready((D, Sr, tau))
+            checkpoint_states[cp_id] = (np.array(D), np.array(Sr), np.array(tau))
+            checkpoint_times[cp_id] = t
 
     print(f"\nEvolution complete!")
     print(f"  Total wall time: {evol_time:.2f}s")
     print(f"  Steps/second: {num_steps_total / evol_time:.0f}")
 
+    # Finalize data manager
+    data_manager.finalize(execution_time_seconds=evol_time)
+
     # ==================================================================
-    # DATA MANAGEMENT - Save metadata and time series
+    # SAVE TIME SERIES TO FILE (matching reference behavior)
     # ==================================================================
-    if ENABLE_DATA_SAVING:
-        # Create output directory
-        from examples.TOV.utils_TOVEvolution import get_star_folder_name
-        star_folder = get_star_folder_name(
-            rho_central, num_points, K, Gamma, EVOLUTION_MODE, RECONSTRUCTOR_NAME
-        )
-        OUTPUT_DIR = os.path.join(script_dir, FOLDER_NAME_EVOL, star_folder)
-        os.makedirs(OUTPUT_DIR, exist_ok=True)
-
-        print(f"\nSaving data to: {OUTPUT_DIR}")
-
-        # Save metadata as JSON
-        metadata = {
-            'K': K,
-            'Gamma': Gamma,
-            'rho_central': rho_central,
-            'r_max': r_max,
-            'num_points': num_points,
-            't_final': t_final,
-            'dt': dt,
-            'num_steps': num_steps_total,
-            'cfl_factor': cfl_factor,
-            'reconstructor': RECONSTRUCTOR_NAME,
-            'solver_method': SOLVER_METHOD,
-            'riemann_solver': RIEMANN_SOLVER,
-            'evolution_mode': EVOLUTION_MODE,
-            'backend': 'JAX',
-            'jit_time_s': jit_time,
-            'wall_time_s': evol_time,
-            'steps_per_second': num_steps_total / evol_time,
-            'tov_mass': tov_solution.M_star,
-            'tov_radius_iso': tov_solution.R_iso,
-        }
-
-        metadata_path = os.path.join(OUTPUT_DIR, 'metadata.json')
-        with open(metadata_path, 'w') as f:
-            json.dump(metadata, f, indent=2)
-        print(f"  Metadata saved: {metadata_path}")
-
-        # Save time series
-        if SAVE_TIMESERIES and len(time_series['t']) > 0:
-            timeseries_path = os.path.join(OUTPUT_DIR, 'timeseries.npz')
-            np.savez(timeseries_path,
-                     times=np.array(time_series['t']),
-                     rho_central=np.array(time_series['rho_c']),
-                     v_central=np.array(time_series['v_c']),
-                     Mb=np.array(time_series['Mb']),
-                     # Simulation parameters
-                     num_points=num_points,
-                     K=K,
-                     Gamma=Gamma,
-                     rho_central_initial=rho_central,
-                     r_max=r_max,
-                     dt=dt,
-                     num_steps=num_steps_total)
-            print(f"  Time series saved: {timeseries_path}")
+    if ENABLE_DATA_SAVING and SAVE_TIMESERIES and len(all_times) > 0:
+        timeseries_path = os.path.join(OUTPUT_DIR, "timeseries.npz")
+        np.savez(timeseries_path,
+                 times=np.array(all_times),
+                 rho_central=np.array(all_rho_c),
+                 v_central=np.array(all_v_c),
+                 Mb=np.array(all_Mb),
+                 num_points=num_points,
+                 K=K,
+                 Gamma=Gamma,
+                 rho_central_initial=rho_central_config,
+                 r_max=r_max,
+                 dt=dt,
+                 num_steps=num_steps_total)
+        print(f"\nTime series saved to: {timeseries_path}")
 
     # ==================================================================
     # RECONSTRUCT FULL STATE FOR DIAGNOSTICS
@@ -606,26 +634,8 @@ def main():
     Sr0_np = np.asarray(Sr0)
     tau0_np = np.asarray(tau0)
 
-    def jax_hydro_to_full_state(D_np, Sr_np, tau_np, bssn_data):
-        """Embed JAX hydro arrays into a full (NUM_VARS, N) state array."""
-        state = np.zeros((NUM_BSSN_VARS + 3, grid.N))
-        state[:NUM_BSSN_VARS, :] = bssn_data
-        state[NUM_BSSN_VARS + 0, :] = D_np
-        state[NUM_BSSN_VARS + 1, :] = Sr_np
-        state[NUM_BSSN_VARS + 2, :] = tau_np
-        return state
-
-    bssn_fixed = initial_state_2d[:NUM_BSSN_VARS, :].copy()
-    state_initial = jax_hydro_to_full_state(D0_np, Sr0_np, tau0_np, bssn_fixed)
-    state_final = jax_hydro_to_full_state(D_f_np, Sr_f_np, tau_f_np, bssn_fixed)
-
-    # Extract primitives using existing Numba cons2prim
-    def extract_primitives(state_2d):
-        bssn = BSSNVars(grid.N)
-        bssn.set_bssn_vars(state_2d[:NUM_BSSN_VARS, :])
-        hydro.set_matter_vars(state_2d, bssn, grid)
-        rho0, vr, p, eps, W, h, success = hydro._get_primitives(bssn, grid.r)
-        return rho0, vr, p, eps, W, h, success
+    state_initial = build_full_state(D0_np, Sr0_np, tau0_np)
+    state_final = build_full_state(D_f_np, Sr_f_np, tau_f_np)
 
     print("\nRecovering primitives for diagnostics...")
     rho0_0, vr_0, p_0, _, _, _, success_0 = extract_primitives(state_initial)
@@ -698,117 +708,44 @@ def main():
         print(f"\n  No NaNs detected - evolution stable.")
 
     # ==================================================================
-    # SAVE DATA
+    # PLOTS (using utils_TOVEvolution for consistency with TOVEvolution.py)
     # ==================================================================
-    output_dir = os.path.join(script_dir, 'jax_output')
-    os.makedirs(output_dir, exist_ok=True)
-
-    data_path = os.path.join(output_dir, 'evolution_jax.npz')
-    np.savez(data_path,
-             # Grid
-             r=grid.r,
-             num_points=num_points,
-             r_max=r_max,
-             num_ghosts=NUM_GHOSTS,
-             # Parameters
-             K=K, Gamma=Gamma, rho_central=rho_central,
-             dt=dt, t_final=t_final, num_steps=num_steps_total,
-             cfl_factor=cfl_factor,
-             reconstructor=RECONSTRUCTOR_NAME,
-             riemann_solver=RIEMANN_SOLVER,
-             # Initial state (primitives + conservatives)
-             D_initial=D0_np, Sr_initial=Sr0_np, tau_initial=tau0_np,
-             rho_initial=rho0_0, vr_initial=vr_0, p_initial=p_0,
-             # Final state (primitives + conservatives)
-             D_final=D_f_np, Sr_final=Sr_f_np, tau_final=tau_f_np,
-             rho_final=rho0_f, vr_final=vr_f, p_final=p_f,
-             # BSSN (frozen)
-             bssn_fixed=bssn_fixed,
-             # Timing
-             wall_time=evol_time,
-             jit_time_rhs=jit_time,
-             jit_time_rk4=rk4_jit_time,
-    )
-    print(f"\nData saved to: {data_path}")
-
-    # ==================================================================
-    # PLOTS
-    # ==================================================================
-    import matplotlib
-    matplotlib.use('Agg')
-    import matplotlib.pyplot as plt
-
-    PLOT_SUFFIX = "_jax"
-    r = grid.r
     R_star = tov_solution.R_iso
 
-    # --- Plot 1: Profiles initial vs final (2x2) ---
-    fig, axes = plt.subplots(2, 2, figsize=(14, 10))
+    # Build states for each checkpoint: t=0, 1/3, 2/3, final
+    state_cp0 = build_full_state(D0, Sr0, tau0)
+    state_cp1 = build_full_state(*checkpoint_states[1])
+    state_cp2 = build_full_state(*checkpoint_states[2])
+    state_cp3 = build_full_state(*checkpoint_states[3])
 
-    ax = axes[0, 0]
-    ax.semilogy(r[interior], rho0_0[interior], 'b-', label='t=0', linewidth=1.5)
-    ax.semilogy(r[interior], rho0_f[interior], 'r--', label=f't={t_final}', linewidth=1.5)
-    ax.axvline(R_star, color='gray', ls=':', alpha=0.7, label=f'R={R_star:.1f}')
-    ax.set_xlabel('r')
-    ax.set_ylabel(r'$\rho_0$')
-    ax.set_title('Baryon Density')
-    ax.legend()
+    states = [state_cp0, state_cp1, state_cp2, state_cp3]
+    times_cp = [0.0, checkpoint_times[1], checkpoint_times[2], checkpoint_times[3]]
 
-    ax = axes[0, 1]
-    ax.semilogy(r[interior], p_0[interior], 'b-', label='t=0', linewidth=1.5)
-    ax.semilogy(r[interior], p_f[interior], 'r--', label=f't={t_final}', linewidth=1.5)
-    ax.axvline(R_star, color='gray', ls=':', alpha=0.7)
-    ax.set_xlabel('r')
-    ax.set_ylabel('P')
-    ax.set_title('Pressure')
-    ax.legend()
+    # Plot evolution using utils (same format as TOVEvolution.py)
+    print("\nGenerating plots...")
+    utils.plot_evolution(
+        states, times_cp, grid, hydro, rho_ref, p_ref,
+        suffix=PLOT_SUFFIX, R_star=R_star
+    )
 
-    ax = axes[1, 0]
-    ax.plot(r[interior], vr_0[interior], 'b-', label='t=0', linewidth=1.5)
-    ax.plot(r[interior], vr_f[interior], 'r--', label=f't={t_final}', linewidth=1.5)
-    ax.axvline(R_star, color='gray', ls=':', alpha=0.7)
-    ax.set_xlabel('r')
-    ax.set_ylabel(r'$v^r$')
-    ax.set_title('Radial Velocity')
-    ax.legend()
+    # Plot BSSN variables evolution (in Cowling mode, should be constant)
+    utils.plot_bssn_evolution(
+        state_cp0, state_cp3, grid,
+        t_0=0.0, t_final=checkpoint_times[3],
+        suffix=PLOT_SUFFIX
+    )
 
-    ax = axes[1, 1]
-    mask = rho0_0[interior] > 100.0 * ATMOSPHERE.rho_floor
-    err = np.abs(rho0_f[interior] - rho0_0[interior]) / (rho0_0[interior] + 1e-30)
-    ax.semilogy(r[interior][mask], err[mask], 'k-', linewidth=1.0)
-    ax.axvline(R_star, color='gray', ls=':', alpha=0.7)
-    ax.set_xlabel('r')
-    ax.set_ylabel(r'$|\Delta\rho|/\rho$')
-    ax.set_title('Relative Density Error')
-
-    fig.suptitle(f'TOV Evolution (JAX Cowling) - N={num_points}, t={t_final}, '
-                 f'{RECONSTRUCTOR_NAME}/{RIEMANN_SOLVER}', fontsize=13)
-    plt.tight_layout()
-    plot_path = os.path.join(plots_dir, f'tov_evolution{PLOT_SUFFIX}.png')
-    plt.savefig(plot_path, dpi=150, bbox_inches='tight')
-    plt.close(fig)
-    print(f"Plot saved: {plot_path}")
-
-    # --- Plot 2: Conservative variables ---
-    fig, axes = plt.subplots(1, 3, figsize=(16, 4.5))
-    for ax, (q0, qf, name) in zip(axes, [
-        (D0_np, D_f_np, r'$\tilde{D}$'),
-        (Sr0_np, Sr_f_np, r'$\tilde{S}_r$'),
-        (tau0_np, tau_f_np, r'$\tilde{\tau}$'),
-    ]):
-        ax.plot(r[interior], q0[interior], 'b-', label='t=0', linewidth=1.5)
-        ax.plot(r[interior], qf[interior], 'r--', label=f't={t_final}', linewidth=1.5)
-        ax.axvline(R_star, color='gray', ls=':', alpha=0.7)
-        ax.set_xlabel('r')
-        ax.set_ylabel(name)
-        ax.legend()
-
-    fig.suptitle('Conservative Variables (JAX)', fontsize=13)
-    plt.tight_layout()
-    plot_path2 = os.path.join(plots_dir, f'tov_conservatives{PLOT_SUFFIX}.png')
-    plt.savefig(plot_path2, dpi=150, bbox_inches='tight')
-    plt.close(fig)
-    print(f"Plot saved: {plot_path2}")
+    print("\n" + "="*70)
+    print("JAX Evolution complete.")
+    print(f"\nData saved to: {OUTPUT_DIR}")
+    print(f"  - tov_snapshots{PLOT_SUFFIX}.h5   (full domain snapshots + constraints)")
+    print(f"  - tov_evolution{PLOT_SUFFIX}.h5   (time series + constraints)")
+    print(f"  - tov_metadata{PLOT_SUFFIX}.json  (simulation parameters)")
+    print(f"  - timeseries.npz                (rho_c, v_c, Mb vs time)")
+    print(f"\nPlots saved to: {plots_dir}")
+    print(f"  - tov_evolution{PLOT_SUFFIX}.png  (hydro at checkpoints)")
+    print(f"  - tov_bssn_evolution{PLOT_SUFFIX}.png (BSSN check)")
+    print("="*70)
 
     # ==================================================================
     # TIMING SUMMARY
@@ -816,13 +753,12 @@ def main():
     print(f"\n{'='*70}")
     print("TIMING SUMMARY")
     print(f"{'='*70}")
-    print(f"  JIT compilation (RHS):  {jit_time:.2f}s")
-    print(f"  JIT compilation (RK4):  {rk4_jit_time:.2f}s")
+    print(f"  JIT compilation:        {jit_time:.2f}s")
+    print(f"  Benchmark step time:    {step_time_ms:.2f} ms")
     print(f"  Evolution:              {evol_time:.2f}s ({num_steps_total} steps)")
     print(f"  Steps/second:           {num_steps_total / evol_time:.0f}")
-    print(f"  Time per RK4 step:      {evol_time / num_steps_total * 1e3:.3f} ms")
+    print(f"  Time per RK4 step:      {evol_time / num_steps_total * 1e3:.3f} ms (includes diagnostics overhead)")
     print(f"{'='*70}")
-    print("JAX evolution complete.")
 
 
 if __name__ == "__main__":

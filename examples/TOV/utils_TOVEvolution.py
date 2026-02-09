@@ -84,7 +84,8 @@ def get_star_folder_name(rho_central, num_points, K, Gamma, evolution_mode="cowl
 class SimulationDataManager:
     """Manages data storage for long TOV simulations."""
 
-    def __init__(self, output_dir, grid, hydro, enable_saving=False, suffix=""):
+    def __init__(self, output_dir, grid, hydro, enable_saving=False, suffix="",
+                 restart_mode=False):
         """
         Initialize data manager.
 
@@ -94,9 +95,11 @@ class SimulationDataManager:
             hydro: Hydro object
             enable_saving: If True, saves data to files
             suffix: Suffix for file naming (e.g., "_iso" for isotropic coordinates)
+            restart_mode: If True, append to existing files instead of overwriting
         """
         self.enable_saving = enable_saving
         self.suffix = suffix
+        self.restart_mode = restart_mode
         if not self.enable_saving:
             return
 
@@ -112,10 +115,11 @@ class SimulationDataManager:
         self.evolution_file = os.path.join(output_dir, f"tov_evolution{suffix}.h5")
         self.metadata_file = os.path.join(output_dir, f"tov_metadata{suffix}.json")
 
-        # Remove old files if they exist (to overwrite)
-        for f in [self.snapshot_file, self.evolution_file, self.metadata_file]:
-            if os.path.exists(f):
-                os.remove(f)
+        # Only remove old files if NOT in restart mode
+        if not restart_mode:
+            for f in [self.snapshot_file, self.evolution_file, self.metadata_file]:
+                if os.path.exists(f):
+                    os.remove(f)
 
         # Initialize evolution data lists (for buffering)
         self.evolution_buffer = {
@@ -139,8 +143,9 @@ class SimulationDataManager:
             'l2_Mom_r': []
         }
 
-        # Initialize HDF5 files
-        self._init_hdf5_files()
+        # Initialize HDF5 files (only if not restart mode)
+        if not restart_mode:
+            self._init_hdf5_files()
 
     def _init_hdf5_files(self):
         """Initialize HDF5 files with proper structure."""
@@ -424,6 +429,208 @@ class SimulationDataManager:
 
 
 # =============================================================================
+# RESTART/CHECKPOINT FUNCTIONS
+# =============================================================================
+
+def load_metadata(output_dir, suffix="_cow"):
+    """
+    Load simulation metadata from JSON file.
+
+    Args:
+        output_dir: Output directory path
+        suffix: File suffix ("_cow" or "_dyn")
+
+    Returns:
+        dict: Metadata dictionary, or None if file doesn't exist
+    """
+    metadata_file = os.path.join(output_dir, f'tov_metadata{suffix}.json')
+    if not os.path.exists(metadata_file):
+        return None
+
+    try:
+        with open(metadata_file, 'r') as f:
+            return json.load(f)
+    except Exception as e:
+        print(f"Warning: Failed to load metadata from {metadata_file}: {e}")
+        return None
+
+
+def find_latest_snapshot(output_dir, suffix="_cow"):
+    """
+    Find the most recent snapshot in output directory.
+
+    Args:
+        output_dir: Output directory path
+        suffix: File suffix ("_cow" or "_dyn")
+
+    Returns:
+        dict or None: {
+            'snapshot_file': str (full path),
+            'step': int,
+            'time': float,
+            'step_name': str
+        }
+        Returns None if file doesn't exist or has no snapshots
+    """
+    snapshot_file = os.path.join(output_dir, f'tov_snapshots{suffix}.h5')
+
+    if not os.path.exists(snapshot_file):
+        return None
+
+    try:
+        with h5py.File(snapshot_file, 'r') as f:
+            snaps_group = f.get('snapshots')
+            if snaps_group is None or len(snaps_group) == 0:
+                return None
+
+            # Get sorted list of snapshots and take the last one
+            snap_keys = sorted(snaps_group.keys())
+            latest_snap_name = snap_keys[-1]
+            latest_snap = snaps_group[latest_snap_name]
+
+            step = int(latest_snap.attrs['step'])
+            time = float(latest_snap.attrs['time'])
+
+            return {
+                'snapshot_file': snapshot_file,
+                'step': step,
+                'time': time,
+                'step_name': latest_snap_name
+            }
+    except Exception as e:
+        print(f"Warning: Failed to find latest snapshot in {snapshot_file}: {e}")
+        return None
+
+
+def load_snapshot_from_hdf5(snapshot_file, step_name=None):
+    """
+    Load complete snapshot from HDF5 file.
+
+    Args:
+        snapshot_file: Path to tov_snapshots_cow.h5 or tov_snapshots_dyn.h5
+        step_name: Name of snapshot (e.g., 'step_00001250')
+                  If None, loads the latest available snapshot
+
+    Returns:
+        dict: {
+            'state_2d': np.array (NUM_VARS=15, N),
+            'step': int,
+            'time': float,
+            'r': np.array (N,),
+            'N': int,
+            'step_name': str
+        }
+
+    Raises:
+        FileNotFoundError: If snapshot_file doesn't exist
+        KeyError: If step_name not found in file
+    """
+    if not os.path.exists(snapshot_file):
+        raise FileNotFoundError(f"Snapshot file not found: {snapshot_file}")
+
+    with h5py.File(snapshot_file, 'r') as f:
+        # Load grid
+        r = np.array(f['grid/r'])
+        N = int(f['grid/N'][()])
+        r_max = float(f['grid/r_max'][()])
+
+        # If step_name not specified, find latest
+        if step_name is None:
+            snaps_group = f.get('snapshots')
+            if snaps_group is None or len(snaps_group) == 0:
+                raise KeyError("No snapshots found in file")
+            snap_keys = sorted(snaps_group.keys())
+            step_name = snap_keys[-1]
+
+        # Load snapshot
+        snap = f['snapshots'][step_name]
+        step = int(snap.attrs['step'])
+        time = float(snap.attrs['time'])
+
+        # Reconstruct state_2d: shape (NUM_VARS=15, N)
+        # [0:12] BSSN variables, [12:15] hydro conservatives
+        state_2d = np.zeros((15, N), dtype=np.float64)
+
+        # Load BSSN variables (12 variables)
+        bssn_group = snap['bssn']
+        bssn_order = ['phi', 'hrr', 'htt', 'hpp', 'K', 'arr', 'att', 'app',
+                      'lambdar', 'shiftr', 'br', 'lapse']
+
+        for idx, var_name in enumerate(bssn_order):
+            state_2d[idx, :] = np.array(bssn_group[var_name])
+
+        # Load hydro conservative variables (3 variables)
+        cons_group = snap['conservatives']
+        state_2d[12, :] = np.array(cons_group['D'])       # D
+        state_2d[13, :] = np.array(cons_group['Sr'])      # Sr
+        state_2d[14, :] = np.array(cons_group['tau'])     # tau
+
+        return {
+            'state_2d': state_2d,
+            'step': step,
+            'time': time,
+            'r': r,
+            'N': N,
+            'r_max': r_max,
+            'step_name': step_name
+        }
+
+
+def validate_restart_consistency(snapshot_data, config):
+    """
+    Validate that loaded snapshot is compatible with current configuration.
+
+    Args:
+        snapshot_data: dict returned by load_snapshot_from_hdf5()
+        config: dict with current configuration {
+            'num_points': int,
+            'r_max': float,
+            'K': float,
+            'Gamma': float,
+            'rho_floor': float,
+            'p_floor': float
+        }
+
+    Raises:
+        ValueError: If critical inconsistencies found
+    """
+    # Check grid size
+    if snapshot_data['N'] != config['num_points']:
+        raise ValueError(
+            f"Grid size mismatch: snapshot has N={snapshot_data['N']}, "
+            f"but config requires N={config['num_points']}"
+        )
+
+    # Check domain size (r_max)
+    r_max_snapshot = snapshot_data['r_max']
+    r_max_config = config['r_max']
+
+    if not np.isclose(r_max_snapshot, r_max_config, rtol=1e-10):
+        raise ValueError(
+            f"Domain size mismatch: snapshot has r_max={r_max_snapshot:.6e}, "
+            f"but config requires r_max={r_max_config:.6e}"
+        )
+
+    # Check state_2d shape
+    if snapshot_data['state_2d'].shape != (15, config['num_points']):
+        raise ValueError(
+            f"State shape mismatch: expected (15, {config['num_points']}), "
+            f"got {snapshot_data['state_2d'].shape}"
+        )
+
+    # Check that grid arrays match
+    if len(snapshot_data['r']) != config['num_points']:
+        raise ValueError(
+            f"Grid array length mismatch: snapshot has {len(snapshot_data['r'])} points, "
+            f"config requires {config['num_points']}"
+        )
+
+    # Warnings for parameter mismatches (non-critical)
+    if not np.isclose(snapshot_data['r'][-1], config['r_max'], rtol=1e-10):
+        print(f"Warning: Grid endpoint mismatch: {snapshot_data['r'][-1]:.6e} vs {config['r_max']:.6e}")
+
+
+# =============================================================================
 # DIAGNOSTIC FUNCTIONS
 # =============================================================================
 
@@ -590,7 +797,7 @@ def evolve_fixed_timestep(state_initial, dt, num_steps, grid, background, hydro,
 
         t_curr = t_start + (step + 1) * dt
         step_num = step_offset + step + 1
-        if step_num % 100 == 0:
+        if step_num % 1000 == 0:
             print(f"step {step_num:4d}  t={t_curr:.2e}:  ρ_c={rho_central:.6e}  max_Δρ/ρ={max_rel_rho_err:.2e}@r={r_max_rho_err:.2f}  "
               f"max_vʳ={max_abs_v:.3e}@r={r_max_v:.2f}  max_Sʳ={max_Sr:.2e}@r={r_max_Sr:.2f}  "
               f"c2p_fail={c2p_fail_count}")

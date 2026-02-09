@@ -668,10 +668,6 @@ def create_reconstruction(method: str = "wenoz"):
     from .tests.advance.backend import BACKEND
 
     if 'jax' in BACKEND:
-        # JAX backend (note: MP5 and MC not available in JAX)
-        if method.lower() in ["mp5", "mc"]:
-            print(f"[reconstruction] WARNING: {method.upper()} not available in JAX, using WENO-Z instead")
-            method = "wenoz"
         from .reconstruction_jax import ReconstructionJAX
         return ReconstructionJAX(method=method)
 

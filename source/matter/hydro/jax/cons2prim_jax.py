@@ -66,72 +66,35 @@ def _newton_kernel_jax(D, Sr, tau, gamma_rr, alpha, p_init,
 
         # Evaluate pressure residual
         Q = tau + D + p
-        vr = alpha_safe * Sr / (Q * gamma_rr)
+        vr = Sr / (Q * gamma_rr)
         v2 = gamma_rr * vr * vr
-
-        # Clamp v2 for safety
         v2 = jnp.clip(v2, 0.0, 1.0 - 1e-12)
         W = 1.0 / jnp.sqrt(1.0 - v2)
 
-        # Check Lorentz factor bounds - if violated, adjust p and continue
-        W_valid = (W <= W_max) & (W >= 1.0)
-
         rho0 = D / jnp.maximum(W, 1e-30)
-        rho0_valid = rho0 > 0.0
-
         eps = p / (rho0 * gm1 + 1e-30)
         h = 1.0 + eps + p / (rho0 + 1e-30)
 
-        # Residual
+        # Residual: f(p) = rho*h*W^2 - Q
         f = rho0 * h * W * W - Q
 
         # Check convergence
-        tol_val = tol * jnp.maximum(1.0, jnp.abs(p))
-        is_converged = jnp.abs(f) <= tol_val
+        is_converged = jnp.abs(f) <= tol * jnp.maximum(1.0, jnp.abs(p))
 
-        # Analytic derivative for ideal gas
+        # Analytic derivative df/dp
         E = tau + D
-        Q2 = (E + p) ** 2
         Sr_sq = Sr * Sr
-        v2_deriv = Sr_sq / jnp.maximum(Q2 * gamma_rr, 1e-30)
-        W_loc = 1.0 / jnp.maximum((1.0 - v2_deriv), 1e-16) ** 0.5
-        W_cubed = W_loc * W_loc * W_loc
-        Q_cubed = (E + p) ** 3
-        Wprime = -Sr_sq * W_cubed / jnp.maximum(Q_cubed * gamma_rr, 1e-30)
-        W_sq = W_loc * W_loc
-        df = c_ideal * W_sq + (D + 2.0 * c_ideal * p * W_loc) * Wprime - 1.0
+        Qp = E + p
+        v2_d = Sr_sq / jnp.maximum(Qp**2 * gamma_rr, 1e-30)
+        W_d = 1.0 / jnp.maximum(1.0 - v2_d, 1e-16) ** 0.5
+        Wprime = -Sr_sq * W_d**3 / jnp.maximum(Qp**3 * gamma_rr, 1e-30)
+        df = c_ideal * W_d**2 + (D + 2.0 * c_ideal * p * W_d) * Wprime - 1.0
 
-        # Check if derivative is too small (matches Numba: skip iteration & reset)
-        small_df = jnp.abs(df) < 1e-15
+        # Standard Newton update: p_{n+1} = p_n - f/f'
+        p_new = p - f / df
+        p_new = jnp.maximum(p_new, p_floor)
 
-        # Newton update (only meaningful when df is valid)
-        df_safe = jnp.where(small_df, 1.0, df)
-        p_newton = p - f / df_safe
-
-        # Handle invalid Newton update (NaN or negative)
-        p_newton = jnp.where(
-            (p_newton <= 0.0) | ~jnp.isfinite(p_newton),
-            jnp.maximum(p_floor, 0.5 * p),
-            p_newton
-        )
-
-        # Apply damped Newton step
-        p_damped = 0.5 * p + 0.5 * p_newton
-
-        # Final pressure update:
-        # - If W or rho0 invalid: reset p (matches Numba continue behavior)
-        # - If df too small: reset p (matches Numba continue behavior)
-        # - Otherwise: use damped Newton
-        p_new = jnp.where(
-            W_valid & rho0_valid & ~small_df,
-            p_damped,
-            jnp.maximum(p_floor, p * 1.5 + 1e-14)
-        )
-
-        # Update convergence flag
-        new_converged = is_converged & W_valid & rho0_valid
-
-        return (iteration + 1, p_new, new_converged)
+        return (iteration + 1, p_new, is_converged)
 
     # Run Newton iterations
     init_state = (0, p_start, False)
@@ -140,7 +103,7 @@ def _newton_kernel_jax(D, Sr, tau, gamma_rr, alpha, p_init,
     # Compute final primitives
     p = final_p
     Q = tau + D + p
-    vr = alpha_safe * Sr / (Q * gamma_rr)
+    vr = Sr / (Q * gamma_rr)
     v2 = gamma_rr * vr * vr
     v2 = jnp.clip(v2, 0.0, 1.0 - 1e-16)
     W = 1.0 / jnp.sqrt(1.0 - v2)
@@ -222,70 +185,40 @@ def _newton_kernel_polytropic_jax(D, Sr, tau, gamma_rr, alpha, rho_init,
     def body_fn(state):
         iteration, rho, converged = state
 
-        # Pressure and enthalpy from rho (barotropic: depends only on rho)
+        # Pressure and enthalpy from rho (barotropic)
         p = K * rho**eos_gamma
         h = 1.0 + eos_gamma * K * rho**gm1 / gm1
 
-        # Compute Q = tau + D + p, then velocity
+        # Velocity from conservatives
         Q = tau + D + p
-        vr = alpha_safe * Sr / (Q * gamma_rr)
+        vr = Sr / (Q * gamma_rr)
         v2 = gamma_rr * vr * vr
-
-        # Clamp v2 for safety
         v2 = jnp.clip(v2, 0.0, 1.0 - 1e-12)
         W = 1.0 / jnp.sqrt(1.0 - v2)
 
-        # Check Lorentz factor bounds
-        W_valid = (W <= W_max) & (W >= 1.0)
-
-        # Residual: f = D - rho * W
+        # Residual: f(rho) = D - rho * W
         f = D - rho * W
 
         # Check convergence
-        tol_val = tol * jnp.maximum(1.0, D)
-        is_converged = jnp.abs(f) <= tol_val
+        is_converged = jnp.abs(f) <= tol * jnp.maximum(1.0, D)
 
         # Numerical derivative df/drho
         drho = 1e-8 * jnp.maximum(rho, 1e-10)
         rho2 = rho + drho
         p2 = K * rho2**eos_gamma
         Q2 = tau + D + p2
-        vr2 = alpha_safe * Sr / (Q2 * gamma_rr)
+        vr2 = Sr / (Q2 * gamma_rr)
         v2_2 = gamma_rr * vr2 * vr2
         v2_2 = jnp.clip(v2_2, 0.0, 1.0 - 1e-12)
         W2 = 1.0 / jnp.sqrt(1.0 - v2_2)
         f2 = D - rho2 * W2
-
         df = (f2 - f) / drho
 
-        # Check if derivative is too small
-        small_df = jnp.abs(df) < 1e-15
+        # Standard Newton update: rho_{n+1} = rho_n - f/f'
+        rho_new = rho - f / df
+        rho_new = jnp.maximum(rho_new, rho_floor)
 
-        # Newton update
-        df_safe = jnp.where(small_df, 1.0, df)
-        rho_newton = rho - f / df_safe
-
-        # Handle invalid Newton update
-        rho_newton = jnp.where(
-            (rho_newton <= 0.0) | ~jnp.isfinite(rho_newton),
-            jnp.maximum(rho_floor, 0.5 * rho),
-            rho_newton
-        )
-
-        # Apply damped Newton step
-        rho_damped = 0.5 * rho + 0.5 * rho_newton
-
-        # Final rho update
-        rho_new = jnp.where(
-            W_valid & ~small_df,
-            rho_damped,
-            jnp.maximum(rho_floor, rho * 0.5)
-        )
-
-        # Update convergence flag
-        new_converged = is_converged & W_valid
-
-        return (iteration + 1, rho_new, new_converged)
+        return (iteration + 1, rho_new, is_converged)
 
     # Run Newton iterations
     init_state = (0, rho_start, False)
@@ -296,7 +229,7 @@ def _newton_kernel_polytropic_jax(D, Sr, tau, gamma_rr, alpha, rho_init,
     p = K * rho**eos_gamma
     h = 1.0 + eos_gamma * K * rho**gm1 / gm1
     Q = tau + D + p
-    vr = alpha_safe * Sr / (Q * gamma_rr)
+    vr = Sr / (Q * gamma_rr)
     v2 = gamma_rr * vr * vr
     v2 = jnp.clip(v2, 0.0, 1.0 - 1e-16)
     W = 1.0 / jnp.sqrt(1.0 - v2)
@@ -342,6 +275,239 @@ def _solve_newton_batch_polytropic_jax(D, Sr, tau, gamma_rr, alpha, rho_guess,
     )
 
     return newton_vmapped(D, Sr, tau, gamma_rr, alpha, rho_guess)
+
+
+# ============================================================================
+# JAX KASTAUN et al. (2021) SOLVER - ROBUST CONS2PRIM WITH BRACKETING
+# Based on: Kastaun et al., Phys. Rev. D 103, 023018 (2021)
+# Simplified for pure hydrodynamics (no magnetic field)
+# ============================================================================
+
+def _kastaun_residual_jax(mu, D, r2, q, eos_gamma, v2_max):
+    """
+    Kastaun residual f(mu) = mu - mu_hat for ideal gas EOS (JAX, branchless).
+
+    Not @jit-decorated: always called from inside a JIT context.
+
+    Steps:
+        1. v2 = min(mu^2 * r2, v2_max)
+        2. W = 1/sqrt(1 - v2)
+        3. rho = D/W
+        4. e/D = q - mu*r2 + 1
+        5. eps = W * e/D - 1,  P = rho*eps*(gamma-1),  h = 1 + eps*gamma
+        6. nu = h/W
+        7. mu_hat = 1/(nu + mu*r2)
+        8. f = mu - mu_hat
+    """
+    gm1 = eos_gamma - 1.0
+
+    v2 = jnp.minimum(mu * mu * r2, v2_max)
+    v2 = jnp.minimum(v2, 1.0 - 1e-15)
+    W = 1.0 / jnp.sqrt(1.0 - v2)
+
+    rho = D / jnp.maximum(W, 1e-30)
+    e_over_D = q - mu * r2 + 1.0
+    eps = jnp.maximum(W * e_over_D - 1.0, 0.0)
+
+    P = rho * eps * gm1
+    h = jnp.maximum(1.0 + eps * eos_gamma, 1.0 + 1e-15)
+
+    nu = h / W
+    mu_hat = 1.0 / jnp.maximum(nu + mu * r2, 1e-30)
+
+    return mu - mu_hat
+
+
+@partial(jit, static_argnums=(4, 5, 6, 7, 8, 9, 10))
+def _kastaun_kernel_jax(D, Sr, tau, gamma_rr,
+                        eos_gamma, rho_floor, p_floor, v_max, W_max, tol, max_iter):
+    """
+    Kastaun et al. (2021) cons2prim kernel for ideal gas (single point, JAX).
+
+    Bracketed root-finding on mu with False Position + Anderson-Bjorck.
+    Fully branchless for JIT/GPU compatibility.
+
+    Args:
+        D, Sr, tau: Conservative variables (physical, not densitized) - scalars
+        gamma_rr: Radial metric component
+        eos_gamma: Adiabatic index (static)
+        rho_floor, p_floor: Atmosphere floors (static)
+        v_max, W_max: Velocity/Lorentz limits (static)
+        tol, max_iter: Convergence parameters (static)
+
+    Returns:
+        (rho0, vr, p, eps, W, h, converged)
+    """
+    gm1 = eos_gamma - 1.0
+    v2_max = v_max * v_max
+
+    # Safe inputs
+    D_safe = jnp.maximum(D, 1e-30)
+    gamma_rr_safe = jnp.maximum(gamma_rr, 1e-30)
+
+    # Auxiliary quantities
+    q = tau / D_safe
+    r2 = (Sr * Sr) / (D_safe * D_safe * gamma_rr_safe)
+
+    # Bounds for mu
+    mu_min = 1e-15
+    mu_max_base = 1.0 / (1.0 + 1e-10)
+    mu_v_limit = jnp.where(
+        r2 > 1e-30,
+        v_max / jnp.sqrt(jnp.maximum(r2, 1e-30)) * 0.999,
+        mu_max_base
+    )
+    mu_max = jnp.minimum(mu_max_base, mu_v_limit)
+    mu_max = jnp.maximum(mu_max, mu_min + 1e-15)
+
+    # Evaluate residual at bounds
+    f_min = _kastaun_residual_jax(mu_min, D_safe, r2, q, eos_gamma, v2_max)
+    f_max = _kastaun_residual_jax(mu_max, D_safe, r2, q, eos_gamma, v2_max)
+
+    has_bracket = f_min * f_max < 0.0
+
+    # ---- Bracket search (20 bisection iterations if no bracket) ----
+    def bracket_body(_, state):
+        a, b, fa, fb, mu_test, found = state
+
+        f_test = _kastaun_residual_jax(mu_test, D_safe, r2, q, eos_gamma, v2_max)
+
+        left_ok = (fa * f_test < 0.0) & ~found
+        right_ok = (f_test * fb < 0.0) & ~found & ~left_ok
+        new_found = found | left_ok | right_ok
+
+        b_new = jnp.where(left_ok, mu_test, b)
+        fb_new = jnp.where(left_ok, f_test, fb)
+        a_new = jnp.where(right_ok, mu_test, a)
+        fa_new = jnp.where(right_ok, f_test, fa)
+
+        # Next test point (bisect toward expected root)
+        mu_next = jnp.where(fa > 0.0,
+                            0.5 * (mu_test + b_new),
+                            0.5 * (a_new + mu_test))
+        mu_test_new = jnp.where(new_found, mu_test, mu_next)
+
+        return (a_new, b_new, fa_new, fb_new, mu_test_new, new_found)
+
+    bracket_init = (mu_min, mu_max, f_min, f_max,
+                    0.5 * (mu_min + mu_max), has_bracket)
+    a_br, b_br, fa_br, fb_br, _, bracket_found = lax.fori_loop(
+        0, 20, bracket_body, bracket_init
+    )
+
+    # ---- False Position with Anderson-Bjorck acceleration ----
+    def fp_cond(state):
+        _, _, _, _, _, _, _, iteration, converged = state
+        return (iteration < max_iter) & (~converged)
+
+    def fp_body(state):
+        a, b, fa, fb, x, xold, side, iteration, converged = state
+
+        xold_new = x
+
+        # Interpolation
+        denom = fb - fa
+        x_fp = jnp.where(jnp.abs(denom) < 1e-30,
+                         0.5 * (a + b),
+                         (a * fb - b * fa) / denom)
+        x_new = jnp.where((x_fp <= a) | (x_fp >= b),
+                          0.5 * (a + b), x_fp)
+
+        fx = _kastaun_residual_jax(x_new, D_safe, r2, q, eos_gamma, v2_max)
+
+        # Convergence check
+        conv = ((jnp.abs(x_new - xold_new) <= tol * jnp.maximum(jnp.abs(x_new), 1e-15))
+                | (jnp.abs(fx) <= tol))
+
+        # Determine which side contains the root
+        root_left = fa * fx < 0.0
+
+        # Anderson-Bjorck: scale fa when b updated on same side twice
+        m_l = 1.0 - fx / jnp.where(jnp.abs(fb) > 1e-30, fb, 1e-30)
+        fa_l = jnp.where(side == -1.0,
+                         jnp.where(m_l > 0.0, fa * m_l, fa * 0.5),
+                         fa)
+
+        # Anderson-Bjorck: scale fb when a updated on same side twice
+        m_r = 1.0 - fx / jnp.where(jnp.abs(fa) > 1e-30, fa, 1e-30)
+        fb_r = jnp.where(side == 1.0,
+                         jnp.where(m_r > 0.0, fb * m_r, fb * 0.5),
+                         fb)
+
+        a_new = jnp.where(root_left, a, x_new)
+        b_new = jnp.where(root_left, x_new, b)
+        fa_new = jnp.where(root_left, fa_l, fx)
+        fb_new = jnp.where(root_left, fx, fb_r)
+        side_new = jnp.where(root_left, -1.0, 1.0)
+
+        return (a_new, b_new, fa_new, fb_new, x_new, xold_new,
+                side_new, iteration + 1, conv)
+
+    fp_init = (a_br, b_br, fa_br, fb_br, a_br, a_br,
+               0.0, 0, jnp.bool_(False))
+    fp_result = lax.while_loop(fp_cond, fp_body, fp_init)
+    mu_sol = fp_result[4]
+    fp_converged = fp_result[8]
+
+    # ---- Recover primitives from mu ----
+    v2 = jnp.minimum(mu_sol * mu_sol * r2, v2_max)
+    v2 = jnp.minimum(v2, 1.0 - 1e-15)
+    W = 1.0 / jnp.sqrt(1.0 - v2)
+    W = jnp.minimum(W, W_max * 1.0)
+
+    rho = D_safe / jnp.maximum(W, 1e-30)
+    rho = jnp.maximum(rho, rho_floor)
+
+    e_over_D = q - mu_sol * r2 + 1.0
+    eps = jnp.maximum(W * e_over_D - 1.0, 0.0)
+
+    P = rho * eps * gm1
+    P = jnp.maximum(P, p_floor)
+    eps = jnp.where(P <= p_floor, p_floor / (rho * gm1), eps)
+
+    h = jnp.maximum(1.0 + eps * eos_gamma, 1.0 + 1e-15)
+
+    # Velocity (sign from Sr)
+    vr = jnp.sign(Sr) * jnp.sqrt(jnp.maximum(v2 / gamma_rr_safe, 0.0))
+
+    # Overall success
+    valid_input = (D > 0.0) & jnp.isfinite(D) & jnp.isfinite(Sr) & jnp.isfinite(tau)
+    success = valid_input & bracket_found & fp_converged
+
+    # Atmosphere fallback values
+    eps_atm = p_floor / (rho_floor * gm1)
+    h_atm = 1.0 + eps_atm * eos_gamma
+
+    rho_out = jnp.where(success, rho, rho_floor)
+    vr_out = jnp.where(success, vr, 0.0)
+    p_out = jnp.where(success, P, p_floor)
+    eps_out = jnp.where(success, eps, eps_atm)
+    W_out = jnp.where(success, W, 1.0)
+    h_out = jnp.where(success, h, h_atm)
+
+    return rho_out, vr_out, p_out, eps_out, W_out, h_out, success
+
+
+@partial(jit, static_argnums=(4, 5, 6, 7, 8, 9, 10))
+def _solve_kastaun_batch_jax(D, Sr, tau, gamma_rr,
+                              eos_gamma, rho_floor, p_floor, v_max, W_max, tol, max_iter):
+    """
+    Batch Kastaun solver for ideal gas EOS using vmap.
+
+    Args:
+        D, Sr, tau: Conservative variable arrays (N,)
+        gamma_rr: Metric component array (N,)
+        eos_gamma, rho_floor, p_floor, v_max, W_max, tol, max_iter: static params
+
+    Returns:
+        tuple: (rho0, vr, p, eps, W, h, converged) - all arrays (N,)
+    """
+    kastaun_vmapped = vmap(
+        lambda d, sr, t, grr: _kastaun_kernel_jax(
+            d, sr, t, grr, eos_gamma, rho_floor, p_floor, v_max, W_max, tol, max_iter
+        )
+    )
+    return kastaun_vmapped(D, Sr, tau, gamma_rr)
 
 
 # ============================================================================

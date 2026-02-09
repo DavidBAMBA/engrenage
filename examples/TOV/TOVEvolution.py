@@ -221,12 +221,12 @@ def main():
     # CONFIGURATION
     # ==================================================================
     r_max = 100.0
-    num_points = 16000
+    num_points = 1000
     K = 100.0
     Gamma = 2.0
     rho_central = 1.28e-3
-    t_final = 4000  # Performance test
-    FOLDER_NAME_EVOL = f"tov_evolution_data_rmax{r_max}_TEST_long_domain_long_time"  # Folder name for evolution data (includes r_max for clarity)
+    t_final = 6000  # Performance test
+    FOLDER_NAME_EVOL = f"tov_evolution_data_rmax{r_max}_prueba"  # Folder name for evolution data (includes r_max for clarity)
 
     SNAPSHOT_INTERVAL = 100  # Save full domain every N timesteps (None to disable)
     EVOLUTION_INTERVAL = 100  # Save time series every N timesteps (None to disable)
@@ -242,6 +242,11 @@ def main():
 
     # Options: "cowling" or "dynamic"
     EVOLUTION_MODE = "cowling"  # "cowling" or "dynamic"
+
+    # ==================================================================
+    # RESTART CONFIGURATION
+    # ==================================================================
+    ENABLE_RESTART = True  # Set to True to attempt restart from last snapshot
 
     # atmosphere config
     rho_floor_base = 1e-13# * rho_central
@@ -339,48 +344,105 @@ def main():
     print(f"Riemann solver: {RIEMANN_SOLVER}\n")
 
     # ==================================================================
-    # SOLVE TOV DIRECTLY ON EVOLUTION GRID (for discrete equilibrium)
+    # RESTART DETECTION
     # ==================================================================
-    print("Solving TOV equations...")
+    restart_info = None
+    initial_state_2d = None
+    tov_solution = None
+    prim_tuple = None
+    t_start = 0.0
+    step_offset = 0
 
-    tov_solution = load_or_solve_tov_iso(
-        K=K, Gamma=Gamma, rho_central=rho_central,
-        r_max=r_max, accuracy="high"
-    )
-    print(f"TOV Solution: M={tov_solution.M_star:.6f}, R_iso={tov_solution.R_iso:.3f}, R_schw={tov_solution.R_schw:.3f}, C={tov_solution.C:.4f}\n")
+    if ENABLE_RESTART and ENABLE_DATA_SAVING:
+        print("="*70)
+        print("CHECKING FOR RESTART DATA")
+        print("="*70)
+        restart_info = utils.find_latest_snapshot(OUTPUT_DIR, suffix=PLOT_SUFFIX)
 
-    #utils.plot_tov_diagnostics(tov_solution, r_max, suffix=PLOT_SUFFIX)
+    if restart_info is not None:
+        print(f"Restart snapshot found:")
+        print(f"  Step: {restart_info['step']}")
+        print(f"  Time: {restart_info['time']:.6e}")
+        print(f"  File: {restart_info['snapshot_file']}")
 
-    # ==================================================================
-    # INITIAL DATA (HIGH-ORDER INTERPOLATION)
-    # ==================================================================
-    print("Creating initial data from TOV solution...")
-    # 1. Interpolate ρ, P ONLY up to stellar radius R
-    # 2. Outside R: use atmosphere values directly (no interpolation)
-    # 3. Interpolate geometry (alpha, exp4φ) everywhere
-    # 4. Stencil NEVER crosses the stellar surface (avoids Gibbs phenomenon)
+        # Load snapshot
+        snapshot_data = utils.load_snapshot_from_hdf5(
+            restart_info['snapshot_file'],
+            restart_info['step_name']
+        )
 
-    initial_state_2d, prim_tuple = tov_id.create_initial_data_iso(
-        tov_solution, grid, background, eos,
-        atmosphere=ATMOSPHERE,
-        polytrope_K=K, polytrope_Gamma=Gamma,
-        interp_order=11
-    )
+        # Validate consistency
+        metadata = utils.load_metadata(OUTPUT_DIR, suffix=PLOT_SUFFIX)
+        utils.validate_restart_consistency(snapshot_data, {
+            'num_points': num_points,
+            'r_max': r_max,
+            'K': K,
+            'Gamma': Gamma,
+            'rho_floor': ATMOSPHERE.rho_floor,
+            'p_floor': ATMOSPHERE.p_floor
+        })
 
-    # Diagnostics: check discrete hydrostatic balance at t=0
-    utils.diagnose_t0_residuals(initial_state_2d, grid, background, hydro)
+        # Set initial state from snapshot
+        initial_state_2d = snapshot_data['state_2d']
+        t_start = snapshot_data['time']
+        step_offset = snapshot_data['step']
 
-    # Initial-data diagnostics
-    tov_id.plot_initial_comparison(tov_solution, initial_state_2d, grid, prim_tuple,
-                                   output_dir=plots_dir, suffix=PLOT_SUFFIX)
+        print(f"\n✓ Restart validated successfully")
+        print(f"  Resuming from step {step_offset}, t={t_start:.6e}")
+        print(f"  Will evolve to t_final={t_final:.6e}")
+        print("="*70 + "\n")
 
-    # Hamiltonian constraint diagnostic (show before evolution)
-    tov_id.plot_hamiltonian_constraint_iso(tov_solution, initial_state_2d, grid, background, hydro,
-                                            K, Gamma, rho_central, output_dir=plots_dir, show=True)
+    else:
+        # NO RESTART: Normal initialization from TOV solution
+        if ENABLE_RESTART:
+            print("="*70)
+            print("NO RESTART DATA FOUND - Starting from TOV solution")
+            print("="*70 + "\n")
 
-    # Zoom comparison: TOV solution vs interpolated initial data 
-    #utils.plot_tov_vs_initial_data_zoom(tov_solution, initial_state_2d, grid, prim_tuple,
-     #                                   window=0.1, suffix=PLOT_SUFFIX)
+    if initial_state_2d is None:
+        # ==================================================================
+        # SOLVE TOV DIRECTLY ON EVOLUTION GRID (for discrete equilibrium)
+        # ==================================================================
+        print("Solving TOV equations...")
+
+        tov_solution = load_or_solve_tov_iso(
+            K=K, Gamma=Gamma, rho_central=rho_central,
+            r_max=r_max, accuracy="high"
+        )
+        print(f"TOV Solution: M={tov_solution.M_star:.6f}, R_iso={tov_solution.R_iso:.3f}, R_schw={tov_solution.R_schw:.3f}, C={tov_solution.C:.4f}\n")
+
+        #utils.plot_tov_diagnostics(tov_solution, r_max, suffix=PLOT_SUFFIX)
+
+        # ==================================================================
+        # INITIAL DATA (HIGH-ORDER INTERPOLATION)
+        # ==================================================================
+        print("Creating initial data from TOV solution...")
+        # 1. Interpolate ρ, P ONLY up to stellar radius R
+        # 2. Outside R: use atmosphere values directly (no interpolation)
+        # 3. Interpolate geometry (alpha, exp4φ) everywhere
+        # 4. Stencil NEVER crosses the stellar surface (avoids Gibbs phenomenon)
+
+        initial_state_2d, prim_tuple = tov_id.create_initial_data_iso(
+            tov_solution, grid, background, eos,
+            atmosphere=ATMOSPHERE,
+            polytrope_K=K, polytrope_Gamma=Gamma,
+            interp_order=11
+        )
+
+        # Diagnostics: check discrete hydrostatic balance at t=0
+        utils.diagnose_t0_residuals(initial_state_2d, grid, background, hydro)
+
+        # Initial-data diagnostics
+        tov_id.plot_initial_comparison(tov_solution, initial_state_2d, grid, prim_tuple,
+                                       output_dir=plots_dir, suffix=PLOT_SUFFIX)
+
+        # Hamiltonian constraint diagnostic (show before evolution)
+        tov_id.plot_hamiltonian_constraint_iso(tov_solution, initial_state_2d, grid, background, hydro,
+                                                K, Gamma, rho_central, output_dir=plots_dir, show=True)
+
+        # Zoom comparison: TOV solution vs interpolated initial data
+        #utils.plot_tov_vs_initial_data_zoom(tov_solution, initial_state_2d, grid, prim_tuple,
+         #                                   window=0.1, suffix=PLOT_SUFFIX)
 
     # ==================================================================
     # EVOLUTION
@@ -420,22 +482,38 @@ def main():
         cfl_factor = 0.1  # Standard CFL for Cowling
 
     # Initialize data manager for saving
+    # In restart mode, append to existing files instead of overwriting
     data_manager = SimulationDataManager(OUTPUT_DIR, grid, hydro,
                                         enable_saving=ENABLE_DATA_SAVING,
-                                        suffix=PLOT_SUFFIX)
+                                        suffix=PLOT_SUFFIX,
+                                        restart_mode=(restart_info is not None))
 
     if integration_method == 'fixed':
         dt = cfl_factor * grid.min_dr  # CFL condition
         num_steps_total = int(t_final / dt)  # Calculate steps from t_final
-        print(f"\nEvolving with fixed dt={dt:.6f} (CFL={cfl_factor}) to t_final={t_final} ({num_steps_total} steps) using RK4")
+
+        # For restart: calculate remaining steps
+        time_remaining = t_final - t_start
+        num_steps_remaining = int(time_remaining / dt)
+
+        if restart_info is not None:
+            print(f"\nRestart mode:")
+            print(f"  Current time: {t_start:.6e}")
+            print(f"  Target time:  {t_final:.6e}")
+            print(f"  Remaining:    {time_remaining:.6e} ({num_steps_remaining} steps)")
+            print(f"  dt={dt:.6e} (CFL={cfl_factor})")
+        else:
+            print(f"\nEvolving with fixed dt={dt:.6f} (CFL={cfl_factor}) to t_final={t_final} ({num_steps_total} steps) using RK4")
 
         # Start timing the evolution
         evolution_start_time = time.time()
 
         # Save metadata now that we have dt
         if ENABLE_DATA_SAVING:
+            # Use tov_solution from metadata if doing restart, otherwise use computed tov_solution
+            tov_sol_to_save = tov_solution if tov_solution is not None else metadata.get('tov_solution', {})
             data_manager.save_metadata(
-                tov_solution, ATMOSPHERE, dt, integration_method,
+                tov_sol_to_save, ATMOSPHERE, dt, integration_method,
                 K=K, Gamma=Gamma, rho_central=rho_central,
                 r_max=r_max, num_points=num_points, t_final=t_final,
                 reconstructor=RECONSTRUCTOR_NAME, solver_method=SOLVER_METHOD,
@@ -443,103 +521,151 @@ def main():
                 cfl_factor=cfl_factor
             )
 
-        # Single step for comparison
-        state_t1 = selected_rk4_step(initial_state_2d.flatten(), dt, grid, background, hydro,
-                                     bssn_fixed, bssn_d1_fixed, ATMOSPHERE).reshape((grid.NUM_VARS, grid.N))
-        t_1 = dt
+        # Skip first-step diagnostics and checkpoints for restart mode
+        if restart_info is None:
+            # Single step for comparison
+            state_t1 = selected_rk4_step(initial_state_2d.flatten(), dt, grid, background, hydro,
+                                         bssn_fixed, bssn_d1_fixed, ATMOSPHERE).reshape((grid.NUM_VARS, grid.N))
+            t_1 = dt
 
-        # Plot only the first step changes
-        #utils.plot_first_step(initial_state_2d, state_t1, grid, hydro, tov_solution,
-        #                     suffix=PLOT_SUFFIX)
-        #utils.plot_surface_zoom(tov_solution, initial_state_2d, state_t1, grid, hydro,
-        #                       primitives_t0=prim_tuple, window=0.1, suffix=PLOT_SUFFIX)
-        #utils.plot_center_zoom(initial_state_2d, state_t1, grid, hydro,
-        #                      window=0.5, suffix=PLOT_SUFFIX)
-
-        # Define checkpoints at 1/3, 2/3, and final of total steps
-        checkpoint_1 = max(1, num_steps_total // 3)
-        checkpoint_2 = max(2, 2 * num_steps_total // 3)
-        checkpoint_3 = num_steps_total
-
-        print(f"\n{'='*70}")
-        print(f"Evolution checkpoints (for plotting):")
-        print(f"  t=0:         initial state")
-        print(f"  step {checkpoint_1:6d}:  1/3 of evolution (~{checkpoint_1*dt:.3e} time units)")
-        print(f"  step {checkpoint_2:6d}:  2/3 of evolution (~{checkpoint_2*dt:.3e} time units)")
-        print(f"  step {checkpoint_3:6d}:  final state     (~{checkpoint_3*dt:.3e} time units)")
-        print(f"{'='*70}\n")
+            # Plot only the first step changes
+            #utils.plot_first_step(initial_state_2d, state_t1, grid, hydro, tov_solution,
+            #                     suffix=PLOT_SUFFIX)
+            #utils.plot_surface_zoom(tov_solution, initial_state_2d, state_t1, grid, hydro,
+            #                       primitives_t0=prim_tuple, window=0.1, suffix=PLOT_SUFFIX)
+            #utils.plot_center_zoom(initial_state_2d, state_t1, grid, hydro,
+            #                      window=0.5, suffix=PLOT_SUFFIX)
 
         # Storage for checkpoint states
         checkpoint_states = {}
         checkpoint_times = {}
         all_series = []
 
-        # Evolve to checkpoint 1
-        print(f"Evolving to checkpoint 1 (step {checkpoint_1})...")
-        state_cp1, steps_cp1, t_cp1, series_1 = evolve_fixed_timestep(
-            initial_state_2d, dt, checkpoint_1, grid, background,
-            hydro, bssn_fixed, bssn_d1_fixed, ATMOSPHERE, selected_rk4_step,
-            method='rk4', reference_state=initial_state_2d,
-            data_manager=data_manager,
-            snapshot_interval=SNAPSHOT_INTERVAL,
-            evolution_interval=EVOLUTION_INTERVAL)
-        checkpoint_states[1] = state_cp1.copy()
-        checkpoint_times[1] = t_cp1
-        all_series.append(series_1)
-        print(f"  -> Reached step {steps_cp1}, t={t_cp1:.6e}")
+        # Choose evolution strategy based on restart
+        if restart_info is None:
+            # Normal mode: use checkpoint structure
+            # Define checkpoints at 1/3, 2/3, and final of total steps
+            checkpoint_1 = max(1, num_steps_total // 3)
+            checkpoint_2 = max(2, 2 * num_steps_total // 3)
+            checkpoint_3 = num_steps_total
 
-        # Evolve to checkpoint 2
-        if steps_cp1 == checkpoint_1:
-            remaining_steps = checkpoint_2 - checkpoint_1
-            print(f"\nEvolving to checkpoint 2 (step {checkpoint_2})...")
-            state_cp2, steps_cp2, t_cp2, series_2 = evolve_fixed_timestep(
-                state_cp1, dt, remaining_steps, grid, background,
+            print(f"\n{'='*70}")
+            print(f"Evolution checkpoints (for plotting):")
+            print(f"  t=0:         initial state")
+            print(f"  step {checkpoint_1:6d}:  1/3 of evolution (~{checkpoint_1*dt:.3e} time units)")
+            print(f"  step {checkpoint_2:6d}:  2/3 of evolution (~{checkpoint_2*dt:.3e} time units)")
+            print(f"  step {checkpoint_3:6d}:  final state     (~{checkpoint_3*dt:.3e} time units)")
+            print(f"{'='*70}\n")
+        else:
+            # Restart mode: compute checkpoints relative to restart point
+            checkpoint_1 = step_offset + max(1, num_steps_remaining // 3)
+            checkpoint_2 = step_offset + max(2, 2 * num_steps_remaining // 3)
+            checkpoint_3 = num_steps_total
+
+            print(f"\n{'='*70}")
+            print(f"Evolution (restart mode):")
+            print(f"  Starting step: {step_offset}")
+            print(f"  Starting time: {t_start:.6e}")
+            print(f"  Target step:   {checkpoint_3}")
+            print(f"  Target time:   {t_final:.6e}")
+            print(f"{'='*70}\n")
+
+        if restart_info is None:
+            # ===== NORMAL MODE: Use checkpoint structure =====
+            # Evolve to checkpoint 1
+            print(f"Evolving to checkpoint 1 (step {checkpoint_1})...")
+            state_cp1, steps_cp1, t_cp1, series_1 = evolve_fixed_timestep(
+                initial_state_2d, dt, checkpoint_1, grid, background,
                 hydro, bssn_fixed, bssn_d1_fixed, ATMOSPHERE, selected_rk4_step,
-                method='rk4', t_start=t_cp1, reference_state=initial_state_2d,
-                step_offset=checkpoint_1,
+                method='rk4', reference_state=initial_state_2d,
                 data_manager=data_manager,
                 snapshot_interval=SNAPSHOT_INTERVAL,
                 evolution_interval=EVOLUTION_INTERVAL)
-            checkpoint_states[2] = state_cp2.copy()
-            checkpoint_times[2] = t_cp2
-            all_series.append(series_2)
-            print(f"  -> Reached step {checkpoint_1 + steps_cp2}, t={t_cp2:.6e}")
-        else:
-            # Stopped early
-            state_cp2 = state_cp1
-            t_cp2 = t_cp1
-            checkpoint_states[2] = state_cp2.copy()
-            checkpoint_times[2] = t_cp2
+            checkpoint_states[1] = state_cp1.copy()
+            checkpoint_times[1] = t_cp1
+            all_series.append(series_1)
+            print(f"  -> Reached step {steps_cp1}, t={t_cp1:.6e}")
 
-        # Evolve to checkpoint 3 (final)
-        if steps_cp1 == checkpoint_1 and (checkpoint_1 + steps_cp2) == checkpoint_2:
-            remaining_steps = checkpoint_3 - checkpoint_2
-            print(f"\nEvolving to checkpoint 3 (step {checkpoint_3}, final)...")
-            state_cp3, steps_cp3, t_cp3, series_3 = evolve_fixed_timestep(
-                state_cp2, dt, remaining_steps, grid, background,
+            # Evolve to checkpoint 2
+            if steps_cp1 == checkpoint_1:
+                remaining_steps = checkpoint_2 - checkpoint_1
+                print(f"\nEvolving to checkpoint 2 (step {checkpoint_2})...")
+                state_cp2, steps_cp2, t_cp2, series_2 = evolve_fixed_timestep(
+                    state_cp1, dt, remaining_steps, grid, background,
+                    hydro, bssn_fixed, bssn_d1_fixed, ATMOSPHERE, selected_rk4_step,
+                    method='rk4', t_start=t_cp1, reference_state=initial_state_2d,
+                    step_offset=checkpoint_1,
+                    data_manager=data_manager,
+                    snapshot_interval=SNAPSHOT_INTERVAL,
+                    evolution_interval=EVOLUTION_INTERVAL)
+                checkpoint_states[2] = state_cp2.copy()
+                checkpoint_times[2] = t_cp2
+                all_series.append(series_2)
+                print(f"  -> Reached step {checkpoint_1 + steps_cp2}, t={t_cp2:.6e}")
+            else:
+                # Stopped early
+                state_cp2 = state_cp1
+                t_cp2 = t_cp1
+                checkpoint_states[2] = state_cp2.copy()
+                checkpoint_times[2] = t_cp2
+
+            # Evolve to checkpoint 3 (final)
+            if steps_cp1 == checkpoint_1 and (checkpoint_1 + steps_cp2) == checkpoint_2:
+                remaining_steps = checkpoint_3 - checkpoint_2
+                print(f"\nEvolving to checkpoint 3 (step {checkpoint_3}, final)...")
+                state_cp3, steps_cp3, t_cp3, series_3 = evolve_fixed_timestep(
+                    state_cp2, dt, remaining_steps, grid, background,
+                    hydro, bssn_fixed, bssn_d1_fixed, ATMOSPHERE, selected_rk4_step,
+                    method='rk4', t_start=t_cp2, reference_state=initial_state_2d,
+                    step_offset=checkpoint_2,
+                    data_manager=data_manager,
+                    snapshot_interval=SNAPSHOT_INTERVAL,
+                    evolution_interval=EVOLUTION_INTERVAL)
+                checkpoint_states[3] = state_cp3.copy()
+                checkpoint_times[3] = t_cp3
+                all_series.append(series_3)
+                steps_final = checkpoint_2 + steps_cp3
+                print(f"  -> Reached step {steps_final}, t={t_cp3:.6e}")
+            else:
+                # Stopped early
+                state_cp3 = state_cp2
+                t_cp3 = t_cp2
+                checkpoint_states[3] = state_cp3.copy()
+                checkpoint_times[3] = t_cp3
+                steps_final = checkpoint_1 + steps_cp2
+
+            # Assign final state for backward compatibility
+            state_t10000 = checkpoint_states[3]
+            t_10000 = checkpoint_times[3]
+            num_steps = steps_final
+
+        else:
+            # ===== RESTART MODE: Simple direct evolution =====
+            print(f"Evolving from step {step_offset} to step {checkpoint_3}...")
+            state_final, steps_done, t_final_actual, series_restart = evolve_fixed_timestep(
+                initial_state_2d, dt, num_steps_remaining, grid, background,
                 hydro, bssn_fixed, bssn_d1_fixed, ATMOSPHERE, selected_rk4_step,
-                method='rk4', t_start=t_cp2, reference_state=initial_state_2d,
-                step_offset=checkpoint_2,
+                method='rk4', t_start=t_start, reference_state=initial_state_2d,
+                step_offset=step_offset,
                 data_manager=data_manager,
                 snapshot_interval=SNAPSHOT_INTERVAL,
                 evolution_interval=EVOLUTION_INTERVAL)
-            checkpoint_states[3] = state_cp3.copy()
-            checkpoint_times[3] = t_cp3
-            all_series.append(series_3)
-            steps_final = checkpoint_2 + steps_cp3
-            print(f"  -> Reached step {steps_final}, t={t_cp3:.6e}")
-        else:
-            # Stopped early
-            state_cp3 = state_cp2
-            t_cp3 = t_cp2
-            checkpoint_states[3] = state_cp3.copy()
-            checkpoint_times[3] = t_cp3
-            steps_final = checkpoint_1 + steps_cp2
 
-        # Assign final state for backward compatibility
-        state_t10000 = checkpoint_states[3]
-        t_10000 = checkpoint_times[3]
-        num_steps = steps_final
+            # Map to checkpoint structure for compatibility with later code
+            checkpoint_states[1] = state_final.copy()
+            checkpoint_times[1] = t_final_actual
+            checkpoint_states[2] = state_final.copy()
+            checkpoint_times[2] = t_final_actual
+            checkpoint_states[3] = state_final.copy()
+            checkpoint_times[3] = t_final_actual
+            all_series.append(series_restart)
+
+            state_t10000 = state_final
+            t_10000 = t_final_actual
+            num_steps = steps_done
+            steps_final = steps_done
+
+            print(f"  -> Reached step {step_offset + steps_done}, t={t_final_actual:.6e}")
 
         # Build full-series arrays for mass, central density, and central velocity
         try:
