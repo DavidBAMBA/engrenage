@@ -524,13 +524,22 @@ class Cons2PrimSolverJAX:
     Args:
         eos: Equation of state object with eps_from_rho_p(rho0, p) method
         atmosphere: AtmosphereParams object (required)
-        tol: Newton-Raphson tolerance (default: 1e-12)
-        max_iter: Maximum iterations (default: 500)
+        tol: Solver tolerance (default: 1e-15)
+        max_iter: Maximum iterations (default: 100)
+        solver_method: "newton" or "kastaun" (default: "newton")
+            - "newton": Newton-Raphson on pressure (fast, needs good initial guess)
+            - "kastaun": Kastaun et al. (2021) bracketed solver (robust, guaranteed convergence)
     """
 
-    def __init__(self, eos, atmosphere, tol=1e-12, max_iter=500):
+    def __init__(self, eos, atmosphere, tol=1e-15, max_iter=100, solver_method="newton"):
         self.eos = eos
         self.atmosphere = atmosphere
+
+        # Validate solver method
+        valid_methods = ["newton", "kastaun"]
+        if solver_method not in valid_methods:
+            raise ValueError(f"solver_method must be one of {valid_methods}, got '{solver_method}'")
+        self._solver_method = solver_method
 
         # Floor applicator (handles all floor logic)
         self.floor_applicator = FloorApplicator(self.atmosphere, eos)
@@ -565,6 +574,7 @@ class Cons2PrimSolverJAX:
             "total_calls": 0,
             "successful_conversions": 0,
             "newton_successes": 0,
+            "kastaun_successes": 0,
             "atmosphere_fallbacks": 0,
             "conservative_floors_applied": 0
         }
@@ -615,8 +625,14 @@ class Cons2PrimSolverJAX:
         rho0, vr, p, eps, W, h = (np.zeros(N) for _ in range(6))
         success = np.zeros(N, dtype=bool)
 
-        # ATMOSPHERE DETECTION
-        atm_mask = D < 10.0 * self.rho_floor
+        # ATMOSPHERE DETECTION: Low density cells get atmosphere values directly
+        # D = ρ₀W, so D is an upper bound for ρ₀. Using 100× ensures we catch
+        # all cells near the stellar surface where oscillations can occur.
+        # IMPORTANT: Since D is densitized (D̃ = e^{6φ} D_phys), we must densitize
+        # the threshold too to be consistent with evolving conformal factor φ
+        # NOTE: Buffer factor increased from 10→100 to better handle WENO5
+        # oscillations at the stellar surface (GRHayL-style buffer zone)
+        atm_mask = D < 100.0 * self.rho_floor * e6phi
 
         if np.any(atm_mask):
             rho0[atm_mask] = self.rho_floor
@@ -635,67 +651,13 @@ class Cons2PrimSolverJAX:
         solve_mask = ~atm_mask
 
         if np.any(solve_mask):
-            # Prepare pressure guess
-            if p_guess is not None:
-                p_init = np.maximum(np.asarray(p_guess)[solve_mask], self.p_floor)
-            else:
-                p_init = np.maximum(self.p_floor, 0.1 * (tau[solve_mask] + D[solve_mask]))
-
-            # Convert to JAX arrays and solve on GPU
-            D_jax = jnp.array(D[solve_mask])
-            Sr_jax = jnp.array(Sr[solve_mask])
-            tau_jax = jnp.array(tau[solve_mask])
-            gamma_rr_jax = jnp.array(gamma_rr[solve_mask])
-            alpha_jax = jnp.array(alpha[solve_mask])
-            p_init_jax = jnp.array(p_init)
-
-            if self._is_ideal_gas:
-                # JAX-accelerated Newton solver for ideal gas
-                result = _solve_newton_batch_jax(
-                    D_jax, Sr_jax, tau_jax, gamma_rr_jax, alpha_jax, p_init_jax,
-                    self._eos_gamma, self.p_floor, self.W_max, self.tol, self.max_iter
+            # Select solver method based on setting
+            result = self._solve_vectorized_points(
+                    D[solve_mask], Sr[solve_mask], tau[solve_mask], gamma_rr[solve_mask],
+                    p_guess[solve_mask] if p_guess is not None else None, alpha[solve_mask]
                 )
 
-                # Convert back to numpy
-                rho0_solved = np.asarray(result[0])
-                vr_solved = np.asarray(result[1])
-                p_solved = np.asarray(result[2])
-                eps_solved = np.asarray(result[3])
-                W_solved = np.asarray(result[4])
-                h_solved = np.asarray(result[5])
-                success_solved = np.asarray(result[6])
-
-            elif self._is_polytropic:
-                # JAX-accelerated Newton solver for polytropic EOS
-                # For polytropic EOS, use rho as the unknown (not pressure)
-                # Initial guess: rho ~ D (since D = rho * W and W ~ 1 for low velocities)
-                rho_init = np.maximum(np.asarray(D[solve_mask]), self.rho_floor)
-                rho_init_jax = jnp.array(rho_init)
-
-                result = _solve_newton_batch_polytropic_jax(
-                    D_jax, Sr_jax, tau_jax, gamma_rr_jax, alpha_jax, rho_init_jax,
-                    self._eos_K, self._eos_gamma, self.rho_floor, self.W_max, self.tol, self.max_iter
-                )
-
-                # Convert back to numpy
-                rho0_solved = np.asarray(result[0])
-                vr_solved = np.asarray(result[1])
-                p_solved = np.asarray(result[2])
-                eps_solved = np.asarray(result[3])
-                W_solved = np.asarray(result[4])
-                h_solved = np.asarray(result[5])
-                success_solved = np.asarray(result[6])
-
-            else:
-                # Fall back to CPU solver for general EOS
-                # Import the Numba version for this case
-                from .cons2prim import Cons2PrimSolver
-                fallback = Cons2PrimSolver(self.eos, self.atmosphere, self.tol, self.max_iter)
-                result = fallback._solve_vectorized_points(
-                    D[solve_mask], Sr[solve_mask], tau[solve_mask],
-                    gamma_rr[solve_mask], p_init, alpha[solve_mask]
-                )
-                rho0_solved, vr_solved, p_solved, eps_solved, W_solved, h_solved, success_solved = result
+            rho0_solved, vr_solved, p_solved, eps_solved, W_solved, h_solved, success_solved = result
 
             # Place results back
             rho0[solve_mask] = rho0_solved
@@ -706,8 +668,8 @@ class Cons2PrimSolverJAX:
             h[solve_mask] = h_solved
             success[solve_mask] = success_solved
 
+            # Update statistics
             self.stats["successful_conversions"] += np.sum(success_solved)
-            self.stats["newton_successes"] += np.sum(success_solved)
             self.stats["atmosphere_fallbacks"] += np.sum(~success_solved)
 
         # Handle failed points with atmosphere (using FloorApplicator)
@@ -758,9 +720,297 @@ class Cons2PrimSolverJAX:
             **self.stats,
             "success_rate": self.stats["successful_conversions"] / total,
             "newton_rate": self.stats["newton_successes"] / total,
+            "kastaun_rate": self.stats["kastaun_successes"] / total,
         }
 
     def reset_statistics(self):
         """Reset all statistics counters."""
         for key in self.stats:
             self.stats[key] = 0
+
+    def _solve_vectorized_points(self, D, Sr, tau, gamma_rr, p_guess=None, alpha=None):
+        """
+        Vectorized solver dispatcher.
+
+        Routes to the appropriate solver based on self._solver_method:
+        - "newton": Newton-Raphson on pressure
+        - "kastaun": Kastaun et al. (2021) bracketed solver
+        """
+        # =====================================================================
+        # KASTAUN SOLVER (robust, guaranteed convergence)
+        # =====================================================================
+        if self._solver_method == "kastaun":
+            if self._is_ideal_gas:
+                D_jax = jnp.array(D)
+                Sr_jax = jnp.array(Sr)
+                tau_jax = jnp.array(tau)
+                gamma_rr_jax = jnp.array(gamma_rr)
+
+                rho0, vr, p, eps, W, h, converged = _solve_kastaun_batch_jax(
+                    D_jax, Sr_jax, tau_jax, gamma_rr_jax,
+                    self._eos_gamma, self.rho_floor, self.p_floor,
+                    self.v_max, self.W_max, self.tol, self.max_iter
+                )
+
+                rho0 = np.asarray(rho0)
+                vr = np.asarray(vr)
+                p = np.asarray(p)
+                eps = np.asarray(eps)
+                W = np.asarray(W)
+                h = np.asarray(h)
+                converged = np.asarray(converged)
+
+                self.stats["kastaun_successes"] += np.sum(converged)
+                return rho0, vr, p, eps, W, h, converged
+            else:
+                # Fallback to Newton for non-ideal-gas EOS
+                # (Kastaun only implemented for ideal gas currently)
+                pass
+
+        # =====================================================================
+        # NEWTON SOLVER (fast, default)
+        # =====================================================================
+        N = len(D)
+
+        # Initialize pressure guess
+        if p_guess is not None:
+            p_init = np.maximum(p_guess, self.p_floor)
+        else:
+            p_init = np.maximum(self.p_floor, 0.1 * (tau + D))
+
+        # Convert to JAX arrays
+        D_jax = jnp.array(D)
+        Sr_jax = jnp.array(Sr)
+        tau_jax = jnp.array(tau)
+        gamma_rr_jax = jnp.array(gamma_rr)
+        alpha_jax = jnp.array(alpha) if alpha is not None else jnp.ones(N)
+        p_init_jax = jnp.array(p_init)
+
+        # =====================================================================
+        # FAST PATH: Use JAX kernel for ideal gas (most common case)
+        # =====================================================================
+        if self._is_ideal_gas:
+            result = _solve_newton_batch_jax(
+                D_jax, Sr_jax, tau_jax, gamma_rr_jax, alpha_jax, p_init_jax,
+                self._eos_gamma, self.p_floor, self.W_max, self.tol, self.max_iter
+            )
+
+            rho0 = np.asarray(result[0])
+            vr = np.asarray(result[1])
+            p = np.asarray(result[2])
+            eps = np.asarray(result[3])
+            W = np.asarray(result[4])
+            h = np.asarray(result[5])
+            converged = np.asarray(result[6])
+
+            self.stats["newton_successes"] += np.sum(converged)
+            return rho0, vr, p, eps, W, h, converged
+
+        # =====================================================================
+        # FAST PATH: Use JAX kernel for polytropic EOS
+        # =====================================================================
+        if self._is_polytropic:
+            # For polytropic EOS, use rho as the unknown (not pressure)
+            # Initial guess: rho ~ D (since D = rho * W and W ~ 1 for low velocities)
+            rho_init = np.maximum(D, self.rho_floor)
+            rho_init_jax = jnp.array(rho_init)
+
+            result = _solve_newton_batch_polytropic_jax(
+                D_jax, Sr_jax, tau_jax, gamma_rr_jax, alpha_jax, rho_init_jax,
+                self._eos_K, self._eos_gamma, self.rho_floor, self.W_max, self.tol, self.max_iter
+            )
+
+            rho0 = np.asarray(result[0])
+            vr = np.asarray(result[1])
+            p = np.asarray(result[2])
+            eps = np.asarray(result[3])
+            W = np.asarray(result[4])
+            h = np.asarray(result[5])
+            converged = np.asarray(result[6])
+
+            self.stats["newton_successes"] += np.sum(converged)
+            return rho0, vr, p, eps, W, h, converged
+
+        # =====================================================================
+        # SLOW PATH: General EOS (fallback with np.any() reduction)
+        # =====================================================================
+        p = p_init.copy()
+        converged = np.zeros(N, dtype=bool)
+        active = np.ones(N, dtype=bool)
+
+        # Output arrays
+        rho0 = np.zeros(N)
+        vr = np.zeros(N)
+        eps = np.zeros(N)
+        W = np.ones(N)
+        h = np.ones(N)
+
+        # Newton-Raphson iterations (reduced np.any calls)
+        for iteration in range(self.max_iter):
+            # Count active points once per iteration
+            n_active = np.sum(active)
+            if n_active == 0:
+                break
+
+            # Evaluate function for active points
+            p_active = p[active]
+            ok_active, states_active = self._evaluate_pressure_vectorized(
+                D[active], Sr[active], tau[active], p_active, gamma_rr[active],
+                alpha=alpha[active] if alpha is not None else None
+            )
+
+            # Handle evaluation failures (use sum instead of any)
+            n_failed = np.sum(~ok_active)
+            if n_failed > 0:
+                failed_indices = np.where(active)[0][~ok_active]
+                p[failed_indices] = np.maximum(self.p_floor,
+                                             p[failed_indices] * 1.5 + 1e-14)
+                continue
+
+            rho0_active, vr_active, eps_active, W_active, h_active, f_active = states_active
+
+            # Check convergence
+            tol_active = self.tol * np.maximum(1.0, np.abs(p_active))
+            converged_now = np.abs(f_active) <= tol_active
+            n_converged = np.sum(converged_now)
+
+            if n_converged > 0:
+                # Mark as converged and store results
+                conv_indices = np.where(active)[0][converged_now]
+                converged[conv_indices] = True
+                rho0[conv_indices] = rho0_active[converged_now]
+                vr[conv_indices] = vr_active[converged_now]
+                eps[conv_indices] = eps_active[converged_now]
+                W[conv_indices] = W_active[converged_now]
+                h[conv_indices] = h_active[converged_now]
+
+                # Remove from active set
+                active[conv_indices] = False
+
+                if n_converged == n_active:
+                    break
+
+            # Compute derivatives for remaining points
+            still_active = active & ~converged
+            n_still = np.sum(still_active)
+            if n_still == 0:
+                break
+
+            p_still = p[still_active]
+            # Residual aligned with still_active
+            f_still = f_active[~converged_now] if n_converged > 0 else f_active
+
+            # Numerical derivative for general EOS
+            dp = np.maximum(1e-3 * np.maximum(np.abs(p_still), 1.0), 1e-14)
+            ok2, states2 = self._evaluate_pressure_vectorized(
+                D[still_active], Sr[still_active], tau[still_active],
+                p_still + dp, gamma_rr[still_active],
+                alpha=alpha[still_active] if alpha is not None else None
+            )
+            n_ok2 = np.sum(ok2)
+            if n_ok2 < n_still:
+                failed_indices = np.where(still_active)[0][~ok2]
+                p[failed_indices] = np.maximum(self.p_floor,
+                                             p[failed_indices] * 1.5 + 1e-12)
+                continue
+
+            num = states2[5] - f_still
+            num = np.where(np.isfinite(num), num, np.inf)
+            dp_safe = np.where(np.abs(dp) > 0, dp, 1e-12)
+            df = num / dp_safe
+            df = np.where(np.isfinite(df), df, 0.0)
+
+            # Avoid small derivatives (use sum instead of any)
+            small_deriv = (np.abs(df) < 1e-15)
+            n_small = np.sum(small_deriv)
+            if n_small > 0:
+                bad_indices = np.where(still_active)[0][small_deriv]
+                p[bad_indices] = np.maximum(self.p_floor,
+                                          p[bad_indices] * 1.5 + 1e-12)
+                continue
+
+            # Update pressure with damping
+            p_new = p_still - f_still / df
+            invalid_update = ~np.isfinite(p_new) | (p_new <= 0)
+            p_new[invalid_update] = np.maximum(self.p_floor, 0.5 * p_still[invalid_update])
+
+            p[still_active] = 0.5 * p_still + 0.5 * p_new  # Damped Newton
+
+        # Update Newton success count
+        self.stats["newton_successes"] += np.sum(converged)
+
+        return rho0, vr, p, eps, W, h, converged
+
+    def _evaluate_pressure_vectorized(self, D, Sr, tau, p, gamma_rr, alpha=None):
+        """
+        Vectorized evaluation of pressure residual for Newton-Raphson.
+
+        Returns:
+            tuple: (valid, (rho0, vr, eps, W, h, f))
+        """
+        p = np.maximum(p, self.p_floor)
+
+        # Pre-compute all intermediate values (vectorized)
+        Q = tau + D + p
+        gamma_rr = np.maximum(gamma_rr, 1e-30)
+
+        # Compute velocity for all points
+        # vr =  Sr / (Q * γrr)
+        # From: Sr = ρ h W² vr γrr => vr = Sr / (Q γrr)
+        vr = Sr / (Q * gamma_rr)
+        v2 = gamma_rr * vr * vr
+
+        # Compute Lorentz factor (safe sqrt)
+        v2_safe = np.clip(v2, 0.0, 1.0 - 1e-16)
+        W = 1.0 / np.sqrt(1.0 - v2_safe)
+
+        # Rest mass density
+        rho0 = D / np.maximum(W, 1e-30)
+
+        # EOS evaluation: eps and h
+        rho0_safe = np.maximum(rho0, 1e-30)
+        if self._is_ideal_gas:
+            gm1 = self._eos_gamma - 1.0
+            eps = p / (rho0_safe * gm1)
+            h = 1.0 + eps + p / rho0_safe
+        else:
+            eps = self.eos.eps_from_rho_p(rho0, p)
+            h = 1.0 + eps + p / rho0_safe
+
+        # Residual for all points
+        W_squared = W * W
+        f = rho0 * h * W_squared - Q
+
+        # For ideal gas: c_s² = p Γ (Γ-1) / [p Γ + ρ₀ (Γ-1)]
+        # Physical requirement: 0 ≤ c_s² < 1
+        if self._is_ideal_gas:
+            gamma = self._eos_gamma
+            gm1 = gamma - 1.0
+            denom = p * gamma + rho0_safe * gm1
+            cs2 = p * gamma * gm1 / np.maximum(denom, 1e-30)
+        else:
+            # For general EOS, skip sound speed check (would need EOS derivatives)
+            cs2 = np.zeros_like(h) + 0.5  # Assume valid
+
+        # Single combined validity check (now includes sound speed)
+        valid = (
+            (Q > 0.0) &
+            (v2 >= 0.0) & (v2 < 1.0) &
+            (W >= 1.0) & (W <= self.W_max) &
+            (rho0 > 0.0) & np.isfinite(rho0) &
+            np.isfinite(eps) & (eps >= 0.0) &
+            np.isfinite(h) & (h > 1.0) &
+            np.isfinite(f) &
+            (cs2 >= 0.0) & (cs2 < 1.0)  # Sound speed physical check
+        )
+
+        # Set invalid points to safe defaults
+        if not np.all(valid):
+            rho0[~valid] = 0.0
+            vr[~valid] = 0.0
+            eps[~valid] = 0.0
+            W[~valid] = 1.0
+            h[~valid] = 1.0
+            f[~valid] = np.inf
+
+        return valid, (rho0, vr, eps, W, h, f)

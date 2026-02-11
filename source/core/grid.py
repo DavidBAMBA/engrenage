@@ -84,6 +84,8 @@ class Grid:
         # Default to all indices if none were specified
         if indices is None:
             indices = self.ALL_INDICES
+        else:
+            indices = np.asarray(indices)
 
         idx = -NUM_GHOSTS - 1
         outer_state = state[:, -NUM_GHOSTS:]
