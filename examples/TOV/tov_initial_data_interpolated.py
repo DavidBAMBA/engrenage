@@ -71,9 +71,9 @@ def interpolate_tov_iso_avoiding_surface(r_target, tov_solution, field_name,
             return atmosphere_value if atmosphere_value is not None else 0.0
 
     # Clamp to data range
-    # For exp4phi, skip the first point (index 0) which has artifact exp4phi=1.0
-    # The first point at r~1e-10 has exp4phi=1.0 which is not physical
-    skip_origin = 1 if (field_name == 'exp4phi' and len(r_iso) > interp_order + 1) else 0
+    # For very small r, the interpolation can be unstable, but the first point
+    # is now correctly computed via Taylor expansion in the solver
+    skip_origin = 0  # No longer need to skip first point
     r_use = max(r_use, r_iso[skip_origin])
     r_use = min(r_use, r_iso[-1])
 
@@ -215,21 +215,10 @@ def create_initial_data_iso(tov_solution, grid, background, eos,
     # Interpolate TOV solution to grid
     print("  Interpolating TOV solution to evolution grid...")
 
-    # Find the central value of exp4phi by extrapolation from interior points
-    # (not from r=0 which has artificial exp4phi=1.0)
-    # Use quadratic extrapolation from first few interior points
-    r_tov = tov_solution.r_iso
+    # Get the central value of exp4phi from TOV solution
+    # (the solver now correctly computes this using Taylor expansion)
     exp4phi_tov = tov_solution.exp4phi
-    # Skip first point (r~0) and use next points for extrapolation to r=0
-    if len(r_tov) > 3:
-        # Use points 1,2,3 (skip index 0 which has exp4phi=1.0 artifact)
-        r_fit = r_tov[1:4]
-        exp4phi_fit = exp4phi_tov[1:4]
-        # Quadratic fit: exp4phi = a + b*r + c*r^2, extrapolate to r=0 -> a
-        coeffs = np.polyfit(r_fit, exp4phi_fit, 2)
-        exp4phi_central = coeffs[2]  # constant term (value at r=0)
-    else:
-        exp4phi_central = exp4phi_tov[1] if len(exp4phi_tov) > 1 else 1.0
+    exp4phi_central = exp4phi_tov[0]  # Use value from solver directly
 
     for i, r in enumerate(grid.r):
         r_abs = abs(r)
@@ -571,10 +560,10 @@ def plot_hamiltonian_constraint_iso(tov_solution, initial_state_2d, grid, backgr
     plt.savefig(filepath, dpi=150, bbox_inches='tight')
     print(f"\nSaved: {filepath}")
 
-    if show:
-        plt.show()
-    else:
-        plt.close(fig)
+    #if show:
+    #plt.show()
+    #else:
+    plt.close(fig)
 
     print("\n" + "="*80)
     print("Note: In isotropic coords with h_ij=0, constraint violations")

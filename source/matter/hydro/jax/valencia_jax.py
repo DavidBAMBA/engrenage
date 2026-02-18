@@ -1,18 +1,24 @@
 """
-JAX-native Valencia RHS for relativistic hydrodynamics (Cowling approximation).
+JAX-native Valencia RHS for relativistic hydrodynamics.
 
-This module provides the complete hydro RHS pipeline in a single JIT-compilable
-function. For Cowling evolution, geometry is static and pre-computed once.
+Provides the complete hydro RHS pipeline as modular, JIT-compilable functions
+mirroring the structure of valencia_reference_metric.py:
 
-Pipeline: cons2prim -> reconstruction -> riemann -> flux divergence + connection + sources
+  extract_geometry()          -> Build HydroGeometry from BSSN variables
+  compute_interface_fluxes()  -> Reconstruction + Riemann solver
+  compute_flux_derivative()   -> Finite-volume divergence
+  compute_connection_terms()  -> Reference-metric connection terms
+  compute_source_terms()      -> Physical source terms from T^{mu nu}
+  compute_hydro_rhs()         -> Full RHS orchestrator
+  get_hydro_emtensor()        -> Stress-energy tensor for BSSN coupling
 
 All functions are pure-functional and JIT-compilable for GPU execution.
 """
 
-import jax
 import jax.numpy as jnp
 from jax import jit
 from functools import partial
+from typing import NamedTuple
 import numpy as np
 
 from source.matter.hydro.jax.cons2prim_jax import (
@@ -44,133 +50,79 @@ from source.matter.hydro.jax.eos_jax import (
     sound_speed_squared_polytropic,
     prim_to_cons_jax,
 )
-
-
-# =============================================================================
-# Static geometry for Cowling evolution (pre-computed once)
-# =============================================================================
-
-class CowlingGeometry:
-    """
-    Pre-computed static geometry for Cowling (frozen spacetime) evolution.
-
-    All arrays are JAX arrays placed on the target device.
-    Computed once from BSSN variables, then reused every timestep.
-
-    Registered as a JAX pytree so it can be passed to @jit functions.
-    Arrays are dynamic (traced), scalars/flags are static (aux_data).
-    """
-    def __init__(self, alpha, beta_r, gamma_rr, e6phi, dx, num_ghosts,
-                 # Source term geometry (needed for non-Minkowski spacetimes)
-                 K_LL=None, dalpha_dx=None,
-                 hatD_beta_U=None, hatD_gamma_LL=None,
-                 hat_christoffel=None,
-                 beta_U=None, gamma_LL=None, gamma_UU=None,
-                 e4phi=None, hat_gamma_LL=None):
-        """
-        Args:
-            alpha: (N,) lapse
-            beta_r: (N,) radial shift
-            gamma_rr: (N,) radial metric component
-            e6phi: (N,) conformal factor e^{6phi}
-            dx: float, computational grid spacing
-            num_ghosts: int, number of ghost cells
-            K_LL: (N,3,3) extrinsic curvature (optional, for source terms)
-            dalpha_dx: (N,3) lapse derivatives (optional)
-            hatD_beta_U: (N,3,3) covariant derivative of shift (optional)
-            hatD_gamma_LL: (N,3,3,3) covariant derivative of metric (optional)
-            hat_christoffel: (N,3,3,3) reference Christoffel symbols (optional)
-            beta_U: (N,3) full shift vector (optional)
-            gamma_LL: (N,3,3) full covariant metric (optional)
-            gamma_UU: (N,3,3) full contravariant metric (optional)
-        """
-        # Core 1D geometry (always needed)
-        self.alpha = jnp.asarray(alpha)
-        self.beta_r = jnp.asarray(beta_r)
-        self.gamma_rr = jnp.asarray(gamma_rr)
-        self.e6phi = jnp.asarray(e6phi)
-        self.dx = float(dx)
-        self.num_ghosts = int(num_ghosts)
-        self.N = len(alpha)
-
-        # Face-interpolated geometry
-        self.alpha_f = 0.5 * (self.alpha[:-1] + self.alpha[1:])
-        self.beta_r_f = 0.5 * (self.beta_r[:-1] + self.beta_r[1:])
-        self.gamma_rr_f = 0.5 * (self.gamma_rr[:-1] + self.gamma_rr[1:])
-        self.e6phi_f = 0.5 * (self.e6phi[:-1] + self.e6phi[1:])
-
-        # Full 3D geometry for source terms
-        self.beta_U = jnp.asarray(beta_U) if beta_U is not None else None
-        self.gamma_LL = jnp.asarray(gamma_LL) if gamma_LL is not None else None
-        self.gamma_UU = jnp.asarray(gamma_UU) if gamma_UU is not None else None
-        self.e4phi = jnp.asarray(e4phi) if e4phi is not None else None
-
-        # Source term pre-computed geometry
-        self.K_LL = jnp.asarray(K_LL) if K_LL is not None else None
-        self.dalpha_dx = jnp.asarray(dalpha_dx) if dalpha_dx is not None else None
-        self.hatD_beta_U = jnp.asarray(hatD_beta_U) if hatD_beta_U is not None else None
-        self.hatD_gamma_LL = jnp.asarray(hatD_gamma_LL) if hatD_gamma_LL is not None else None
-        self.hat_christoffel = jnp.asarray(hat_christoffel) if hat_christoffel is not None else None
-
-        # Flag: are source terms available?
-        self.has_sources = (K_LL is not None and dalpha_dx is not None)
-        self.has_connections = (hat_christoffel is not None)
-
-    def tree_flatten(self):
-        """Flatten for JAX pytree: arrays=children, scalars=aux_data."""
-        children = (
-            self.alpha, self.beta_r, self.gamma_rr, self.e6phi,
-            self.alpha_f, self.beta_r_f, self.gamma_rr_f, self.e6phi_f,
-            self.beta_U, self.gamma_LL, self.gamma_UU, self.e4phi,
-            self.K_LL, self.dalpha_dx, self.hatD_beta_U, self.hatD_gamma_LL,
-            self.hat_christoffel,
-        )
-        aux_data = (self.N, self.num_ghosts, self.dx,
-                    self.has_sources, self.has_connections)
-        return children, aux_data
-
-    @classmethod
-    def tree_unflatten(cls, aux_data, children):
-        """Reconstruct from flattened pytree."""
-        (alpha, beta_r, gamma_rr, e6phi,
-         alpha_f, beta_r_f, gamma_rr_f, e6phi_f,
-         beta_U, gamma_LL, gamma_UU, e4phi,
-         K_LL, dalpha_dx, hatD_beta_U, hatD_gamma_LL,
-         hat_christoffel) = children
-        N, num_ghosts, dx, has_sources, has_connections = aux_data
-        # Build object without recomputing face values
-        obj = object.__new__(cls)
-        obj.alpha = alpha
-        obj.beta_r = beta_r
-        obj.gamma_rr = gamma_rr
-        obj.e6phi = e6phi
-        obj.dx = dx
-        obj.num_ghosts = num_ghosts
-        obj.N = N
-        obj.alpha_f = alpha_f
-        obj.beta_r_f = beta_r_f
-        obj.gamma_rr_f = gamma_rr_f
-        obj.e6phi_f = e6phi_f
-        obj.beta_U = beta_U
-        obj.gamma_LL = gamma_LL
-        obj.gamma_UU = gamma_UU
-        obj.e4phi = e4phi
-        obj.K_LL = K_LL
-        obj.dalpha_dx = dalpha_dx
-        obj.hatD_beta_U = hatD_beta_U
-        obj.hatD_gamma_LL = hatD_gamma_LL
-        obj.hat_christoffel = hat_christoffel
-        obj.has_sources = has_sources
-        obj.has_connections = has_connections
-        return obj
-
-
-# Register CowlingGeometry as a JAX pytree
-jax.tree_util.register_pytree_node(
-    CowlingGeometry,
-    lambda obj: obj.tree_flatten(),
-    lambda aux_data, children: CowlingGeometry.tree_unflatten(aux_data, children),
+from source.bssn.jax.tensoralgebra_jax import (
+    EMTensor, get_bar_gamma_LL,
 )
+
+
+# =============================================================================
+# Geometry container
+# =============================================================================
+
+class HydroGeometry(NamedTuple):
+    """
+    Geometry data needed by the hydro RHS, extracted from BSSN variables.
+
+    In Cowling mode this is built once and reused. In dynamic mode it is
+    rebuilt every RHS evaluation from the current BSSN state.
+
+    NamedTuples are automatically JAX pytrees (no registration needed).
+    """
+    alpha: jnp.ndarray       # (N,) lapse
+    beta_r: jnp.ndarray      # (N,) radial shift component
+    gamma_rr: jnp.ndarray    # (N,) radial metric component
+    e6phi: jnp.ndarray       # (N,) conformal factor e^{6phi}
+    e4phi: jnp.ndarray       # (N,) conformal factor e^{4phi}
+    beta_U: jnp.ndarray      # (N,3) full shift vector (physical)
+    gamma_LL: jnp.ndarray    # (N,3,3) full physical covariant metric
+    gamma_UU: jnp.ndarray    # (N,3,3) full physical contravariant metric
+
+
+# =============================================================================
+# Geometry extraction
+# =============================================================================
+
+def extract_geometry(phi, h_LL, lapse, shift_U, background):
+    """
+    Extract physical geometry from BSSN variables.
+
+    Matches ValenciaReferenceMetric._extract_geometry().
+
+    Args:
+        phi: (N,) conformal factor
+        h_LL: (N,3,3) rescaled metric perturbation
+        lapse: (N,) lapse function
+        shift_U: (N,3) rescaled shift vector
+        background: BSSNBackground pytree
+
+    Returns:
+        HydroGeometry with all geometry needed for the hydro RHS.
+    """
+    r = background.r
+
+    e4phi = jnp.exp(4.0 * phi)
+    e6phi = jnp.exp(6.0 * phi)
+
+    # Physical shift: beta^i = shift_U * inverse_scaling_vector
+    beta_U = background.inverse_scaling_vector * shift_U
+    beta_r = beta_U[:, 0]
+
+    # Conformal and physical metric
+    bar_gamma_LL = get_bar_gamma_LL(r, h_LL, background)
+    gamma_LL = e4phi[:, None, None] * bar_gamma_LL
+    gamma_UU = jnp.linalg.inv(gamma_LL)
+    gamma_rr = gamma_LL[:, 0, 0]
+
+    return HydroGeometry(
+        alpha=lapse,
+        beta_r=beta_r,
+        gamma_rr=gamma_rr,
+        e6phi=e6phi,
+        e4phi=e4phi,
+        beta_U=beta_U,
+        gamma_LL=gamma_LL,
+        gamma_UU=gamma_UU,
+    )
 
 
 # =============================================================================
@@ -458,24 +410,130 @@ def compute_hll_flux(rhoL, vrL, pL, rhoR, vrR, pR,
 
 
 # =============================================================================
-# Source terms (for non-Minkowski Cowling spacetimes)
+# Interface fluxes (reconstruction + Riemann)
+# =============================================================================
+
+def compute_interface_fluxes(rho0, vr, pressure, geom, dx,
+                             eos_type, eos_gamma, eos_K,
+                             rho_floor, p_floor, v_max, W_max,
+                             recon_method):
+    """
+    Reconstruction + Riemann solver at cell interfaces.
+
+    Matches ValenciaReferenceMetric._compute_interface_fluxes().
+
+    Args:
+        rho0, vr, pressure: (N,) cell-center primitive arrays
+        geom: HydroGeometry
+        dx: grid spacing (float)
+        eos_type, eos_gamma, eos_K: EOS parameters
+        rho_floor, p_floor, v_max, W_max: atmosphere parameters
+        recon_method: reconstruction method string
+
+    Returns:
+        F_D, F_Sr, F_tau: (N-1,) numerical fluxes at interfaces
+    """
+    # Face-interpolated geometry
+    alpha_f = 0.5 * (geom.alpha[:-1] + geom.alpha[1:])
+    beta_r_f = 0.5 * (geom.beta_r[:-1] + geom.beta_r[1:])
+    gamma_rr_f = 0.5 * (geom.gamma_rr[:-1] + geom.gamma_rr[1:])
+    e6phi_f = 0.5 * (geom.e6phi[:-1] + geom.e6phi[1:])
+
+    # Reconstruct primitives at interfaces
+    rhoL, rhoR, vrL, vrR, pL, pR = reconstruct_primitives(
+        rho0, vr, pressure, recon_method, dx, rho_floor, p_floor, v_max, gamma_rr_f
+    )
+
+    # EOS at faces
+    if eos_type == 'ideal_gas':
+        epsL = eps_from_rho_p_ideal(rhoL, pL, eos_gamma)
+        epsR = eps_from_rho_p_ideal(rhoR, pR, eos_gamma)
+        cs2L = sound_speed_squared_ideal(rhoL, pL, epsL, eos_gamma)
+        cs2R = sound_speed_squared_ideal(rhoR, pR, epsR, eos_gamma)
+    else:
+        epsL = eps_from_rho_p_polytropic(rhoL, pL, eos_K, eos_gamma)
+        epsR = eps_from_rho_p_polytropic(rhoR, pR, eos_K, eos_gamma)
+        cs2L = sound_speed_squared_polytropic(rhoL, eos_K, eos_gamma)
+        cs2R = sound_speed_squared_polytropic(rhoR, eos_K, eos_gamma)
+
+    # Prim to cons at faces (for Riemann solver)
+    DL, SrL_f, tauL = prim_to_cons_jax(rhoL, vrL, pL, gamma_rr_f, e6phi_f,
+                                        eos_type, eos_gamma, eos_K)
+    DR, SrR_f, tauR = prim_to_cons_jax(rhoR, vrR, pR, gamma_rr_f, e6phi_f,
+                                        eos_type, eos_gamma, eos_K)
+
+    # Riemann solver
+    flux = compute_hll_flux(
+        rhoL, vrL, pL, rhoR, vrR, pR,
+        DL, SrL_f, tauL, DR, SrR_f, tauR,
+        gamma_rr_f, alpha_f, beta_r_f, e6phi_f,
+        epsL, epsR, cs2L, cs2R
+    )
+
+    F_D = flux[:, 0]
+    F_Sr = flux[:, 1]
+    F_tau = flux[:, 2]
+
+    return F_D, F_Sr, F_tau
+
+
+# =============================================================================
+# Flux divergence
+# =============================================================================
+
+def compute_flux_derivative(F_D, F_Sr, F_tau, N, num_ghosts, inv_dx):
+    """
+    Finite-volume flux divergence for interior cells.
+
+    Matches ValenciaReferenceMetric._compute_flux_derivative().
+
+    Returns:
+        div_D, div_Sr, div_tau: (N,) arrays (zero in ghost cells)
+    """
+    i_s = num_ghosts
+    i_e = N - num_ghosts
+
+    div_D = jnp.zeros(N)
+    div_Sr = jnp.zeros(N)
+    div_tau = jnp.zeros(N)
+
+    div_D = div_D.at[i_s:i_e].set(-(F_D[i_s:i_e] - F_D[i_s-1:i_e-1]) * inv_dx)
+    div_Sr = div_Sr.at[i_s:i_e].set(-(F_Sr[i_s:i_e] - F_Sr[i_s-1:i_e-1]) * inv_dx)
+    div_tau = div_tau.at[i_s:i_e].set(-(F_tau[i_s:i_e] - F_tau[i_s-1:i_e-1]) * inv_dx)
+
+    return div_D, div_Sr, div_tau
+
+
+# =============================================================================
+# Source terms
 # =============================================================================
 
 @jit
-def compute_source_terms(rho0, vr, pressure, W, h,
-                         alpha, beta_U, gamma_LL, gamma_UU, e6phi,
+def compute_source_terms(rho0, vr, pressure, W, h, geom,
                          K_LL, dalpha_dx, hatD_beta_U, hatD_gamma_LL):
     """
-    Compute source terms for Valencia equations (Cowling).
+    Compute source terms for Valencia equations.
 
-    All geometry arrays are STATIC (pre-computed).
-    Only rho0, vr, pressure, W, h are dynamic.
+    Matches ValenciaReferenceMetric._compute_source_terms().
+
+    Args:
+        rho0, vr, pressure, W, h: (N,) primitive variables
+        geom: HydroGeometry
+        K_LL: (N,3,3) extrinsic curvature
+        dalpha_dx: (N,3) lapse derivatives
+        hatD_beta_U: (N,3,3) covariant derivative of shift
+        hatD_gamma_LL: (N,3,3,3) covariant derivative of metric
 
     Returns:
         src_Sr: (N,) radial momentum source
         src_tau: (N,) energy source
     """
     N = rho0.shape[0]
+    alpha = geom.alpha
+    beta_U = geom.beta_U
+    gamma_LL = geom.gamma_LL
+    gamma_UU = geom.gamma_UU
+    e6phi = geom.e6phi
 
     # Build full 3D velocity (radial only)
     v_U = jnp.zeros((N, 3))
@@ -543,20 +601,31 @@ def compute_source_terms(rho0, vr, pressure, W, h,
 # =============================================================================
 
 @jit
-def compute_connection_terms(rho0, vr, pressure, W, h,
-                             alpha, beta_U, gamma_LL, gamma_UU, e6phi,
+def compute_connection_terms(rho0, vr, pressure, W, h, geom,
                              hat_christoffel):
     """
     Compute connection terms from reference metric Christoffels.
+
+    Matches ValenciaReferenceMetric._compute_connection_terms().
 
     conn_D   = -Gamma^k_{kj} F_tilde^j_D
     conn_tau = -Gamma^k_{kj} F_tilde^j_tau
     conn_Sr  = -Gamma^k_{kj} F_tilde^j_r + Gamma^l_{jr} F_tilde^j_l
 
+    Args:
+        rho0, vr, pressure, W, h: (N,) primitive variables
+        geom: HydroGeometry
+        hat_christoffel: (N,3,3,3) reference Christoffel symbols
+
     Returns:
         conn_D, conn_Sr, conn_tau: (N,) arrays
     """
     N = rho0.shape[0]
+    alpha = geom.alpha
+    beta_U = geom.beta_U
+    gamma_LL = geom.gamma_LL
+    gamma_UU = geom.gamma_UU
+    e6phi = geom.e6phi
 
     # Build 3D velocity
     v_U = jnp.zeros((N, 3))
@@ -581,9 +650,9 @@ def compute_connection_terms(rho0, vr, pressure, W, h,
     D = rho0 * W
 
     # Flux vectors
-    fD_U = (e6phi * alpha * D)[:, None] * VUtilde
-    fTau_U = (alpha**2 * e6phi)[:, None] * TUU_0i - (alpha * e6phi)[:, None] * D[:, None] * VUtilde
-    fS_UD = (alpha * e6phi)[:, None, None] * TUD_ij
+    fD_U = (e6phi * alpha[:] * D)[:, None] * VUtilde
+    fTau_U = (alpha[:]**2 * e6phi)[:, None] * TUU_0i - (alpha[:] * e6phi)[:, None] * D[:, None] * VUtilde
+    fS_UD = (alpha[:] * e6phi)[:, None, None] * TUD_ij
 
     # Christoffel trace
     Gamma_trace = jnp.einsum('xkkj->xj', hat_christoffel)
@@ -598,38 +667,99 @@ def compute_connection_terms(rho0, vr, pressure, W, h,
 
 
 # =============================================================================
-# Main RHS function (Cowling approximation)
+# Stress-energy tensor for BSSN coupling
 # =============================================================================
 
-@partial(jit, static_argnums=(4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17))
-def _compute_hydro_rhs_impl(D, Sr, tau, geom,
-                             eos_type, eos_gamma, eos_K,
-                             rho_floor, p_floor, v_max, W_max, tol, max_iter,
-                             recon_method, riemann_type,
-                             use_connections, use_sources,
-                             solver_method):
+def get_hydro_emtensor(rho0, vr, pressure, W, h, geom):
     """
-    JIT-compiled hydro RHS implementation for Cowling evolution.
+    Compute the stress-energy tensor from hydro primitives for BSSN coupling.
 
-    All scalar parameters are static (resolved at trace time).
-    geom is a CowlingGeometry pytree (arrays traced, N/dx/flags static).
+    Follows the same convention as perfect_fluid.py:get_emtensor() and
+    scalarmatter_jax.py:get_scalar_emtensor(). All quantities use the
+    PHYSICAL (not conformal) metric.
+
+    The BSSN RHS (bssnrhs_jax.py) handles the conformal decomposition
+    internally via the e^{-4phi} prefactors.
+
+    Args:
+        rho0, vr, pressure, W, h: (N,) primitive variables
+        geom: HydroGeometry (with physical gamma_LL, gamma_UU)
+
+    Returns:
+        EMTensor(rho, Si, Sij, S) namedtuple
     """
-    N = geom.N
-    NG = geom.num_ghosts
-    dx = geom.dx
+    N = rho0.shape[0]
+    gamma_LL = geom.gamma_LL
+    gamma_UU = geom.gamma_UU
+
+    # 3-velocity vector (radial only in spherical symmetry)
+    v_U = jnp.zeros((N, 3))
+    v_U = v_U.at[:, 0].set(vr)
+
+    # Lower velocity with physical metric: v_i = gamma_ij v^j
+    v_D = jnp.einsum('xij,xj->xi', gamma_LL, v_U)
+
+    # Energy density: rho = rho0 * h * W^2 - p
+    pref = rho0 * h * W * W
+    rho_em = pref - pressure
+
+    # Momentum density: S_i = rho0 * h * W^2 * v_i
+    Si = pref[:, None] * v_D
+
+    # Stress tensor: S_ij = rho0 * h * W^2 * v_i * v_j + p * gamma_ij
+    Sij = pref[:, None, None] * jnp.einsum('xi,xj->xij', v_D, v_D) + pressure[:, None, None] * gamma_LL
+
+    # Trace: S = gamma^{ij} S_{ij}
+    S = jnp.einsum('xij,xij->x', gamma_UU, Sij)
+
+    return EMTensor(rho=rho_em, Si=Si, Sij=Sij, S=S)
+
+
+# =============================================================================
+# Main RHS orchestrator
+# =============================================================================
+
+@partial(jit, static_argnums=(4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18))
+def compute_hydro_rhs(D, Sr, tau, geom,
+                      dx, num_ghosts,
+                      eos_type, eos_gamma, eos_K,
+                      rho_floor, p_floor, v_max, W_max, tol, max_iter,
+                      recon_method, solver_method,
+                      use_connections, use_sources,
+                      source_data, connection_data):
+    """
+    Full hydro RHS orchestrator. JIT-compiled.
+
+    Matches ValenciaReferenceMetric.compute_rhs().
+
+    Args:
+        D, Sr, tau: (N,) densitized conservative variables
+        geom: HydroGeometry pytree (dynamic, traced by JAX)
+        dx: float (static) grid spacing
+        num_ghosts: int (static) number of ghost cells
+        eos_type: str (static) "ideal_gas" or "polytropic"
+        eos_gamma, eos_K: float (static) EOS parameters
+        rho_floor, p_floor, v_max, W_max, tol, max_iter: (static) atmosphere/solver params
+        recon_method: str (static) reconstruction method
+        solver_method: str (static) cons2prim solver
+        use_connections: bool (static) include connection terms
+        use_sources: bool (static) include source terms
+        source_data: tuple (K_LL, dalpha_dx, hatD_beta_U, hatD_gamma_LL) or None (dynamic)
+        connection_data: tuple (hat_christoffel,) or None (dynamic)
+
+    Returns:
+        (rhs_D, rhs_Sr, rhs_tau): (N,) time derivatives
+        (rho0, vr, p, eps, W, h): (N,) primitives (for EMTensor computation)
+    """
+    N = D.shape[0]
     inv_dx = 1.0 / dx
 
-    # =========================================================================
-    # 1. De-densitize conservative variables (D̃ = e^{6φ} D_phys)
-    # State stores DENSITIZED conservatives; cons2prim expects PHYSICAL
-    # =========================================================================
+    # 1. De-densitize conservative variables
     D_phys = D / geom.e6phi
     Sr_phys = Sr / geom.e6phi
     tau_phys = tau / geom.e6phi
 
-    # =========================================================================
-    # 2. Cons2Prim (on PHYSICAL conservatives)
-    # =========================================================================
+    # 2. Cons2Prim
     if eos_type == 'ideal_gas' and solver_method == 'kastaun':
         rho0, vr, p, eps, W, h = cons2prim_batch_kastaun_ideal(
             D_phys, Sr_phys, tau_phys, geom.gamma_rr,
@@ -646,116 +776,79 @@ def _compute_hydro_rhs_impl(D, Sr, tau, geom,
             eos_K, eos_gamma, rho_floor, p_floor, W_max, tol, max_iter
         )
 
-    # =========================================================================
-    # 2. Reconstruction
-    # =========================================================================
-    rhoL, rhoR, vrL, vrR, pL, pR = reconstruct_primitives(
-        rho0, vr, p, recon_method, dx, rho_floor, p_floor, v_max, geom.gamma_rr_f
+    # 3. Interface fluxes (reconstruction + Riemann)
+    F_D, F_Sr, F_tau = compute_interface_fluxes(
+        rho0, vr, p, geom, dx,
+        eos_type, eos_gamma, eos_K,
+        rho_floor, p_floor, v_max, W_max,
+        recon_method
     )
 
-    # =========================================================================
-    # 3. Compute EOS quantities at faces
-    # =========================================================================
-    if eos_type == 'ideal_gas':
-        epsL = eps_from_rho_p_ideal(rhoL, pL, eos_gamma)
-        epsR = eps_from_rho_p_ideal(rhoR, pR, eos_gamma)
-        cs2L = sound_speed_squared_ideal(rhoL, pL, epsL, eos_gamma)
-        cs2R = sound_speed_squared_ideal(rhoR, pR, epsR, eos_gamma)
-    else:
-        epsL = eps_from_rho_p_polytropic(rhoL, pL, eos_K, eos_gamma)
-        epsR = eps_from_rho_p_polytropic(rhoR, pR, eos_K, eos_gamma)
-        cs2L = sound_speed_squared_polytropic(rhoL, eos_K, eos_gamma)
-        cs2R = sound_speed_squared_polytropic(rhoR, eos_K, eos_gamma)
+    # 4. Flux divergence
+    rhs_D, rhs_Sr, rhs_tau = compute_flux_derivative(F_D, F_Sr, F_tau, N, num_ghosts, inv_dx)
 
-    # =========================================================================
-    # 4. Prim to cons at faces (for Riemann solver)
-    # =========================================================================
-    DL, SrL_f, tauL = prim_to_cons_jax(rhoL, vrL, pL, geom.gamma_rr_f, geom.e6phi_f,
-                                        eos_type, eos_gamma, eos_K)
-    DR, SrR_f, tauR = prim_to_cons_jax(rhoR, vrR, pR, geom.gamma_rr_f, geom.e6phi_f,
-                                        eos_type, eos_gamma, eos_K)
+    i_s = num_ghosts
+    i_e = N - num_ghosts
 
-    # =========================================================================
-    # 5. Riemann solver
-    # =========================================================================
-    flux = compute_hll_flux(
-        rhoL, vrL, pL, rhoR, vrR, pR,
-        DL, SrL_f, tauL, DR, SrR_f, tauR,
-        geom.gamma_rr_f, geom.alpha_f, geom.beta_r_f, geom.e6phi_f,
-        epsL, epsR, cs2L, cs2R
-    )
-
-    F_D = flux[:, 0]
-    F_Sr = flux[:, 1]
-    F_tau = flux[:, 2]
-
-    # =========================================================================
-    # 6. Flux divergence (interior cells only)
-    # =========================================================================
-    rhs_D = jnp.zeros(N)
-    rhs_Sr = jnp.zeros(N)
-    rhs_tau = jnp.zeros(N)
-
-    i_s = NG
-    i_e = N - NG
-
-    rhs_D = rhs_D.at[i_s:i_e].set(-(F_D[i_s:i_e] - F_D[i_s-1:i_e-1]) * inv_dx)
-    rhs_Sr = rhs_Sr.at[i_s:i_e].set(-(F_Sr[i_s:i_e] - F_Sr[i_s-1:i_e-1]) * inv_dx)
-    rhs_tau = rhs_tau.at[i_s:i_e].set(-(F_tau[i_s:i_e] - F_tau[i_s-1:i_e-1]) * inv_dx)
-
-    # =========================================================================
-    # 7. Connection terms
-    # =========================================================================
+    # 5. Connection terms
     if use_connections:
+        hat_christoffel = connection_data[0]
         conn_D, conn_Sr, conn_tau = compute_connection_terms(
-            rho0, vr, p, W, h,
-            geom.alpha, geom.beta_U, geom.gamma_LL, geom.gamma_UU, geom.e6phi,
-            geom.hat_christoffel
+            rho0, vr, p, W, h, geom, hat_christoffel
         )
         rhs_D = rhs_D.at[i_s:i_e].add(conn_D[i_s:i_e])
         rhs_Sr = rhs_Sr.at[i_s:i_e].add(conn_Sr[i_s:i_e])
         rhs_tau = rhs_tau.at[i_s:i_e].add(conn_tau[i_s:i_e])
 
-    # =========================================================================
-    # 8. Source terms
-    # =========================================================================
+    # 6. Source terms
     if use_sources:
+        K_LL, dalpha_dx, hatD_beta_U, hatD_gamma_LL = source_data
         src_Sr, src_tau = compute_source_terms(
-            rho0, vr, p, W, h,
-            geom.alpha, geom.beta_U, geom.gamma_LL, geom.gamma_UU, geom.e6phi,
-            geom.K_LL, geom.dalpha_dx, geom.hatD_beta_U, geom.hatD_gamma_LL
+            rho0, vr, p, W, h, geom,
+            K_LL, dalpha_dx, hatD_beta_U, hatD_gamma_LL
         )
         rhs_Sr = rhs_Sr.at[i_s:i_e].add(src_Sr[i_s:i_e])
         rhs_tau = rhs_tau.at[i_s:i_e].add(src_tau[i_s:i_e])
 
-    return rhs_D, rhs_Sr, rhs_tau
+    return (rhs_D, rhs_Sr, rhs_tau), (rho0, vr, p, eps, W, h)
 
 
-def compute_hydro_rhs_cowling(D, Sr, tau, geom, eos_type, eos_params,
-                              atm_params, recon_method, riemann_type="hll",
-                              solver_method="newton"):
+# =============================================================================
+# Cowling wrapper (backward-compatible public interface)
+# =============================================================================
+
+def compute_hydro_rhs_cowling(D, Sr, tau, geom, dx, num_ghosts,
+                              eos_type, eos_params, atm_params,
+                              recon_method, solver_method="newton",
+                              source_data=None, connection_data=None):
     """
     Compute the full hydro RHS for Cowling evolution.
 
     Thin Python wrapper that unpacks dict parameters and calls the
-    JIT-compiled implementation. The first call triggers JIT compilation;
-    subsequent calls with the same static args use the cached compiled version.
+    JIT-compiled implementation.
 
     Args:
         D, Sr, tau: (N,) conservative variables (densitized)
-        geom: CowlingGeometry with pre-computed static geometry
+        geom: HydroGeometry with pre-computed static geometry
+        dx: float, grid spacing
+        num_ghosts: int, number of ghost cells
         eos_type: "ideal_gas" or "polytropic"
         eos_params: dict with EOS parameters (gamma, K)
         atm_params: dict with atmosphere parameters (rho_floor, p_floor, v_max, W_max)
         recon_method: "wenoz", "weno5", "mp5", "mc", "minmod"
-        riemann_type: "hll" or "llf"
         solver_method: "newton" or "kastaun"
+        source_data: tuple (K_LL, dalpha_dx, hatD_beta_U, hatD_gamma_LL) or None
+        connection_data: tuple (hat_christoffel,) or None
 
     Returns:
         rhs_D, rhs_Sr, rhs_tau: (N,) time derivatives of conservative variables
     """
-    return _compute_hydro_rhs_impl(
+    use_sources = source_data is not None
+    use_connections = connection_data is not None
+
+    (rhs_D, rhs_Sr, rhs_tau), _ = compute_hydro_rhs(
         D, Sr, tau, geom,
+        dx, num_ghosts,
         eos_type,
         eos_params['gamma'],
         eos_params.get('K', 0.0),
@@ -766,8 +859,10 @@ def compute_hydro_rhs_cowling(D, Sr, tau, geom, eos_type, eos_params,
         atm_params.get('tol', 1e-12),
         atm_params.get('max_iter', 500),
         recon_method,
-        riemann_type,
-        geom.has_connections,  # Pass as static argument
-        geom.has_sources,      # Pass as static argument
         solver_method,
+        use_connections,
+        use_sources,
+        source_data,
+        connection_data,
     )
+    return rhs_D, rhs_Sr, rhs_tau

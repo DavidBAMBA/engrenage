@@ -18,23 +18,47 @@ N_med = 4000
 N_high = 8000
 # Data paths - constructed from resolution values
 FOLDERS = {
-    f'N={N_very_low}': f'/home/davidbamba/repositories/engrenage/examples/TOV/tov_evolution_data_rmax100.0_jax_reconstructor/tov_star_rhoc1p28em03_N1000_K100_G2_cow_wz',
-    f'N={N_low}': f'/home/davidbamba/repositories/engrenage/examples/TOV/tov_evolution_data_rmax100.0_jax_reconstructor/tov_star_rhoc1p28em03_N2000_K100_G2_cow_wz',
-    f'N={N_med}': f'/home/davidbamba/repositories/engrenage/examples/TOV/tov_evolution_data_rmax100.0_jax_reconstructor/tov_star_rhoc1p28em03_N4000_K100_G2_cow_wz',
-    f'N={N_high}': f'/home/davidbamba/repositories/engrenage/examples/TOV/tov_evolution_data_rmax100.0_jax_reconstructor/tov_star_rhoc1p28em03_N8000_K100_G2_cow_wz',
+    f'N={N_very_low}': f'/home/davidbamba/repositories/engrenage/examples/TOV/tov_evolution_data_refact_rmax100.0_jax/tov_star_rhoc1p28em03_N2000_K100_G2_cow_mp5'
+      #f'N={N_low}': f'/home/davidbamba/repositories/engrenage/examples/TOV/tov_evolution_data_rmax100.0_jax_reconstructor/tov_star_rhoc1p28em03_N2000_K100_G2_cow_wz',
+    #f'N={N_med}': f'/home/davidbamba/repositories/engrenage/examples/TOV/tov_evolution_data_rmax100.0_jax_reconstructor/tov_star_rhoc1p28em03_N4000_K100_G2_cow_wz',
+    #f'N={N_high}': f'/home/davidbamba/repositories/engrenage/examples/TOV/tov_evolution_data_rmax100.0_jax_reconstructor/tov_star_rhoc1p28em03_N8000_K100_G2_cow_wz',
 }
 COLORS = ['#1f77b4', "#ff7f0e", '#2ca02c', "#d62728",
           "#9467bd", "#8c564b", "#e377c2", "#17becf"]
 
 
 def load_timeseries(folder_path):
-    h5_file = os.path.join(folder_path, 'tov_evolution_cow.h5')
-    if os.path.exists(h5_file):
-        with h5py.File(h5_file, 'r') as f:
-            times = f['time'][:]
-            rho_central = f['rho_central'][:]
-            baryon_mass = f['baryon_mass'][:] if 'baryon_mass' in f else None
-            return times, rho_central, baryon_mass
+    """Load timeseries from HDF5 or NPZ files.
+
+    Auto-detects Cowling or dynamic mode files (with or without _jax suffix).
+    Priority: timeseries.npz > dyn_jax > dyn > cow_jax > cow
+    """
+    # Try NPZ first (most general format)
+    npz_file = os.path.join(folder_path, 'timeseries.npz')
+    if os.path.exists(npz_file):
+        npz = np.load(npz_file)
+        times = npz['times']
+        rho_central = npz['rho_central']
+        baryon_mass = npz['baryon_mass'] if 'baryon_mass' in npz else None
+        return times, rho_central, baryon_mass
+
+    # Try all possible HDF5 file names (priority order)
+    possible_names = [
+        'tov_evolution_dyn_jax.h5',
+        'tov_evolution_dyn.h5',
+        'tov_evolution_cow_jax.h5',
+        'tov_evolution_cow.h5',
+    ]
+
+    for filename in possible_names:
+        h5_file = os.path.join(folder_path, filename)
+        if os.path.exists(h5_file):
+            with h5py.File(h5_file, 'r') as f:
+                times = f['time'][:]
+                rho_central = f['rho_central'][:]
+                baryon_mass = f['baryon_mass'][:] if 'baryon_mass' in f else None
+                return times, rho_central, baryon_mass
+
     return None, None, None
 
 
@@ -42,9 +66,25 @@ def load_snapshots(folder_path):
     """
     Load snapshots with density profiles.
     Returns times, radial grid r, and list of density fields rho0(r).
+
+    Auto-detects Cowling or dynamic mode files (with or without _jax suffix).
     """
-    h5_file = os.path.join(folder_path, 'tov_snapshots_cow.h5')
-    if not os.path.exists(h5_file):
+    # Try all possible snapshot file names (priority order)
+    possible_names = [
+        'tov_snapshots_dyn_jax.h5',
+        'tov_snapshots_dyn.h5',
+        'tov_snapshots_cow_jax.h5',
+        'tov_snapshots_cow.h5',
+    ]
+
+    h5_file = None
+    for filename in possible_names:
+        filepath = os.path.join(folder_path, filename)
+        if os.path.exists(filepath):
+            h5_file = filepath
+            break
+
+    if h5_file is None:
         return None, None, None
 
     times = []
@@ -173,9 +213,25 @@ Examples:
     dt_plot = 1.0  # Plot every dt=1 M_sun
 
     for (label, folder_path), color in zip(folders_dict.items(), COLORS):
+        # Strip whitespace from folder path
+        folder_path = folder_path.strip()
+
+        # Debug: check if folder exists
+        if not os.path.exists(folder_path):
+            print(f"Warning: Folder does not exist: {folder_path}")
+            continue
+
+        # Debug: list files in folder
+        files = os.listdir(folder_path)
+        print(f"Loading {label} from {folder_path}")
+        print(f"  Available files: {[f for f in files if f.endswith(('.h5', '.npz'))]}")
+
         t, rho_c, M_b = load_timeseries(folder_path)
         if t is None:
+            print(f"  Warning: No timeseries data found for {label}")
             continue
+
+        print(f"  Loaded {len(t)} timesteps (t: {t[0]:.1f} to {t[-1]:.1f})")
 
         mask = t <= t_max
         t = t[mask]

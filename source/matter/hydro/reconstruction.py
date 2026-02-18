@@ -668,7 +668,7 @@ def create_reconstruction(method: str = "wenoz"):
     from .tests.advance.backend import BACKEND
 
     if 'jax' in BACKEND:
-        from .reconstruction_jax import ReconstructionJAX
+        from .jax.reconstruction_jax import ReconstructionJAX
         return ReconstructionJAX(method=method)
 
     return Reconstruction(method=method)

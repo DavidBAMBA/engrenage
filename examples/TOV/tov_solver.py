@@ -454,7 +454,19 @@ class TOVSolverIso:
 
         with np.errstate(divide='ignore', invalid='ignore'):
             exp4phi_arr = (r_schw_arr / r_iso_arr)**2
-        exp4phi_arr[0] = 1.0
+
+        # Fix origin value: use quadratic extrapolation from interior points
+        # (the division at r=0 can be numerically unstable)
+        if len(r_iso_arr) > 3:
+            # Use points 1,2,3 (skip index 0) for extrapolation
+            r_fit = r_iso_arr[1:4]
+            exp4phi_fit = exp4phi_arr[1:4]
+            # Quadratic fit: exp4phi = a + b*r + c*r^2, extrapolate to r=0 → a
+            coeffs = np.polyfit(r_fit, exp4phi_fit, 2)
+            exp4phi_arr[0] = coeffs[2]  # constant term (value at r=0)
+        # If extrapolation fails or gives unphysical value, keep computed value
+        if exp4phi_arr[0] < 0.5 or np.isnan(exp4phi_arr[0]):
+            exp4phi_arr[0] = exp4phi_arr[1] if len(exp4phi_arr) > 1 else 1.0
 
         alpha_arr = np.exp(nu_arr / 2.0)
 

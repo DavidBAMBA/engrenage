@@ -797,7 +797,7 @@ def evolve_fixed_timestep(state_initial, dt, num_steps, grid, background, hydro,
 
         t_curr = t_start + (step + 1) * dt
         step_num = step_offset + step + 1
-        if step_num % 1000 == 0:
+        if step_num % 100 == 0:
             print(f"step {step_num:4d}  t={t_curr:.2e}:  ρ_c={rho_central:.6e}  max_Δρ/ρ={max_rel_rho_err:.2e}@r={r_max_rho_err:.2f}  "
               f"max_vʳ={max_abs_v:.3e}@r={r_max_v:.2f}  max_Sʳ={max_Sr:.2e}@r={r_max_Sr:.2f}  "
               f"c2p_fail={c2p_fail_count}")
@@ -1385,8 +1385,9 @@ def plot_mass_and_central_density(times, Mb_series, rho_c_series, suffix=""):
 
 
 def plot_evolution(states, times, grid, hydro, rho_ref, p_ref,
-                   Mb_series=None, rho_c_series=None, suffix="", R_star=None):
-    """Plot evolution at multiple checkpoints with 3-checkpoint structure.
+                   Mb_series=None, rho_c_series=None,
+                   times_series=None, suffix="", R_star=None):
+    """Plot evolution at multiple checkpoints: density, pressure, baryon mass, central density.
 
     Args:
         states: List of state arrays at different times [state_t0, state_t1, state_t2, state_tfinal]
@@ -1395,8 +1396,9 @@ def plot_evolution(states, times, grid, hydro, rho_ref, p_ref,
         hydro: Hydro object
         rho_ref: Reference density for error computation
         p_ref: Reference pressure for error computation
-        Mb_series: Optional time series of baryon mass
-        rho_c_series: Optional time series of central density
+        Mb_series: Optional array of baryon mass values
+        rho_c_series: Optional array of central density values
+        times_series: Optional array of times for Mb_series/rho_c_series
         suffix: Suffix for output filename
         R_star: Optional stellar radius for vertical line marker
     """
@@ -1413,100 +1415,77 @@ def plot_evolution(states, times, grid, hydro, rho_ref, p_ref,
         rho0, vr, p, eps, W, h, _ = hydro._get_primitives(bssn, grid.r)
         primitives.append((rho0, vr, p, eps, W, h))
 
-    # Create figure with 3 rows
-    fig = plt.figure(figsize=(16, 14))
+    # Create 2x2 figure
+    fig, axes = plt.subplots(2, 2, figsize=(14, 10))
 
-    # Row 1: Density at all checkpoints
-    ax1 = plt.subplot(3, 2, 1)
+    # (0,0) Density profiles at checkpoints
+    ax = axes[0, 0]
     colors = plt.cm.viridis(np.linspace(0, 1, n_states))
     for i, (prim, t) in enumerate(zip(primitives, times)):
-        ax1.plot(r[interior], prim[0][interior], color=colors[i],
+        ax.plot(r[interior], prim[0][interior], color=colors[i],
                 label=f't={t:.2f}', linewidth=1.5)
     if R_star is not None:
-        ax1.axvline(R_star, color='gray', linestyle=':', alpha=0.7, label=f'R={R_star:.2f}')
-    ax1.set_xlabel('r')
-    ax1.set_ylabel(r'$\rho_0$')
-    ax1.set_title('Baryon Density Evolution')
-    ax1.set_yscale('log')
-    ax1.legend(loc='upper right')
-    # ax1.grid(True, alpha=0.3)
+        ax.axvline(R_star, color='gray', linestyle=':', alpha=0.7, label=f'R={R_star:.2f}')
+    ax.set_xlabel('r')
+    ax.set_ylabel(r'$\rho_0$')
+    ax.set_title('Baryon Density Evolution')
+    ax.set_yscale('log')
+    ax.legend(loc='upper right')
 
-    # Row 1: Pressure at all checkpoints
-    ax2 = plt.subplot(3, 2, 2)
+    # (0,1) Pressure profiles at checkpoints
+    ax = axes[0, 1]
     for i, (prim, t) in enumerate(zip(primitives, times)):
-        ax2.plot(r[interior], prim[2][interior], color=colors[i],
+        ax.plot(r[interior], prim[2][interior], color=colors[i],
                 label=f't={t:.2f}', linewidth=1.5)
     if R_star is not None:
-        ax2.axvline(R_star, color='gray', linestyle=':', alpha=0.7, label=f'R={R_star:.2f}')
-    ax2.set_xlabel('r')
-    ax2.set_ylabel('P')
-    ax2.set_title('Pressure Evolution')
-    ax2.set_yscale('log')
-    ax2.legend(loc='upper right')
-   #  #ax2.grid(True, alpha=0.3)
+        ax.axvline(R_star, color='gray', linestyle=':', alpha=0.7, label=f'R={R_star:.2f}')
+    ax.set_xlabel('r')
+    ax.set_ylabel('P')
+    ax.set_title('Pressure Evolution')
+    ax.set_yscale('log')
+    ax.legend(loc='upper right')
 
-    # Row 2: Velocity at all checkpoints
-    ax3 = plt.subplot(3, 2, 3)
-    for i, (prim, t) in enumerate(zip(primitives, times)):
-        ax3.plot(r[interior], prim[1][interior], color=colors[i],
-                label=f't={t:.2f}', linewidth=1.5)
-    if R_star is not None:
-        ax3.axvline(R_star, color='gray', linestyle=':', alpha=0.7, label=f'R={R_star:.2f}')
-    ax3.set_xlabel('r')
-    ax3.set_ylabel(r'$v^r$')
-    ax3.set_title('Radial Velocity Evolution')
-    ax3.legend(loc='upper right')
-    ax3.set_ylim(0, 0.1)
-   #  #ax3.grid(True, alpha=0.3)
-
-    # Row 2: Density error
-    ax4 = plt.subplot(3, 2, 4)
-    for i, (prim, t) in enumerate(zip(primitives, times)):
-        if i == 0:
-            continue  # Skip t=0 for error
-        delta_rho = np.abs(prim[0][interior] - rho_ref[interior])
-        rel_error = delta_rho / (np.abs(rho_ref[interior]) + 1e-20)
-        ax4.semilogy(r[interior], rel_error + 1e-20, color=colors[i],
-                    label=f't={t:.2f}', linewidth=1.5)
-    if R_star is not None:
-        ax4.axvline(R_star, color='gray', linestyle=':', alpha=0.7, label=f'R={R_star:.2f}')
-    ax4.set_xlabel('r')
-    ax4.set_ylabel(r'$|\Delta\rho|/\rho_0$')
-    ax4.set_title('Relative Density Error')
-    ax4.legend(loc='upper right')
-    # ax4.grid(True, alpha=0.3)
-
-    # Row 3: Time series (if available)
+    # (1,0) Baryon mass deviation vs time
+    ax = axes[1, 0]
     if Mb_series is not None and len(Mb_series) > 1:
-        times_series = np.linspace(0, times[-1], len(Mb_series))
+        Mb_arr = np.asarray(Mb_series)
+        if times_series is not None:
+            t_ser = np.asarray(times_series)
+        else:
+            t_ser = np.linspace(0, times[-1], len(Mb_arr))
+        Mb_0 = Mb_arr[0]
+        delta_Mb = (Mb_arr - Mb_0) / Mb_0
+        ax.plot(t_ser, delta_Mb, 'b-', linewidth=1.5)
+        ax.set_ylabel(r'$\Delta M_b / M_{b,0}$')
+    else:
+        ax.text(0.5, 0.5, 'No time series data', transform=ax.transAxes,
+                ha='center', va='center', fontsize=12, color='gray')
+    ax.set_xlabel('t')
+    ax.set_title('Baryon Mass Conservation')
 
-        ax5 = plt.subplot(3, 2, 5)
-        Mb_0 = Mb_series[0]
-        delta_Mb = np.abs(np.array(Mb_series) - Mb_0)
-        ax5.semilogy(times_series, delta_Mb + 1e-20, 'b-', linewidth=1.5)
-        ax5.set_xlabel('t')
-        ax5.set_ylabel(r'$|M_b - M_{b,0}|$')
-        ax5.set_title('Baryon Mass Deviation')
-        # ax5.grid(True, alpha=0.3)
-
+    # (1,1) Central density vs time
+    ax = axes[1, 1]
     if rho_c_series is not None and len(rho_c_series) > 1:
-        times_series = np.linspace(0, times[-1], len(rho_c_series))
+        rho_c_arr = np.asarray(rho_c_series)
+        if times_series is not None:
+            t_ser = np.asarray(times_series)
+        else:
+            t_ser = np.linspace(0, times[-1], len(rho_c_arr))
+        rho_c_0 = rho_c_arr[0]
+        delta_rho_c = (rho_c_arr - rho_c_0) / rho_c_0
+        ax.plot(t_ser, delta_rho_c, 'r-', linewidth=1.5)
+        ax.set_ylabel(r'$(\rho_c - \rho_{c,0})/\rho_{c,0}$')
+    else:
+        ax.text(0.5, 0.5, 'No time series data', transform=ax.transAxes,
+                ha='center', va='center', fontsize=12, color='gray')
+    ax.set_xlabel('t')
+    ax.set_title('Central Density Relative Change')
 
-        ax6 = plt.subplot(3, 2, 6)
-        rho_c_0 = rho_c_series[0]
-        delta_rho_c = (np.array(rho_c_series) - rho_c_0) / rho_c_0
-        ax6.plot(times_series, delta_rho_c, 'r-', linewidth=1.5)
-        ax6.set_xlabel('t')
-        ax6.set_ylabel(r'$(\rho_c - \rho_{c,0})/\rho_{c,0}$')
-        ax6.set_title('Central Density Relative Change')
-        # ax6.grid(True, alpha=0.3)
-
-    plt.suptitle(f'TOV Evolution: 3-Checkpoint Structure', fontsize=14)
+    plt.suptitle(f'TOV Evolution', fontsize=14)
     plt.tight_layout()
     out_path = os.path.join(plots_dir, f'tov_evolution{suffix}.png')
     plt.savefig(out_path, dpi=150, bbox_inches='tight')
     plt.close(fig)
-    #plt.show()
     print(f"Saved: {out_path}")
 
 

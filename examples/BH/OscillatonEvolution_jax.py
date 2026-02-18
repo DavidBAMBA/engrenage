@@ -17,6 +17,10 @@ import sys
 import time
 import numpy as np
 
+# Add project root to path
+script_dir = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, os.path.join(script_dir, '..', '..'))
+
 # Ensure JAX 64-bit is enabled before any JAX import
 os.environ.setdefault('ENGRENAGE_BACKEND', 'jax')
 
@@ -116,6 +120,8 @@ def main():
             state, bssn_bg, deriv_mats, dr,
             NUM_GHOSTS, num_vars,
             sigma_base, scalar_mu, eta,
+            outer_bc_type="asymptotic",  # Oscillaton: asymptotic falloff
+            fix_shift=False  # Oscillaton: use Gamma-driver for shift
         )
 
     @jax.jit

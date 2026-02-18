@@ -17,28 +17,36 @@ import argparse
 M_SUN_SECONDS = 4.926e-6
 FREQ_CONVERSION = 1.0 / (M_SUN_SECONDS * 1e3)
 
+# Mode selection: "cow" = Cowling approximation, "dyn" = dynamic (full BSSN+hydro)
+MODE = "dyn"
+
 # Analysis variable selection: 1 = rho_central (density), 2 = v_central (velocity)
 ANALYSIS_VAR = 1
 
 # Time to start analysis (in M_sun units) - data before this is discarded
-T_START = 100.0
+T_START = 10.0
 
 # =============================================================================
 # FOLDERS TO ANALYZE - Specify the exact folders you want to analyze
 # =============================================================================
 FOLDERS_TO_ANALYZE = [
-    '/home/davidbamba/repositories/engrenage/examples/TOV/tov_evolution_data_rmax100.0_jax/tov_star_rhoc1p28em03_N16000_K100_G2_cow_mp5'
-
- # '../tov_evolution_data_rmax20_TEST_kas_ideal_long_domain_lasttest/tov_star_rhoc1p28em03_N200_K100_G2_cow_mp5',
-    #'../tov_evolution_data_rmax20_TEST_kas_ideal_long_domain_lasttest/tov_star_rhoc1p28em03_N400_K100_G2_cow_mp5',
-    #'../tov_evolution_data_rmax20_TEST_kas_ideal_long_domain_lasttest/tov_star_rhoc1p28em03_N800_K100_G2_cow_mp5',
-]
+ '/home/davidbamba/repositories/engrenage/examples/TOV/tov_evolution_data_refact_rmax100.0_jax/tov_star_rhoc1p28em03_N2000_K100_G2_dyn_mp5'
+   ]
 
 # Theoretical frequencies (Font et al. 2002)
 FREQUENCIES_COWLING_KHZ = {
     'F':  2.696, 'H1': 4.534, 'H2': 6.346, 'H3': 8.161,
     'H4': 9.971, 'H5': 11.806, 'H6': 13.605,
 }
+
+# Frequencies for dynamic evolution (BSSN+hydro) - Present 3D code
+FREQUENCIES_DYNAMIC_KHZ = {
+    'F':  1.450, 'H1': 3.958, 'H2': 5.935, 'H3': 7.812,
+    'h4': 9.72,
+}
+
+# Select frequency dictionary based on MODE
+FREQUENCIES_KHZ = FREQUENCIES_COWLING_KHZ if MODE == "cow" else FREQUENCIES_DYNAMIC_KHZ
 
 def subsample_to_delta_t(t, signal_data, delta_t):
     """Efficiently subsample data to integer time intervals using searchsorted."""
@@ -260,7 +268,7 @@ def plot_qnm_v3(t, signal_data, freq_khz, power, peak_freqs, peak_powers,
 
     ax2.set_xlabel('Frequency [kHz]', fontsize=12)
     ax2.set_ylabel('Power', fontsize=12)
-    ax2.set_xlim(0, 14)
+    ax2.set_xlim(0, 9)
     ax2.set_title('Power Spectrum\n', fontsize=12)
     ax2.grid(True, linestyle=':', alpha=0.3)
     
@@ -320,8 +328,9 @@ def analyze_and_plot(data, folder_name, plot_dir):
     signal_data = data['signal']
     var_name = data.get('var_name', 'rho_central')
 
+    mode_name = "Cowling" if MODE == "cow" else "Dynamic"
     print(f"\n{'='*70}")
-    print(f"ANALYSIS: {folder_name} (variable: {var_name})")
+    print(f"ANALYSIS: {folder_name} (variable: {var_name}, mode: {mode_name})")
     print(f"{'='*70}")
     print(f"Time: {t[0]:.1f} to {t[-1]:.1f} M_sun ({t[-1]*M_SUN_SECONDS*1e3:.2f} ms)")
     print(f"Points: {len(t)}, dt = {np.mean(np.diff(t)):.4f}")
@@ -343,7 +352,7 @@ def analyze_and_plot(data, folder_name, plot_dir):
     print(f"\n{'Mode':<8} {'Theo [kHz]':<12} {'Obtained [kHz]':<15} {'yerror [%]':<12}")
     print("-"*50)
 
-    for mode, f_theo in FREQUENCIES_COWLING_KHZ.items():
+    for mode, f_theo in FREQUENCIES_KHZ.items():
         if len(peak_freqs) == 0:
             # No peaks detected
             print(f"{mode:<8} {f_theo:<12.3f} {'N/A':<15} {'N/A':<12}")
@@ -363,7 +372,7 @@ def analyze_and_plot(data, folder_name, plot_dir):
 
     output_path = os.path.join(plot_dir, f'qnm_{folder_name}_{var_name}.png')
     plot_qnm_v3(t, signal_data, freq_khz, power, peak_freqs, peak_powers,
-               FREQUENCIES_COWLING_KHZ, output_path, title=f"{folder_name} ({var_name})",
+               FREQUENCIES_KHZ, output_path, title=f"{folder_name} ({var_name})",
                var_name=var_name)
 
     # Return analysis results for comparison table
@@ -410,8 +419,8 @@ def create_comparison_table(results_list, plot_dir, var_name='rho_central'):
     sorted_results.sort(key=lambda x: x[0])  # Sort by resolution number
 
     # Match top 3 peaks for each resolution to theoretical modes
-    mode_list = list(FREQUENCIES_COWLING_KHZ.keys())
-    theo_freqs = list(FREQUENCIES_COWLING_KHZ.values())
+    mode_list = list(FREQUENCIES_KHZ.keys())
+    theo_freqs = list(FREQUENCIES_KHZ.values())
 
     # Build comparison data: dict[mode] -> list of (resolution, freq)
     comparison = {mode: {} for mode in mode_list}
@@ -464,7 +473,7 @@ def create_comparison_table(results_list, plot_dir, var_name='rho_central'):
     # Rows
     table_data = []
     for mode in active_modes:
-        f_theo = FREQUENCIES_COWLING_KHZ[mode]
+        f_theo = FREQUENCIES_KHZ[mode]
         row = [mode, f'{f_theo:.3f}']
 
         # Add obtained frequencies for each resolution
@@ -585,6 +594,10 @@ Examples:
         print(f"\nUsing delta_t = {delta_t} (subsampled data)")
     else:
         print(f"\nUsing all data points (no subsampling)")
+
+    mode_name = "Cowling" if MODE == "cow" else "Dynamic (BSSN+hydro)"
+    print(f"Mode: {mode_name} (MODE = '{MODE}')")
+    print(f"Using theoretical frequencies: {list(FREQUENCIES_KHZ.keys())}")
 
     var_name = "rho_central" if ANALYSIS_VAR == 1 else "v_central"
     print(f"Analysis variable: {var_name} (ANALYSIS_VAR = {ANALYSIS_VAR})")

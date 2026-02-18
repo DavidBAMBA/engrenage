@@ -29,11 +29,16 @@ from source.bssn.bssnstatevariables import (
 )
 from source.bssn.jax.tensoralgebra_jax import (
     SPACEDIM, get_bar_gamma_LL, get_bar_gamma_UU, get_det_bar_gamma,
+    get_bar_A_LL, get_hat_D_bar_gamma_LL,
     get_vector_advection, get_tensor_advection,
+    get_tensor_connections, get_bar_christoffel,
 )
 from source.bssn.jax.bssnrhs_jax import get_bssn_rhs_jax
 from source.bssn.jax.boundaries_jax import fill_bssn_boundaries_jax
 from source.matter.jax.scalarmatter_jax import get_scalar_emtensor, get_scalar_rhs
+from source.matter.hydro.jax.valencia_jax import (
+    extract_geometry, compute_hydro_rhs, get_hydro_emtensor,
+)
 
 # Coordinate indices for spherical symmetry
 i_r, i_t, i_p = 0, 1, 2
@@ -227,10 +232,12 @@ def _pack_bssn_rhs(dphidt, dhdt, dKdt, dadt, dlambdadt, dlapse_dt, dshift_dt, db
     return rhs_bssn
 
 
-@partial(jax.jit, static_argnums=(4, 5))
+@partial(jax.jit, static_argnums=(4, 5, 9, 10))
 def get_rhs_bssn_scalar_jax(state, bssn_bg, deriv_mats, dr,
                               num_ghosts, num_vars,
-                              sigma_base, scalar_mu, eta):
+                              sigma_base, scalar_mu, eta,
+                              outer_bc_type="asymptotic",
+                              fix_shift=False):
     """
     Full BSSN + scalar field RHS, JIT-compiled.
 
@@ -244,6 +251,10 @@ def get_rhs_bssn_scalar_jax(state, bssn_bg, deriv_mats, dr,
         sigma_base: float, KO dissipation base coefficient
         scalar_mu: float, scalar field mass parameter
         eta: float, Gamma driver damping parameter
+        outer_bc_type: str (static), outer boundary type
+            "asymptotic" (default), "zero_gradient", "sommerfeld"
+        fix_shift: bool (static), if True, keep shift=0 and B=0 (no Gamma-driver)
+            Use True for static spherical systems (TOV, Schwarzschild)
 
     Returns:
         rhs_state: (NUM_VARS, N) right-hand side
@@ -293,14 +304,17 @@ def get_rhs_bssn_scalar_jax(state, bssn_bg, deriv_mats, dr,
     # 6. Gauge conditions
     # 1+log slicing
     dlapse_dt = -2.0 * lapse * K
-    # Gamma driver
-    dshift_dt = b_U
-    db_dt = 0.75 * dlambdadt - eta * b_U
-    # dlambdadt is (N, 3), shift_dt and b_dt need to be (N, 3) too
-    dshift_dt_vec = jnp.zeros((N, SPACEDIM))
-    dshift_dt_vec = dshift_dt_vec.at[:, i_r].set(b_U[:, i_r])
-    db_dt_vec = jnp.zeros((N, SPACEDIM))
-    db_dt_vec = db_dt_vec.at[:, i_r].set(0.75 * dlambdadt[:, i_r] - eta * b_U[:, i_r])
+    # Shift evolution: Gamma driver or fixed to zero
+    if fix_shift:
+        # Keep shift and B fixed at zero (for static TOV, spherical BH, etc.)
+        dshift_dt_vec = jnp.zeros((N, SPACEDIM))
+        db_dt_vec = jnp.zeros((N, SPACEDIM))
+    else:
+        # Gamma driver: d_t shift^i = B^i, d_t B^i = 3/4 d_t lambda^i - eta B^i
+        dshift_dt_vec = jnp.zeros((N, SPACEDIM))
+        dshift_dt_vec = dshift_dt_vec.at[:, i_r].set(b_U[:, i_r])
+        db_dt_vec = jnp.zeros((N, SPACEDIM))
+        db_dt_vec = db_dt_vec.at[:, i_r].set(0.75 * dlambdadt[:, i_r] - eta * b_U[:, i_r])
 
     # 7. Advection corrections
     # Scalars
@@ -330,6 +344,325 @@ def get_rhs_bssn_scalar_jax(state, bssn_bg, deriv_mats, dr,
     rhs_state = rhs_state.at[:NUM_BSSN_VARS].add(sigma * ko_diss)
 
     # 10. Boundary conditions on the RHS (reuse parity/asymp arrays from step 0)
-    rhs_state = fill_bssn_boundaries_jax(rhs_state, r, num_ghosts, parity, asymp_power, asymp_offset)
+    rhs_state = fill_bssn_boundaries_jax(rhs_state, r, num_ghosts, parity, asymp_power, asymp_offset, outer_bc_type)
+
+    return rhs_state
+
+
+# =============================================================================
+# BSSN-only derivative computation (no matter derivatives)
+# =============================================================================
+
+def _compute_bssn_derivatives(state, deriv_mats, dr, N, shift_r):
+    """
+    Compute BSSN derivatives only (no scalar/hydro field derivatives).
+
+    Same as _compute_derivatives() but without the scalar field parts (lines 166-181).
+    Hydro variables use finite-volume methods, not matrix derivatives.
+    """
+    # Compute raw derivatives for all state variables
+    d1_raw = (state @ deriv_mats.d1_matrix.T) / dr
+    d2_raw = (state @ deriv_mats.d2_matrix.T) / (dr * dr)
+
+    # Advection: upwind selection based on shift sign
+    advec_l = (state @ deriv_mats.advec_l_matrix.T) / dr
+    advec_r = (state @ deriv_mats.advec_r_matrix.T) / dr
+    mask = (shift_r >= 0)[jnp.newaxis, :]
+    advec_raw = jnp.where(mask, advec_r, advec_l)
+
+    # --- Build tensor forms for d1 ---
+    d1_phi = jnp.zeros((N, SPACEDIM))
+    d1_phi = d1_phi.at[:, i_r].set(d1_raw[idx_phi])
+
+    d1_K = jnp.zeros((N, SPACEDIM))
+    d1_K = d1_K.at[:, i_r].set(d1_raw[idx_K])
+
+    d1_lapse = jnp.zeros((N, SPACEDIM))
+    d1_lapse = d1_lapse.at[:, i_r].set(d1_raw[idx_lapse])
+
+    d1_h_LL = jnp.zeros((N, SPACEDIM, SPACEDIM, SPACEDIM))
+    d1_h_LL = d1_h_LL.at[:, i_r, i_r, i_r].set(d1_raw[idx_hrr])
+    d1_h_LL = d1_h_LL.at[:, i_t, i_t, i_r].set(d1_raw[idx_htt])
+    d1_h_LL = d1_h_LL.at[:, i_p, i_p, i_r].set(d1_raw[idx_hpp])
+
+    d1_a_LL = jnp.zeros((N, SPACEDIM, SPACEDIM, SPACEDIM))
+    d1_a_LL = d1_a_LL.at[:, i_r, i_r, i_r].set(d1_raw[idx_arr])
+    d1_a_LL = d1_a_LL.at[:, i_t, i_t, i_r].set(d1_raw[idx_att])
+    d1_a_LL = d1_a_LL.at[:, i_p, i_p, i_r].set(d1_raw[idx_app])
+
+    d1_lambda_U = jnp.zeros((N, SPACEDIM, SPACEDIM))
+    d1_lambda_U = d1_lambda_U.at[:, i_r, i_r].set(d1_raw[idx_lambdar])
+
+    d1_shift_U = jnp.zeros((N, SPACEDIM, SPACEDIM))
+    d1_shift_U = d1_shift_U.at[:, i_r, i_r].set(d1_raw[idx_shiftr])
+
+    # --- Build tensor forms for d2 ---
+    d2_phi = jnp.zeros((N, SPACEDIM, SPACEDIM))
+    d2_phi = d2_phi.at[:, i_r, i_r].set(d2_raw[idx_phi])
+
+    d2_lapse = jnp.zeros((N, SPACEDIM, SPACEDIM))
+    d2_lapse = d2_lapse.at[:, i_r, i_r].set(d2_raw[idx_lapse])
+
+    d2_h_LL = jnp.zeros((N, SPACEDIM, SPACEDIM, SPACEDIM, SPACEDIM))
+    d2_h_LL = d2_h_LL.at[:, i_r, i_r, i_r, i_r].set(d2_raw[idx_hrr])
+    d2_h_LL = d2_h_LL.at[:, i_t, i_t, i_r, i_r].set(d2_raw[idx_htt])
+    d2_h_LL = d2_h_LL.at[:, i_p, i_p, i_r, i_r].set(d2_raw[idx_hpp])
+
+    d2_shift_U = jnp.zeros((N, SPACEDIM, SPACEDIM, SPACEDIM))
+    d2_shift_U = d2_shift_U.at[:, i_r, i_r, i_r].set(d2_raw[idx_shiftr])
+
+    # --- Build tensor forms for advection ---
+    advec_phi = jnp.zeros((N, SPACEDIM))
+    advec_phi = advec_phi.at[:, i_r].set(advec_raw[idx_phi])
+
+    advec_K = jnp.zeros((N, SPACEDIM))
+    advec_K = advec_K.at[:, i_r].set(advec_raw[idx_K])
+
+    advec_lapse = jnp.zeros((N, SPACEDIM))
+    advec_lapse = advec_lapse.at[:, i_r].set(advec_raw[idx_lapse])
+
+    advec_h_LL = jnp.zeros((N, SPACEDIM, SPACEDIM, SPACEDIM))
+    advec_h_LL = advec_h_LL.at[:, i_r, i_r, i_r].set(advec_raw[idx_hrr])
+    advec_h_LL = advec_h_LL.at[:, i_t, i_t, i_r].set(advec_raw[idx_htt])
+    advec_h_LL = advec_h_LL.at[:, i_p, i_p, i_r].set(advec_raw[idx_hpp])
+
+    advec_a_LL = jnp.zeros((N, SPACEDIM, SPACEDIM, SPACEDIM))
+    advec_a_LL = advec_a_LL.at[:, i_r, i_r, i_r].set(advec_raw[idx_arr])
+    advec_a_LL = advec_a_LL.at[:, i_t, i_t, i_r].set(advec_raw[idx_att])
+    advec_a_LL = advec_a_LL.at[:, i_p, i_p, i_r].set(advec_raw[idx_app])
+
+    advec_lambda_U = jnp.zeros((N, SPACEDIM, SPACEDIM))
+    advec_lambda_U = advec_lambda_U.at[:, i_r, i_r].set(advec_raw[idx_lambdar])
+
+    return (d1_phi, d1_K, d1_lapse, d1_h_LL, d1_a_LL, d1_lambda_U, d1_shift_U,
+            d2_phi, d2_lapse, d2_h_LL, d2_shift_U,
+            advec_phi, advec_K, advec_lapse, advec_h_LL, advec_a_LL, advec_lambda_U)
+
+
+# =============================================================================
+# Source geometry computation from BSSN variables
+# =============================================================================
+
+def _compute_source_geometry(phi, h_LL, K, a_LL, lapse, shift_U,
+                             d1_phi, d1_lapse, d1_shift_U, d1_h_LL, background):
+    """
+    Compute geometry data needed by hydro source terms from current BSSN state.
+
+    In Cowling mode this is pre-computed once and frozen. In dynamic mode it must be
+    recomputed every RHS call since the spacetime evolves, particularly the conformal
+    Christoffel symbols bar_Gamma^i_{jk} = hat_Gamma^i_{jk} + Delta^i_{jk}(h_LL).
+
+    Returns:
+        source_data: (K_LL, dalpha_dx, hatD_beta_U, hatD_gamma_LL) tuple
+        connection_data: (bar_christoffel,) tuple (evolved conformal Christoffel)
+    """
+    r = background.r
+    e4phi = jnp.exp(4.0 * phi)
+
+    bar_gamma_LL = get_bar_gamma_LL(r, h_LL, background)
+    gamma_LL = e4phi[:, None, None] * bar_gamma_LL
+
+    # Extrinsic curvature: K_ij = e^{4phi} A_ij + (K/3) gamma_ij
+    bar_A_LL_val = get_bar_A_LL(r, a_LL, background.scaling_matrix)
+    K_LL = e4phi[:, None, None] * bar_A_LL_val + (K / 3.0)[:, None, None] * gamma_LL
+
+    # Lapse derivative (already in tensor form)
+    dalpha_dx = d1_lapse
+
+    # Physical shift
+    beta_U = background.inverse_scaling_vector * shift_U
+
+    # Compute conformal Christoffel from evolved metric (dynamic mode)
+    # In Cowling mode, h_LL is frozen at t=0 so Delta_ULL = 0, bar_chris = hat_chris
+    # In dynamic mode, h_LL evolves so bar_chris = hat_chris + Delta_ULL(h_LL)
+    Delta_U, Delta_ULL, Delta_LLL = get_tensor_connections(r, h_LL, d1_h_LL, background)
+    bar_chris = get_bar_christoffel(r, Delta_ULL, background)
+
+    # Shift covariant derivative: hatD_j beta^i = d_j beta^i + hat_Gamma^i_{jk} beta^k
+    # Note: Still uses hat_chris for shift derivative (shift lives in reference space)
+    d1_beta_U = (
+        background.d1_inverse_scaling_vector * shift_U[:, :, jnp.newaxis]
+        + d1_shift_U * background.inverse_scaling_vector[:, :, jnp.newaxis]
+    )
+    hat_chris = background.hat_christoffel
+    hatD_beta_U = (
+        jnp.transpose(d1_beta_U, (0, 2, 1))
+        + jnp.einsum('xjik,xk->xij', hat_chris, beta_U)
+    )
+
+    # Covariant derivative of metric: hatD_k gamma_ij
+    hat_D_bar_gamma = get_hat_D_bar_gamma_LL(r, h_LL, d1_h_LL, background)
+    d1_phi_expanded = d1_phi
+    hatD_gamma_LL = e4phi[:, None, None, None] * (
+        4.0 * d1_phi_expanded[:, :, None, None] * bar_gamma_LL[:, None, :, :]
+        + jnp.transpose(hat_D_bar_gamma, (0, 3, 1, 2))
+    )
+
+    source_data = (K_LL, dalpha_dx, hatD_beta_U, hatD_gamma_LL)
+    connection_data = (bar_chris,)  # Now uses evolved conformal Christoffel
+
+    return source_data, connection_data
+
+
+# =============================================================================
+# Full BSSN + hydro coupled RHS
+# =============================================================================
+
+# Hydro parity: D (+1), Sr (-1), tau (+1)
+HYDRO_PARITY = [1.0, -1.0, 1.0]
+NUM_HYDRO_VARS = 3
+
+@partial(jax.jit, static_argnums=(4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21))
+def get_rhs_bssn_hydro_jax(state, bssn_bg, deriv_mats, dr,
+                            num_ghosts, num_vars,
+                            sigma_base, eta,
+                            eos_type, eos_gamma, eos_K,
+                            rho_floor, p_floor, v_max, W_max,
+                            recon_method, solver_method, max_iter,
+                            tol, dx,
+                            outer_bc_type="sommerfeld",
+                            fix_shift=False):
+    """
+    Full BSSN + hydro RHS, JIT-compiled.
+
+    Couples the BSSN evolution with relativistic hydrodynamics via the
+    stress-energy tensor. Follows the same structure as get_rhs_bssn_scalar_jax().
+
+    State layout: (NUM_BSSN_VARS + NUM_HYDRO_VARS, N) = (15, N)
+      [0:12]  BSSN variables
+      [12]    D  (densitized baryon density)
+      [13]    Sr (densitized radial momentum)
+      [14]    tau (densitized energy)
+
+    Args:
+        state: (NUM_VARS, N) current state
+        bssn_bg: BSSNBackground pytree
+        deriv_mats: DerivativeMatrices pytree
+        dr: float, grid spacing
+        num_ghosts: int (static)
+        num_vars: int (static) = NUM_BSSN_VARS + NUM_HYDRO_VARS = 15
+        sigma_base: float (static), KO dissipation base coefficient
+        eta: float (static), Gamma driver damping parameter (ignored if fix_shift=True)
+        eos_type: str (static) "ideal_gas" or "polytropic"
+        eos_gamma, eos_K: float (static) EOS parameters
+        rho_floor, p_floor, v_max, W_max: float (static) atmosphere params
+        recon_method: str (static) reconstruction method
+        solver_method: str (static), cons2prim solver ("newton" or "kastaun")
+        max_iter: int (static), cons2prim max iterations
+        tol: float, cons2prim tolerance
+        dx: float, grid spacing for hydro (computational)
+        outer_bc_type: str (static), outer boundary type
+            "sommerfeld" (default for TOV), "zero_gradient", "asymptotic"
+        fix_shift: bool (static), if True, keep shift=0 and B=0 (no Gamma-driver)
+            Use True for static TOV stars (1+log lapse, shift=0)
+
+    Returns:
+        rhs_state: (NUM_VARS, N) right-hand side
+    """
+    N = state.shape[1]
+    r = bssn_bg.r
+
+    # Precompute BC arrays for BSSN + hydro
+    parity = jnp.array(jnp.concatenate([
+        jnp.array(BSSN_PARITY, dtype=jnp.float64),
+        jnp.array(HYDRO_PARITY, dtype=jnp.float64),
+    ]))
+    asymp_power = jnp.array(jnp.concatenate([
+        jnp.array(BSSN_ASYMP_POWER, dtype=jnp.float64),
+        jnp.zeros(NUM_HYDRO_VARS),
+    ]))
+    asymp_offset = jnp.array(jnp.concatenate([
+        jnp.array(BSSN_ASYMP_OFFSET, dtype=jnp.float64),
+        jnp.zeros(NUM_HYDRO_VARS),
+    ]))
+
+    # 1. Unpack state -> BSSN vars + hydro vars
+    phi, h_LL, K, a_LL, lambda_U, shift_U, b_U, lapse = _unpack_state(state, N)
+    D   = state[NUM_BSSN_VARS]
+    Sr  = state[NUM_BSSN_VARS + 1]
+    tau = state[NUM_BSSN_VARS + 2]
+
+    # 2. Enforce determinant constraint
+    h_LL = _enforce_det_constraint(h_LL, bssn_bg)
+    phi = jnp.minimum(phi, 1.0e6)
+
+    # 3. Compute BSSN derivatives (no hydro derivatives needed)
+    shift_r = shift_U[:, i_r]
+    (d1_phi, d1_K, d1_lapse, d1_h_LL, d1_a_LL, d1_lambda_U, d1_shift_U,
+     d2_phi, d2_lapse, d2_h_LL, d2_shift_U,
+     advec_phi, advec_K, advec_lapse, advec_h_LL, advec_a_LL, advec_lambda_U,
+    ) = _compute_bssn_derivatives(state, deriv_mats, dr, N, shift_r)
+
+    # 4. Extract hydro geometry from current BSSN vars
+    geom = extract_geometry(phi, h_LL, lapse, shift_U, bssn_bg)
+
+    # 5. Compute source geometry for hydro (K_LL, dalpha, hatD_beta, hatD_gamma)
+    source_data, connection_data = _compute_source_geometry(
+        phi, h_LL, K, a_LL, lapse, shift_U,
+        d1_phi, d1_lapse, d1_shift_U, d1_h_LL, bssn_bg
+    )
+
+    # 6. Compute hydro RHS (cons2prim -> recon -> riemann -> flux + source + connection)
+    (dDdt, dSrdt, dtaudt), (rho0, vr, p, eps, W, h) = compute_hydro_rhs(
+        D, Sr, tau, geom,
+        dx, num_ghosts,
+        eos_type, eos_gamma, eos_K,
+        rho_floor, p_floor, v_max, W_max, tol, max_iter,
+        recon_method, solver_method,
+        True, True,    # use_connections=True, use_sources=True
+        source_data, connection_data,
+    )
+
+    # 7. Compute hydro EMTensor for BSSN coupling
+    my_emtensor = get_hydro_emtensor(rho0, vr, p, W, h, geom)
+
+    # 8. BSSN RHS (with hydro matter sources)
+    dphidt, dhdt, dKdt, dadt, dlambdadt = get_bssn_rhs_jax(
+        r, phi, h_LL, K, a_LL, lambda_U, lapse, shift_U, b_U,
+        d1_phi, d1_h_LL, d1_K, d1_a_LL, d1_lambda_U, d1_lapse, d1_shift_U,
+        d2_phi, d2_h_LL, d2_lapse, d2_shift_U,
+        bssn_bg, my_emtensor)
+
+    # 9. Gauge conditions (1+log lapse + shift evolution)
+    # 1+log slicing
+    dlapse_dt = -2.0 * lapse * K
+    # Shift evolution: Gamma driver or fixed to zero
+    if fix_shift:
+        # Keep shift and B fixed at zero (for static TOV)
+        dshift_dt_vec = jnp.zeros((N, SPACEDIM))
+        db_dt_vec = jnp.zeros((N, SPACEDIM))
+    else:
+        # Gamma driver: d_t shift^i = B^i, d_t B^i = 3/4 d_t lambda^i - eta B^i
+        dshift_dt_vec = jnp.zeros((N, SPACEDIM))
+        dshift_dt_vec = dshift_dt_vec.at[:, i_r].set(b_U[:, i_r])
+        db_dt_vec = jnp.zeros((N, SPACEDIM))
+        db_dt_vec = db_dt_vec.at[:, i_r].set(0.75 * dlambdadt[:, i_r] - eta * b_U[:, i_r])
+
+    # 10. Advection corrections (BSSN only — hydro uses finite volume)
+    # Scalars
+    dphidt = dphidt + jnp.einsum('xj,xj->x', bssn_bg.inverse_scaling_vector * shift_U, advec_phi)
+    dKdt = dKdt + jnp.einsum('xj,xj->x', bssn_bg.inverse_scaling_vector * shift_U, advec_K)
+    # Vectors
+    advec_lambda_U_corr = get_vector_advection(r, lambda_U, advec_lambda_U, shift_U, d1_shift_U, bssn_bg)
+    dlambdadt = dlambdadt + advec_lambda_U_corr
+    # Tensors
+    advec_h_LL_corr = get_tensor_advection(r, h_LL, advec_h_LL, shift_U, d1_shift_U, bssn_bg)
+    dhdt = dhdt + advec_h_LL_corr
+    advec_a_LL_corr = get_tensor_advection(r, a_LL, advec_a_LL, shift_U, d1_shift_U, bssn_bg)
+    dadt = dadt + advec_a_LL_corr
+
+    # 11. Pack BSSN + hydro RHS
+    rhs_bssn = _pack_bssn_rhs(dphidt, dhdt, dKdt, dadt, dlambdadt,
+                                dlapse_dt, dshift_dt_vec, db_dt_vec, N)
+    rhs_hydro = jnp.stack([dDdt, dSrdt, dtaudt])  # (3, N)
+    rhs_state = jnp.concatenate([rhs_bssn, rhs_hydro], axis=0)
+
+    # 12. Kreiss-Oliger dissipation (BSSN variables only — HLL provides hydro dissipation)
+    sigma = sigma_base * lapse * jnp.exp(-2.0 * phi)
+    ko_diss = (state[:NUM_BSSN_VARS] @ deriv_mats.ko_matrix.T) / (64.0 * dr)
+    rhs_state = rhs_state.at[:NUM_BSSN_VARS].add(sigma * ko_diss)
+
+    # 13. Boundary conditions
+    rhs_state = fill_bssn_boundaries_jax(rhs_state, r, num_ghosts, parity, asymp_power, asymp_offset, outer_bc_type)
 
     return rhs_state
