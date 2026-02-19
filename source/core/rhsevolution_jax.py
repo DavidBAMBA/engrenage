@@ -5,7 +5,7 @@
 #
 # Pipeline:
 #   1. Unpack state (NUM_VARS, N) -> individual variables
-#   2. Compute derivatives via matrix multiplication
+#   2. Compute derivatives via stencil application (O(N*K) instead of O(N^2) matmul)
 #   3. Algebraic constraints (determinant)
 #   4. Matter EMTensor + RHS
 #   5. BSSN RHS
@@ -82,24 +82,42 @@ def _unpack_state(state, N):
     return phi, h_LL, K, a_LL, lambda_U, shift_U, b_U, lapse
 
 
-def _compute_derivatives(state, deriv_mats, dr, N, shift_r):
-    """Compute all needed derivatives via matrix multiplication."""
-    # First derivative indices (same as BSSNFirstDerivs)
-    d1_indices = jnp.array([idx_phi, idx_hrr, idx_htt, idx_hpp, idx_K,
-                             idx_arr, idx_att, idx_app, idx_lambdar, idx_shiftr, idx_lapse])
-    # Second derivative indices (same as BSSNSecondDerivs)
-    d2_indices = jnp.array([idx_phi, idx_hrr, idx_htt, idx_hpp, idx_shiftr, idx_lapse])
+def _apply_stencil(f, stencils, left_pad, right_pad):
+    """Apply position-dependent stencil to a batch of 1D fields.
 
-    # Compute raw d1 for all needed variables
-    d1_raw = (state @ deriv_mats.d1_matrix.T) / dr  # (NUM_VARS, N)
+    Replaces dense matrix multiplication state @ matrix.T with O(N*K)
+    operations instead of O(N^2), where K is the stencil width (4-7).
 
-    # Compute raw d2 for needed variables
-    d2_raw = (state @ deriv_mats.d2_matrix.T) / (dr * dr)  # (NUM_VARS, N)
+    Args:
+        f: (V, N) array of V fields on N grid points
+        stencils: (N, K) array of per-point stencil weights
+        left_pad: int, stencil extent to the left (>= 0)
+        right_pad: int, stencil extent to the right (>= 0)
+
+    Returns:
+        result: (V, N) — equivalent to f @ matrix.T for the banded matrix
+    """
+    N = f.shape[1]
+    K = stencils.shape[1]
+    f_pad = jnp.pad(f, ((0, 0), (left_pad, right_pad)))
+    result = jnp.zeros_like(f)
+    for k in range(K):  # unrolled by XLA at compile time
+        result = result + stencils[None, :, k] * f_pad[:, k:k + N]
+    return result
+
+
+def _compute_derivatives(state, deriv_stencils, dr, N, shift_r):
+    """Compute all needed derivatives via stencil application."""
+    # Compute raw d1 for all variables
+    d1_raw = _apply_stencil(state, deriv_stencils.d1_stencils, 2, 2) / dr
+
+    # Compute raw d2 for all variables
+    d2_raw = _apply_stencil(state, deriv_stencils.d2_stencils, 2, 2) / (dr * dr)
 
     # Advection: direction depends on sign of shift
     # BSSN upwind: shift_r >= 0 -> right/forward stencil, else left/backward
-    advec_l = (state @ deriv_mats.advec_l_matrix.T) / dr
-    advec_r = (state @ deriv_mats.advec_r_matrix.T) / dr
+    advec_l = _apply_stencil(state, deriv_stencils.advec_l_stencils, 3, 0) / dr
+    advec_r = _apply_stencil(state, deriv_stencils.advec_r_stencils, 0, 3) / dr
     # Branchless selection
     mask = (shift_r >= 0)[jnp.newaxis, :]  # (1, N) broadcast
     advec_raw = jnp.where(mask, advec_r, advec_l)  # (NUM_VARS, N)
@@ -233,7 +251,7 @@ def _pack_bssn_rhs(dphidt, dhdt, dKdt, dadt, dlambdadt, dlapse_dt, dshift_dt, db
 
 
 @partial(jax.jit, static_argnums=(4, 5, 9, 10))
-def get_rhs_bssn_scalar_jax(state, bssn_bg, deriv_mats, dr,
+def get_rhs_bssn_scalar_jax(state, bssn_bg, deriv_stencils, dr,
                               num_ghosts, num_vars,
                               sigma_base, scalar_mu, eta,
                               outer_bc_type="asymptotic",
@@ -244,7 +262,7 @@ def get_rhs_bssn_scalar_jax(state, bssn_bg, deriv_mats, dr,
     Args:
         state: (NUM_VARS, N) current state
         bssn_bg: BSSNBackground pytree
-        deriv_mats: DerivativeMatrices pytree
+        deriv_stencils: DerivativeStencils pytree (compact banded stencils)
         dr: (N,) grid spacing array
         num_ghosts: int (static) number of ghost cells
         num_vars: int (static) total number of variables
@@ -286,7 +304,7 @@ def get_rhs_bssn_scalar_jax(state, bssn_bg, deriv_mats, dr,
     (d1_phi, d1_K, d1_lapse, d1_h_LL, d1_a_LL, d1_lambda_U, d1_shift_U,
      d2_phi, d2_lapse, d2_h_LL, d2_shift_U,
      advec_phi, advec_K, advec_lapse, advec_h_LL, advec_a_LL, advec_lambda_U,
-     d1_u, d2_u, advec_u, advec_v) = _compute_derivatives(state, deriv_mats, dr, N, shift_r)
+     d1_u, d2_u, advec_u, advec_v) = _compute_derivatives(state, deriv_stencils, dr, N, shift_r)
 
     # 4. Matter sources
     my_emtensor = get_scalar_emtensor(u, v, d1_u, phi, h_LL, bssn_bg, scalar_mu)
@@ -340,7 +358,7 @@ def get_rhs_bssn_scalar_jax(state, bssn_bg, deriv_mats, dr,
 
     # 9. Kreiss-Oliger dissipation (BSSN variables only)
     sigma = sigma_base * lapse * jnp.exp(-2.0 * phi)
-    ko_diss = (state[:NUM_BSSN_VARS] @ deriv_mats.ko_matrix.T) / (64.0 * dr)
+    ko_diss = _apply_stencil(state[:NUM_BSSN_VARS], deriv_stencils.ko_stencils, 3, 3) / (64.0 * dr)
     rhs_state = rhs_state.at[:NUM_BSSN_VARS].add(sigma * ko_diss)
 
     # 10. Boundary conditions on the RHS (reuse parity/asymp arrays from step 0)
@@ -353,20 +371,21 @@ def get_rhs_bssn_scalar_jax(state, bssn_bg, deriv_mats, dr,
 # BSSN-only derivative computation (no matter derivatives)
 # =============================================================================
 
-def _compute_bssn_derivatives(state, deriv_mats, dr, N, shift_r):
+def _compute_bssn_derivatives(state, deriv_stencils, dr, N, shift_r):
     """
     Compute BSSN derivatives only (no scalar/hydro field derivatives).
 
-    Same as _compute_derivatives() but without the scalar field parts (lines 166-181).
-    Hydro variables use finite-volume methods, not matrix derivatives.
+    Hydro variables use finite-volume methods, not stencil derivatives.
+    Only computes derivatives for BSSN variables (indices 0:NUM_BSSN_VARS).
     """
-    # Compute raw derivatives for all state variables
-    d1_raw = (state @ deriv_mats.d1_matrix.T) / dr
-    d2_raw = (state @ deriv_mats.d2_matrix.T) / (dr * dr)
+    # Only compute derivatives for BSSN variables (not hydro vars)
+    bssn_state = state[:NUM_BSSN_VARS]
+    d1_raw = _apply_stencil(bssn_state, deriv_stencils.d1_stencils, 2, 2) / dr
+    d2_raw = _apply_stencil(bssn_state, deriv_stencils.d2_stencils, 2, 2) / (dr * dr)
 
     # Advection: upwind selection based on shift sign
-    advec_l = (state @ deriv_mats.advec_l_matrix.T) / dr
-    advec_r = (state @ deriv_mats.advec_r_matrix.T) / dr
+    advec_l = _apply_stencil(bssn_state, deriv_stencils.advec_l_stencils, 3, 0) / dr
+    advec_r = _apply_stencil(bssn_state, deriv_stencils.advec_r_stencils, 0, 3) / dr
     mask = (shift_r >= 0)[jnp.newaxis, :]
     advec_raw = jnp.where(mask, advec_r, advec_l)
 
@@ -513,7 +532,7 @@ HYDRO_PARITY = [1.0, -1.0, 1.0]
 NUM_HYDRO_VARS = 3
 
 @partial(jax.jit, static_argnums=(4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21))
-def get_rhs_bssn_hydro_jax(state, bssn_bg, deriv_mats, dr,
+def get_rhs_bssn_hydro_jax(state, bssn_bg, deriv_stencils, dr,
                             num_ghosts, num_vars,
                             sigma_base, eta,
                             eos_type, eos_gamma, eos_K,
@@ -537,7 +556,7 @@ def get_rhs_bssn_hydro_jax(state, bssn_bg, deriv_mats, dr,
     Args:
         state: (NUM_VARS, N) current state
         bssn_bg: BSSNBackground pytree
-        deriv_mats: DerivativeMatrices pytree
+        deriv_stencils: DerivativeStencils pytree (compact banded stencils)
         dr: float, grid spacing
         num_ghosts: int (static)
         num_vars: int (static) = NUM_BSSN_VARS + NUM_HYDRO_VARS = 15
@@ -591,7 +610,7 @@ def get_rhs_bssn_hydro_jax(state, bssn_bg, deriv_mats, dr,
     (d1_phi, d1_K, d1_lapse, d1_h_LL, d1_a_LL, d1_lambda_U, d1_shift_U,
      d2_phi, d2_lapse, d2_h_LL, d2_shift_U,
      advec_phi, advec_K, advec_lapse, advec_h_LL, advec_a_LL, advec_lambda_U,
-    ) = _compute_bssn_derivatives(state, deriv_mats, dr, N, shift_r)
+    ) = _compute_bssn_derivatives(state, deriv_stencils, dr, N, shift_r)
 
     # 4. Extract hydro geometry from current BSSN vars
     geom = extract_geometry(phi, h_LL, lapse, shift_U, bssn_bg)
@@ -659,7 +678,7 @@ def get_rhs_bssn_hydro_jax(state, bssn_bg, deriv_mats, dr,
 
     # 12. Kreiss-Oliger dissipation (BSSN variables only — HLL provides hydro dissipation)
     sigma = sigma_base * lapse * jnp.exp(-2.0 * phi)
-    ko_diss = (state[:NUM_BSSN_VARS] @ deriv_mats.ko_matrix.T) / (64.0 * dr)
+    ko_diss = _apply_stencil(state[:NUM_BSSN_VARS], deriv_stencils.ko_stencils, 3, 3) / (64.0 * dr)
     rhs_state = rhs_state.at[:NUM_BSSN_VARS].add(sigma * ko_diss)
 
     # 13. Boundary conditions

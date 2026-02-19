@@ -155,3 +155,42 @@ class Derivatives:
         # Do not compute advection where it is not possible because of boundaries.
         self.advec_x_matrix[0, :NUM_GHOSTS] = 0
         self.advec_x_matrix[1, -NUM_GHOSTS:] = 0
+
+    def get_stencils(self):
+        """Extract compact stencil coefficients from banded derivative matrices.
+
+        Returns dict with (N, K) arrays instead of (N, N) matrices,
+        where K is the stencil width (4-7). Memory: O(N*K) vs O(N^2).
+        """
+        return {
+            'd1': extract_stencils(self.drn_matrix[1], [-2, -1, 0, 1, 2]),
+            'd2': extract_stencils(self.drn_matrix[2], [-2, -1, 0, 1, 2]),
+            'advec_l': extract_stencils(self.advec_x_matrix[0], [-3, -2, -1, 0]),
+            'advec_r': extract_stencils(self.advec_x_matrix[1], [0, 1, 2, 3]),
+            'ko': extract_stencils(self.drn_matrix[6], [-3, -2, -1, 0, 1, 2, 3]),
+        }
+
+
+def extract_stencils(matrix, offsets):
+    """Extract per-point stencil coefficients from a banded matrix.
+
+    Given matrix M of shape (N, N) and column offsets, produces compact
+    array S of shape (N, K) where K = len(offsets), such that:
+        (M @ f)[i] = sum_k S[i, k] * f[i + offsets[k]]
+
+    Args:
+        matrix: (N, N) numpy array (banded but stored dense)
+        offsets: list of ints, column offsets relative to row index
+
+    Returns:
+        stencils: (N, K) numpy array of per-point coefficients
+    """
+    N = matrix.shape[0]
+    K = len(offsets)
+    stencils = np.zeros((N, K))
+    rows = np.arange(N)
+    for k, off in enumerate(offsets):
+        cols = rows + off
+        valid = (cols >= 0) & (cols < N)
+        stencils[valid, k] = matrix[rows[valid], cols[valid]]
+    return stencils

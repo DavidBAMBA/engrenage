@@ -174,7 +174,7 @@ def bench_jax(label, grid, bg, matter, sv, state_flat):
     jax.config.update("jax_enable_x64", True)
     import jax.numpy as jnp
     from source.bssn.jax.bssngeometry import (
-        build_bssn_background, build_derivative_matrices,
+        build_bssn_background, build_derivative_stencils,
     )
     from source.core.rhsevolution_jax import get_rhs_bssn_scalar_jax
     from source.bssn.jax.boundaries_jax import fill_bssn_boundaries_jax
@@ -187,7 +187,7 @@ def bench_jax(label, grid, bg, matter, sv, state_flat):
     # Transfer to JAX
     state_2d = jnp.array(state_flat.reshape(num_vars, -1))
     bssn_bg = build_bssn_background(grid, bg)
-    deriv_mats = build_derivative_matrices(grid)
+    deriv_stencils = build_derivative_stencils(grid)
     dr = jnp.array(grid.dr)
 
     parity_j = jnp.array(np.concatenate([
@@ -209,7 +209,7 @@ def bench_jax(label, grid, bg, matter, sv, state_flat):
     @jax.jit
     def rhs_fn(s):
         return get_rhs_bssn_scalar_jax(
-            s, bssn_bg, deriv_mats, dr,
+            s, bssn_bg, deriv_stencils, dr,
             NUM_GHOSTS, num_vars, SIGMA_BASE, SCALAR_MU, ETA,
             outer_bc_type="asymptotic", fix_shift=False)
 

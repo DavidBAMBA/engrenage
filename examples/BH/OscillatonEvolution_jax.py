@@ -42,7 +42,7 @@ from source.bssn.bssnstatevariables import (
 )
 
 # JAX BSSN imports
-from source.bssn.jax.bssngeometry import build_bssn_background, build_derivative_matrices
+from source.bssn.jax.bssngeometry import build_bssn_background, build_derivative_stencils
 from source.bssn.jax.boundaries_jax import fill_bssn_boundaries_jax
 from source.core.rhsevolution_jax import get_rhs_bssn_scalar_jax
 
@@ -96,7 +96,7 @@ def main():
     print("\n[JAX] Transferring data to JAX arrays...")
     state_jax = jnp.array(initial_state_2d)
     bssn_bg = build_bssn_background(grid, background)
-    deriv_mats = build_derivative_matrices(grid)
+    deriv_stencils = build_derivative_stencils(grid)
     dr = jnp.array(grid.dr)
 
     # =========================================================================
@@ -117,7 +117,7 @@ def main():
     @jax.jit
     def rhs_fn(state):
         return get_rhs_bssn_scalar_jax(
-            state, bssn_bg, deriv_mats, dr,
+            state, bssn_bg, deriv_stencils, dr,
             NUM_GHOSTS, num_vars,
             sigma_base, scalar_mu, eta,
             outer_bc_type="asymptotic",  # Oscillaton: asymptotic falloff

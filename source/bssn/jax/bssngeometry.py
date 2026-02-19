@@ -155,3 +155,68 @@ def build_derivative_matrices(grid):
         advec_r_matrix=jnp.array(grid.derivs.advec_x_matrix[1]),
         ko_matrix=jnp.array(grid.derivs.drn_matrix[6]),
     )
+
+
+class DerivativeStencils:
+    """
+    Compact stencil coefficients extracted from banded derivative matrices.
+    Replaces DerivativeMatrices for O(N*K) computation instead of O(N^2).
+
+    Memory savings: (N, K) with K=4-7 instead of (N, N).
+    For N=4000: ~800 KB vs ~640 MB (800x reduction).
+
+    Contains:
+      - d1_stencils: (N, 5) 4th-order first derivative, offsets [-2,-1,0,+1,+2]
+      - d2_stencils: (N, 5) 4th-order second derivative (position-dependent)
+      - advec_l_stencils: (N, 4) 3rd-order backward advection, offsets [-3,-2,-1,0]
+      - advec_r_stencils: (N, 4) 3rd-order forward advection, offsets [0,+1,+2,+3]
+      - ko_stencils: (N, 7) 6th-order KO dissipation, offsets [-3,...,+3]
+    """
+    def __init__(self, d1_stencils, d2_stencils, advec_l_stencils,
+                 advec_r_stencils, ko_stencils):
+        self.d1_stencils = d1_stencils
+        self.d2_stencils = d2_stencils
+        self.advec_l_stencils = advec_l_stencils
+        self.advec_r_stencils = advec_r_stencils
+        self.ko_stencils = ko_stencils
+
+    def tree_flatten(self):
+        children = (
+            self.d1_stencils, self.d2_stencils,
+            self.advec_l_stencils, self.advec_r_stencils,
+            self.ko_stencils,
+        )
+        aux_data = ()
+        return children, aux_data
+
+    @classmethod
+    def tree_unflatten(cls, aux_data, children):
+        return cls(*children)
+
+
+jax.tree_util.register_pytree_node(
+    DerivativeStencils,
+    DerivativeStencils.tree_flatten,
+    DerivativeStencils.tree_unflatten,
+)
+
+
+def build_derivative_stencils(grid):
+    """
+    Extract compact stencil coefficients from derivative matrices
+    and transfer to JAX arrays.
+
+    Args:
+        grid: Grid object with derivs attribute
+
+    Returns:
+        DerivativeStencils pytree with (N, K) stencil arrays
+    """
+    stencils = grid.derivs.get_stencils()
+    return DerivativeStencils(
+        d1_stencils=jnp.array(stencils['d1']),
+        d2_stencils=jnp.array(stencils['d2']),
+        advec_l_stencils=jnp.array(stencils['advec_l']),
+        advec_r_stencils=jnp.array(stencils['advec_r']),
+        ko_stencils=jnp.array(stencils['ko']),
+    )

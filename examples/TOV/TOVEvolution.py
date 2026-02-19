@@ -78,7 +78,7 @@ if JAX_RUN:
         compute_hydro_rhs_cowling,
     )
     # Dynamic mode imports (BSSN + hydro coupling)
-    from source.bssn.jax.bssngeometry import build_bssn_background, build_derivative_matrices
+    from source.bssn.jax.bssngeometry import build_bssn_background, build_derivative_stencils
     from source.bssn.jax.boundaries_jax import fill_bssn_boundaries_jax
     from source.core.rhsevolution_jax import get_rhs_bssn_hydro_jax, NUM_HYDRO_VARS, HYDRO_PARITY
     from source.bssn.bssnstatevariables import (
@@ -365,10 +365,10 @@ def main():
     # CONFIGURATION
     # ==================================================================
     r_max = 100.0
-    num_points = int(os.environ.get("NUM_POINTS", 2000))
+    num_points = int(os.environ.get("NUM_POINTS", 4000))
     K = 100.0
     Gamma = 2.0
-    rho_central = 8.0e-3
+    rho_central = 1.28e-3
     t_final = float(os.environ.get("T_FINAL", "4000"))
     FOLDER_NAME_EVOL = f"tov_evolution_data_refact_rmax{r_max}" + ("_jax" if JAX_RUN else "")
 
@@ -1227,11 +1227,11 @@ def _evolve_jax(initial_state_2d, prim_tuple, tov_solution,
     # ==================================================================
     if IS_DYNAMIC:
         # ----- DYNAMIC MODE: Build BSSN background + derivative matrices -----
-        print("\nBuilding BSSNBackground and DerivativeMatrices...")
+        print("\nBuilding BSSNBackground and DerivativeStencils...")
         t0_setup = time.perf_counter()
         state_jax = jnp.array(initial_state_2d)
         bssn_bg = build_bssn_background(grid, background)
-        deriv_mats = build_derivative_matrices(grid)
+        deriv_stencils = build_derivative_stencils(grid)
         dr_jax = jnp.array(grid.dr)
         dx_hydro = float(grid.derivs.dx)
 
@@ -1286,7 +1286,7 @@ def _evolve_jax(initial_state_2d, prim_tuple, tov_solution,
         @jax.jit
         def rhs_fn(state):
             return get_rhs_bssn_hydro_jax(
-                state, bssn_bg, deriv_mats, dr_jax,
+                state, bssn_bg, deriv_stencils, dr_jax,
                 NUM_GHOSTS, num_vars,
                 sigma_base, eta,
                 eos_type, Gamma, K,
