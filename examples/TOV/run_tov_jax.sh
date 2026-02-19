@@ -7,7 +7,7 @@ set -e
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 SCRIPT="$SCRIPT_DIR/TOVEvolution.py"
 
-for NP in 500 1000; do
+for NP in 4000; do
     echo "============================================================"
     echo "  Running TOVEvolution.py (JAX backend) with num_points = $NP"
     echo "  Started at: $(date)"

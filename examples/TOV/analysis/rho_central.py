@@ -18,7 +18,9 @@ N_med = 4000
 N_high = 8000
 # Data paths - constructed from resolution values
 FOLDERS = {
-    f'N={N_very_low}': f'/home/davidbamba/repositories/engrenage/examples/TOV/tov_evolution_data_refact_rmax100.0_jax/tov_star_rhoc1p28em03_N2000_K100_G2_cow_mp5'
+    f'N={N_very_low}': f'/home/davidbamba/repositories/engrenage/examples/TOV/tov_evolution_data_refact_rmax100.0_jax/tov_star_rhoc1p28em03_N500_K100_G2_dyn_mp5',
+    f'N={N_low}':      f'/home/davidbamba/repositories/engrenage/examples/TOV/tov_evolution_data_refact_rmax100.0_jax/tov_star_rhoc1p28em03_N1000_K100_G2_dyn_mp5',
+    f'N={N_med}':      f'/home/davidbamba/repositories/engrenage/examples/TOV/tov_evolution_data_refact_rmax100.0_jax/tov_star_rhoc1p28em03_N2000_K100_G2_dyn_mp5',
       #f'N={N_low}': f'/home/davidbamba/repositories/engrenage/examples/TOV/tov_evolution_data_rmax100.0_jax_reconstructor/tov_star_rhoc1p28em03_N2000_K100_G2_cow_wz',
     #f'N={N_med}': f'/home/davidbamba/repositories/engrenage/examples/TOV/tov_evolution_data_rmax100.0_jax_reconstructor/tov_star_rhoc1p28em03_N4000_K100_G2_cow_wz',
     #f'N={N_high}': f'/home/davidbamba/repositories/engrenage/examples/TOV/tov_evolution_data_rmax100.0_jax_reconstructor/tov_star_rhoc1p28em03_N8000_K100_G2_cow_wz',
@@ -170,7 +172,7 @@ Examples:
                         help='List of data directories to analyze. Default: use FOLDERS')
     parser.add_argument('--output-dir', default=None,
                         help='Output directory for plots. Default: script_dir/plots')
-    parser.add_argument('--t-max', type=float, default=4000.0,
+    parser.add_argument('--t-max', type=float, default=2000.0,
                         help='Maximum time to plot. Default: 1000.0')
     args = parser.parse_args()
 

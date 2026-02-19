@@ -5,22 +5,22 @@ Convergence analysis for TOV star evolution - Rest-Mass Density L1 Norm
 Calculates convergence order from L1-norm of rest-mass density differences
 between resolutions, similar to Figure 16 in arXiv:1612.06251.
 
-Uses 4 resolutions: N=200, N=400, N=800, N=1600
+Uses 3 resolutions: N1, N2, N3
 
 Temporal alignment:
-  - All resolutions aligned to common time grid (N=200 as reference)
+  - All resolutions aligned to common time grid (N1 as reference)
   - Nearest snapshot in time used for comparison (no interpolation)
   - Each resolution uses its closest available snapshot
 
 Computes using two methods:
 
   1. Discrete L1 (consecutive pairs): E = (1/N) Σ |ρ₁ - ρ₂|
-     - Three pairs: (N=200, N=400), (N=400, N=800), (N=800, N=1600)
-     - Two convergence orders: p₁₂ = log(E₁₂/E₂₃)/log(2), p₂₃ = log(E₂₃/E₃₄)/log(2)
+     - Two pairs: (N1, N2), (N2, N3)
+     - One convergence order: p12 = log(E₁₂/E₂₃)/log(2)
 
   2. Paper method (vs highest resolution): Δf = (1/N) Σ |f - f̄|
-     - Three comparisons vs N=1600: N=200, N=400, N=800
-     - Two convergence orders: p₁₂ = log(E₁/E₂)/log(2), p₂₃ = log(E₂/E₃)/log(2)
+     - Two comparisons vs N3: N1, N2
+     - One convergence order: p12 = log(E₁/E₂)/log(2)
      - As in Appendix B of arXiv:1612.06251
 
 All methods compute interior only (r ≤ R_star).
@@ -42,32 +42,38 @@ FREQ_CONVERSION = 1.0 / (M_SUN_SECONDS * 1e3)  # Convert from 1/M_sun to kHz
 
 # Theoretical QNM frequencies in kHz (Font et al. 2002, Cowling approximation)
 FREQUENCIES_COWLING_KHZ = {
-    'F':  1.450, 'H1': 3.958, 'H2': 5.935, 'H3': 7.812,
+    'F':  2.696, 'H1': 4.534, 'H2': 6.346, 'H3': 8.161,
 }
 
+# Frequencies for dynamic evolution (BSSN+hydro)
+FREQUENCIES_DYNAMIC_KHZ = {
+    'F':  1.450, 'H1': 3.958, 'H2': 5.935, 'H3': 7.812,
+    'H4': 9.72,
+}
+
+# Select frequency dictionary based on data type (dyn_jax -> dynamic)
+FREQUENCIES_KHZ = FREQUENCIES_DYNAMIC_KHZ
+
+# QNM FFT settings (matching plot_qnm_analysis.py)
+QNM_DELTA_T = 1.0   # Subsample to uniform dt=1 for FFT
+QNM_T_START = 10.0   # Discard initial transient
 
 # Resolutions - UPDATE THESE TO CHANGE RESOLUTIONS
-N1 = 1000
-N2 = 2000
-N3 = 4000
-N4 = 8000
-
-# Base data directory
-#DATA_DIR = '/home/davidbamba/repositories/engrenage/examples/TOV/tov_evolution_data_rmax100.0_TEST_long_domain_long_time'
+N1 = 500
+N2 = 1000
+N3 = 2000
 
 # Data paths - constructed from resolution values
 FOLDERS = {
     f'N={N1}': f'/home/davidbamba/repositories/engrenage/examples/TOV/tov_evolution_data_refact_rmax100.0_jax/tov_star_rhoc1p28em03_N500_K100_G2_dyn_mp5',
     f'N={N2}': f'/home/davidbamba/repositories/engrenage/examples/TOV/tov_evolution_data_refact_rmax100.0_jax/tov_star_rhoc1p28em03_N1000_K100_G2_dyn_mp5',
     f'N={N3}': f'/home/davidbamba/repositories/engrenage/examples/TOV/tov_evolution_data_refact_rmax100.0_jax/tov_star_rhoc1p28em03_N2000_K100_G2_dyn_mp5',
-    #f'N={N4}': f'/home/davidbamba/repositories/engrenage/examples/TOV/tov_evolution_data_refact_rmax100.0_jax/tov_star_rhoc1p28em03_N8000_K100_G2_dyn_mp5'
 }
 
 # Resolution labels (keys to FOLDERS dictionary)
 res1 = f'N={N1}'
 res2 = f'N={N2}'
-res3 = f'N={N3}'
-res4 = f'N={N4}'  # Highest resolution for comparison
+res3 = f'N={N3}'  # Highest resolution for comparison
 
 COLORS = ['#1f77b4', "#ff7f0e", '#2ca02c', "#d62728",
           "#9467bd", "#8c564b", "#e377c2", "#17becf"]
@@ -80,7 +86,7 @@ def load_metadata(folder_path):
     Returns:
         Dictionary with metadata including stellar radius R_star
     """
-    json_file = os.path.join(folder_path, 'tov_metadata_cow.json')
+    json_file = os.path.join(folder_path, 'tov_metadata_dyn_jax.json')
 
     try:
         with open(json_file, 'r') as f:
@@ -100,7 +106,7 @@ def load_snapshots(folder_path):
         r: radial grid
         rho_list: list of density profiles rho0(r) at each time
     """
-    h5_file = os.path.join(folder_path, 'tov_snapshots_cow.h5')
+    h5_file = os.path.join(folder_path, 'tov_snapshots_dyn_jax.h5')
 
     times = []
     rho_list = []
@@ -170,15 +176,19 @@ def find_stellar_radius(r, rho, rho_atm=1e-16):
 
 
 def running_average(x, window):
-    """Compute running average with given window size."""
+    """Compute running average with given window size.
+    Uses reflect-padding at edges to avoid zero-padding artifacts."""
     if window <= 1 or len(x) == 0:
         return x
-    # Adjust window if larger than data
     window = min(window, len(x))
     if window <= 1:
         return x
+    pad = window // 2
+    # Reflect signal at boundaries to avoid edge artifacts
+    x_padded = np.pad(x, pad, mode='reflect')
     kernel = np.ones(window) / window
-    return np.convolve(x, kernel, mode='same')
+    result = np.convolve(x_padded, kernel, mode='same')
+    return result[pad:pad + len(x)]
 
 
 def smooth(y, window=15, polyorder=3):
@@ -188,25 +198,35 @@ def smooth(y, window=15, polyorder=3):
     return savgol_filter(y, window, polyorder)
 
 
-def compute_qnm_power_spectrum(t, signal_data, window='hann'):
+def compute_qnm_power_spectrum(t, signal_data, t_start=None, window='hann'):
     """
-    Compute power spectrum for QNM analysis (from plot_qnm_analysis.py).
+    Compute power spectrum for QNM analysis (matching plot_qnm_analysis.py).
 
     Args:
         t: time array
-        signal_data: signal array (e.g., central density deviation)
+        signal_data: signal array (e.g., central density)
+        t_start: discard data before this time (avoids initial transient)
         window: window function ('hann' or None)
 
     Returns:
         freq_khz: frequency array in kHz
         power: power spectrum
     """
-    sig_detrend = signal_data - np.mean(signal_data)
+    if t_start is not None:
+        mask = t > t_start
+        t_sel, sig_sel = t[mask], signal_data[mask]
+    else:
+        t_sel, sig_sel = t, signal_data
+
+    # Use relative change (rho - rho_0) / rho_0 as in plot_qnm_analysis.py
+    sig_rel = (sig_sel - sig_sel[0]) / sig_sel[0]
+    sig_detrend = sig_rel - np.mean(sig_rel)
+
     n = len(sig_detrend)
     win = np.hanning(n) if window == 'hann' else np.ones(n)
     sig_windowed = sig_detrend * win
 
-    dt = np.mean(np.diff(t))
+    dt = np.mean(np.diff(t_sel))
     freq = np.fft.rfftfreq(n, dt)
     fft_vals = np.fft.rfft(sig_windowed)
     freq_khz = freq * FREQ_CONVERSION
@@ -215,9 +235,10 @@ def compute_qnm_power_spectrum(t, signal_data, window='hann'):
     return freq_khz, power
 
 
-def find_qnm_peaks(freq_khz, power, min_freq=1.0, max_freq=10.0, max_peaks=4):
+def find_qnm_peaks(freq_khz, power, min_freq=1.0, max_freq=14.0, max_peaks=10):
     """
     Find the most significant peaks in QNM frequency range.
+    Matches find_all_peaks() from plot_qnm_analysis.py.
 
     Args:
         freq_khz: frequency array in kHz
@@ -241,12 +262,12 @@ def find_qnm_peaks(freq_khz, power, min_freq=1.0, max_freq=10.0, max_peaks=4):
     log_power = np.log10(power_sel + 1e-50)
     noise_floor = np.median(log_power)
 
-    # Find peaks
+    # Find peaks - relaxed criteria to detect all visible peaks
     peaks, props = find_peaks(
         log_power,
-        height=noise_floor + 0.3,  # ~2x above noise
-        prominence=0.08,
-        distance=2
+        height=noise_floor + 0.3,  # ~2x above noise (relaxed)
+        prominence=0.08,           # Low prominence threshold
+        distance=2                 # Minimum separation
     )
 
     if len(peaks) == 0:
@@ -261,6 +282,31 @@ def find_qnm_peaks(freq_khz, power, min_freq=1.0, max_freq=10.0, max_peaks=4):
     peaks = peaks[freq_order]
 
     return freq_sel[peaks], power_sel[peaks]
+
+
+def subsample_to_delta_t(t, signal_data, delta_t):
+    """Efficiently subsample data to uniform time intervals using searchsorted.
+    Matches plot_qnm_analysis.py."""
+    target_times = np.arange(0, t.max() + delta_t, delta_t)
+    indices = np.searchsorted(t, target_times)
+    indices = np.clip(indices, 0, len(t) - 1)
+    for i, (idx, target) in enumerate(zip(indices, target_times)):
+        if idx > 0 and abs(t[idx - 1] - target) < abs(t[idx] - target):
+            indices[i] = idx - 1
+    _, unique_idx = np.unique(indices, return_index=True)
+    indices = indices[np.sort(unique_idx)]
+    return t[indices], signal_data[indices]
+
+
+def load_timeseries_for_qnm(folder_path, delta_t=1.0):
+    """Load rho_central from timeseries.npz and subsample, matching plot_qnm_analysis.py."""
+    npz_file = os.path.join(folder_path, 'timeseries.npz')
+    npz = np.load(npz_file)
+    t = npz['times']
+    signal_data = npz['rho_central']
+    if delta_t is not None:
+        t, signal_data = subsample_to_delta_t(t, signal_data, delta_t)
+    return t, signal_data
 
 
 def find_nearest_time_snapshots(t_target, t_source, rho_list_source):
@@ -298,28 +344,28 @@ def extract_resolution_from_dirname(dirname):
 
 def main():
     parser = argparse.ArgumentParser(
-        description='Rest-mass density convergence analysis (requires exactly 4 resolutions)',
+        description='Rest-mass density convergence analysis (requires exactly 3 resolutions)',
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog='''
 Examples:
-  python rest_mass_density_convergence.py                           # Use default folders
-  python rest_mass_density_convergence.py --data-dirs D1 D2 D3 D4   # Exactly 4 directories
-  python rest_mass_density_convergence.py --tov-cache CACHE_PATH    # Custom TOV cache
+  python rest_mass_density_convergence_3.py                           # Use default folders
+  python rest_mass_density_convergence_3.py --data-dirs D1 D2 D3      # Exactly 3 directories
+  python rest_mass_density_convergence_3.py --tov-cache CACHE_PATH    # Custom TOV cache
 '''
     )
     parser.add_argument('--data-dirs', nargs='+', default=None,
-                        help='List of data directories (exactly 4 required). Default: use FOLDERS')
+                        help='List of data directories (exactly 3 required). Default: use FOLDERS')
     parser.add_argument('--output-dir', default=None,
                         help='Output directory for plots. Default: script_dir/plots')
     parser.add_argument('--t-min', type=float, default=0.0,
                         help='Minimum time to analyze. Default: 0.0')
-    parser.add_argument('--t-max', type=float, default=6000.0,
-                        help='Maximum time to plot. Default: 4000.0')
+    parser.add_argument('--t-max', type=float, default=4000.0,
+                        help='Maximum time to plot. Default: 6000.0')
     parser.add_argument('--tov-cache', default=None,
                         help='Path to TOV cache directory. Required if using --data-dirs.')
     args = parser.parse_args()
 
-    t_min = 1000#args.t_min
+    t_min = 10#args.t_min
     t_max = args.t_max
     script_dir = os.path.dirname(os.path.abspath(__file__))
 
@@ -332,9 +378,9 @@ Examples:
 
     # Determine data folders and TOV cache
     if args.data_dirs:
-        # Validate exactly 4 directories
-        if len(args.data_dirs) != 4:
-            print(f"Error: This script requires exactly 4 directories, got {len(args.data_dirs)}")
+        # Validate exactly 3 directories
+        if len(args.data_dirs) != 3:
+            print(f"Error: This script requires exactly 3 directories, got {len(args.data_dirs)}")
             return
 
         if not args.tov_cache:
@@ -352,13 +398,13 @@ Examples:
             else:
                 print(f"Warning: Folder not found: {folder_path}")
 
-        if len(folders_dict) != 4:
-            print("Error: Need exactly 4 valid directories")
+        if len(folders_dict) != 3:
+            print("Error: Need exactly 3 valid directories")
             return
 
-        # Sort by resolution to assign res1/res2/res3/res4
+        # Sort by resolution to assign res1/res2/res3
         sorted_items = sorted(folders_dict.items(), key=lambda x: extract_resolution_from_dirname(x[0]) or 0)
-        res1, res2, res3, res4 = sorted_items[0][0], sorted_items[1][0], sorted_items[2][0], sorted_items[3][0]
+        res1, res2, res3 = sorted_items[0][0], sorted_items[1][0], sorted_items[2][0]
         folders_dict = dict(sorted_items)
         tov_cache_dir = args.tov_cache
 
@@ -366,20 +412,18 @@ Examples:
         N1 = extract_resolution_from_dirname(res1) or 100
         N2 = extract_resolution_from_dirname(res2) or 200
         N3 = extract_resolution_from_dirname(res3) or 400
-        N4 = extract_resolution_from_dirname(res4) or 800
     else:
         # Use default FOLDERS (backward compatibility)
         folders_dict = FOLDERS
         # Extract res labels from FOLDERS keys
         sorted_items = sorted(folders_dict.items(), key=lambda x: extract_resolution_from_dirname(x[0]) or 0)
-        res1, res2, res3, res4 = sorted_items[0][0], sorted_items[1][0], sorted_items[2][0], sorted_items[3][0]
+        res1, res2, res3 = sorted_items[0][0], sorted_items[1][0], sorted_items[2][0]
         tov_cache_dir = "/home/davidbamba/repositories/engrenage/examples/TOV/tov_iso_cache/TOVSOL_ISO_K=100.0_G=2.0_rho=1.280000e-03"
 
         # Extract resolution numbers for use in plots and print statements
         N1 = extract_resolution_from_dirname(res1) or 100
         N2 = extract_resolution_from_dirname(res2) or 200
         N3 = extract_resolution_from_dirname(res3) or 400
-        N4 = extract_resolution_from_dirname(res4) or 800
 
     # =========================================================
     # Load all data
@@ -409,19 +453,17 @@ Examples:
     common_times = t_ref[time_mask]
 
     print(f"  Using {res1} as reference: {len(common_times)} time points in range t=[{t_min}, {t_max}]")
-    print(f"  Finding nearest snapshots for {res2}, {res3}, and {res4}...")
+    print(f"  Finding nearest snapshots for {res2} and {res3}...")
 
     # Get source data
-    t1, t2, t3, t4 = data[res1]['t'], data[res2]['t'], data[res3]['t'], data[res4]['t']
+    t1, t2, t3 = data[res1]['t'], data[res2]['t'], data[res3]['t']
     r1 = data[res1]['r']
     r2 = data[res2]['r']
     r3 = data[res3]['r']
-    r4 = data[res4]['r']
 
     rho1_list_full = data[res1]['rho']
     rho2_list_full = data[res2]['rho']
     rho3_list_full = data[res3]['rho']
-    rho4_list_full = data[res4]['rho']
 
     # Lowest resolution: just slice to t_max (no interpolation needed - it's the reference)
     rho1_list = [rho1_list_full[i] for i in range(len(common_times))]
@@ -429,7 +471,6 @@ Examples:
     # Other resolutions: find nearest time snapshots (no interpolation)
     rho2_list = find_nearest_time_snapshots(common_times, t2, rho2_list_full)
     rho3_list = find_nearest_time_snapshots(common_times, t3, rho3_list_full)
-    rho4_list = find_nearest_time_snapshots(common_times, t4, rho4_list_full)
 
     print(f"  Found nearest snapshots!")
 
@@ -437,7 +478,7 @@ Examples:
     # Get stellar radius from metadata
     # =========================================================
     # Load metadata from highest resolution simulation
-    metadata = load_metadata(folders_dict[res4])
+    metadata = load_metadata(folders_dict[res3])
 
     if metadata and 'tov_solution' in metadata and 'R' in metadata['tov_solution']:
         R_star = metadata['tov_solution']['R']
@@ -448,7 +489,7 @@ Examples:
     else:
         # Fallback: compute from density profile if metadata not available
         print("\nWarning: Metadata not found, computing R_star from density profile...")
-        R_star = find_stellar_radius(r4, rho4_list[0])
+        R_star = find_stellar_radius(r3, rho3_list[0])
         print(f"Stellar radius (computed): R_star = {R_star:.3f}")
 
     R_star = R_star
@@ -476,41 +517,32 @@ Examples:
     # Discrete L1 errors (interior only)
     E12_disc = []
     E23_disc = []
-    E34_disc = []
 
-    # Paper method: compare against highest resolution (N=1600)
-    E1_paper = []  # N=200 vs N=1600
-    E2_paper = []  # N=400 vs N=1600
-    E3_paper = []  # N=800 vs N=1600
+    # Paper method: compare against highest resolution (N3)
+    E1_paper = []  # N1 vs N3
+    E2_paper = []  # N2 vs N3
 
     for i in range(len(common_times)):
         rho1 = rho1_list[i]
         rho2 = rho2_list[i]
         rho3 = rho3_list[i]
-        rho4 = rho4_list[i]
 
         # Discrete L1 (interior only)
         e12_disc = compute_L1_error_discrete(r1, rho1, r2, rho2, r_max=R_star)
         e23_disc = compute_L1_error_discrete(r2, rho2, r3, rho3, r_max=R_star)
-        e34_disc = compute_L1_error_discrete(r3, rho3, r4, rho4, r_max=R_star)
         E12_disc.append(e12_disc)
         E23_disc.append(e23_disc)
-        E34_disc.append(e34_disc)
 
-        # Paper method: discrete L1 vs highest resolution N=1600 (interior only)
-        e1_paper = compute_L1_error_discrete(r1, rho1, r4, rho4, r_max=R_star)
-        e2_paper = compute_L1_error_discrete(r2, rho2, r4, rho4, r_max=R_star)
-        e3_paper = compute_L1_error_discrete(r3, rho3, r4, rho4, r_max=R_star)
+        # Paper method: discrete L1 vs highest resolution N3 (interior only)
+        e1_paper = compute_L1_error_discrete(r1, rho1, r3, rho3, r_max=R_star)
+        e2_paper = compute_L1_error_discrete(r2, rho2, r3, rho3, r_max=R_star)
         E1_paper.append(e1_paper)
         E2_paper.append(e2_paper)
-        E3_paper.append(e3_paper)
 
     E12_disc = np.array(E12_disc)
     E23_disc = np.array(E23_disc)
-    E34_disc = np.array(E34_disc)
     E1_paper = np.array(E1_paper)
     E2_paper = np.array(E2_paper)
-    E3_paper = np.array(E3_paper)
 
     # =========================================================
     # Compute convergence order
@@ -521,17 +553,13 @@ Examples:
 
         # Discrete L1 (interior only)
         p12_disc = np.log(E12_disc / E23_disc) / np.log(2.0)
-        p23_disc = np.log(E23_disc / E34_disc) / np.log(2.0)
 
-        # Paper method: p = log(Ei/Ej) / log(Ni/Nj) where Ei, Ej are vs highest resolution
-        p12_paper = np.log(E1_paper / E2_paper) / np.log(2.0)  # N200 vs N400
-        p23_paper = np.log(E2_paper / E3_paper) / np.log(2.0)  # N400 vs N800
+        # Paper method: p = log(E1/E2) / log(N2/N1)
+        p12_paper = np.log(E1_paper / E2_paper) / np.log(2.0)
 
     # Compute running averages
     p12_disc_avg = running_average(p12_disc, window=100)
-    p23_disc_avg = running_average(p23_disc, window=100)
     p12_paper_avg = running_average(p12_paper, window=100)
-    p23_paper_avg = running_average(p23_paper, window=100)
 
     valid = common_times > 50  # Skip initial transient
 
@@ -559,22 +587,17 @@ Examples:
                 color=COLORS[0], linewidth=1.2)
     ax.semilogy(common_times, smooth(E23_disc), label=rf'$E_{{23}}$ ({res2} vs {res3})',
                 color=COLORS[1], linewidth=1.2)
-    ax.semilogy(common_times, smooth(E34_disc), label=rf'$E_{{34}}$ ({res3} vs {res4})',
-                color=COLORS[2], linewidth=1.2)
     ax.set_xlabel(r'$t$ [M$_\odot$]')
     ax.set_ylabel(r'$L_1$ error')
-    ax.set_title(rf'(b) Discrete $L_1$: $(1/N) \sum |\Delta\rho|$ ($r \leq {R_star:.1f}$)')
+    ax.set_title(rf'(b) Discrete $L_1$: $(1/N) \sum |\Delta\rho|$')
     ax.legend(fontsize=8)
 
     # Plot 3: Error ratio (discrete)
     ax = axes1[1, 0]
     with np.errstate(divide='ignore', invalid='ignore'):
         ratio12_disc = E12_disc / E23_disc
-        ratio23_disc = E23_disc / E34_disc
     ax.plot(common_times, smooth(ratio12_disc), label='$E_{12}/E_{23}$',
             color=COLORS[0], linewidth=1.2)
-    ax.plot(common_times, smooth(ratio23_disc), label='$E_{23}/E_{34}$',
-            color=COLORS[1], linewidth=1.2)
     ax.axhline(4, ls='--', color='gray', label='Ratio=4 (2nd order)')
     ax.axhline(8, ls=':', color='gray', label='Ratio=8 (3rd order)')
     ax.set_xlabel(r'$t$ [M$_\odot$]')
@@ -588,9 +611,6 @@ Examples:
     ax.plot(common_times[valid], p12_disc[valid], color=COLORS[0], alpha=0.3, lw=0.6)
     ax.plot(common_times[valid], p12_disc_avg[valid], color=COLORS[0], lw=2.0,
             label=f'p(N{N1},N{N2})')
-    ax.plot(common_times[valid], p23_disc[valid], color=COLORS[1], alpha=0.3, lw=0.6)
-    ax.plot(common_times[valid], p23_disc_avg[valid], color=COLORS[1], lw=2.0,
-            label=f'p(N{N2},N{N3})')
     ax.axhline(2, ls='--', color='gray', label='2nd order')
     ax.axhline(3, ls=':', color='gray', label='3rd order')
     ax.axhline(5, ls='-.', color='gray', label='5th order')
@@ -624,12 +644,10 @@ Examples:
 
     # Plot 2: Paper method L1 errors
     ax = axes2[0, 1]
-    ax.semilogy(common_times, smooth(E1_paper), label=rf'$E_1$ ({res1} vs {res4})',
+    ax.semilogy(common_times, smooth(E1_paper), label=rf'$E_1$ ({res1} vs {res3})',
                 color=COLORS[0], linewidth=1.2)
-    ax.semilogy(common_times, smooth(E2_paper), label=rf'$E_2$ ({res2} vs {res4})',
+    ax.semilogy(common_times, smooth(E2_paper), label=rf'$E_2$ ({res2} vs {res3})',
                 color=COLORS[1], linewidth=1.2)
-    ax.semilogy(common_times, smooth(E3_paper), label=rf'$E_3$ ({res3} vs {res4})',
-                color=COLORS[2], linewidth=1.2)
     ax.set_xlabel(r'$t$ [M$_\odot$]')
     ax.set_ylabel(r'$L_1$ error')
     ax.set_title(rf'(b) Error vs Highest Resolution ($r \leq {R_star:.1f}$)')
@@ -639,11 +657,8 @@ Examples:
     ax = axes2[1, 0]
     with np.errstate(divide='ignore', invalid='ignore'):
         ratio12_paper = E1_paper / E2_paper
-        ratio23_paper = E2_paper / E3_paper
     ax.plot(common_times, smooth(ratio12_paper), label='$E_1/E_2$',
             color=COLORS[0], linewidth=1.2)
-    ax.plot(common_times, smooth(ratio23_paper), label='$E_2/E_3$',
-            color=COLORS[1], linewidth=1.2)
     ax.axhline(2, ls='--', color='gray', label='Ratio=2 (1st order)')
     ax.axhline(4, ls=':', color='gray', label='Ratio=4 (2nd order)')
     ax.set_xlabel(r'$t$ [M$_\odot$]')
@@ -657,9 +672,6 @@ Examples:
     ax.plot(common_times[valid], p12_paper[valid], color=COLORS[0], alpha=0.3, lw=0.6)
     ax.plot(common_times[valid], p12_paper_avg[valid], color=COLORS[0], lw=2.0,
             label=f'p(N{N1},N{N2})')
-    ax.plot(common_times[valid], p23_paper[valid], color=COLORS[1], alpha=0.3, lw=0.6)
-    ax.plot(common_times[valid], p23_paper_avg[valid], color=COLORS[1], lw=2.0,
-            label=f'p(N{N2},N{N3})')
     ax.axhline(1, ls='--', color='gray', label='1st order')
     ax.axhline(2, ls=':', color='gray', label='2nd order')
     ax.axhline(3, ls='-.', color='gray', label='3rd order')
@@ -670,20 +682,20 @@ Examples:
     ax.set_title(r'(d) Convergence Order $p(t)$')
     ax.legend(fontsize=8, loc='upper right')
 
-    fig2.suptitle(rf'Paper Method: $\Delta f = (1/N) \sum |f_i - \bar{{f}}_i|$ where $\bar{{f}}$ = {res4}', fontsize=12, y=1.02)
+    fig2.suptitle(rf'Paper Method: $\Delta f = (1/N) \sum |f_i - \bar{{f}}_i|$ where $\bar{{f}}$ = {res3}', fontsize=12, y=1.02)
     fig2.tight_layout()
 
     # =========================================================
     # Figure 3: Convergence plot log(Δρ) vs log(N)
-    # Using all 4 resolutions for log-log convergence plot
+    # Using all 3 resolutions for log-log convergence plot
     # =========================================================
     print(f"\nPreparing Figure 3: convergence log-log plot...")
 
     fig3, axes3 = plt.subplots(1, 2, figsize=(14, 6))
     ax3_left, ax3_right = axes3
 
-    # Resolutions and their log values (all 4)
-    N_values = np.array([N1, N2, N3, N4])
+    # Resolutions and their log values (all 3)
+    N_values = np.array([N1, N2, N3])
     log_N = np.log10(N_values)
 
     # Select representative times for the plot
@@ -698,18 +710,16 @@ Examples:
         # Get density profiles at this time (all at nearest snapshots)
         rho1 = rho1_list[idx_t]
         rho2 = rho2_list[idx_t]
-        rho3 = rho3_list[idx_t]
-        rho4 = rho4_list[idx_t]  # Highest resolution as reference
+        rho3 = rho3_list[idx_t]  # Highest resolution as reference
 
-        # Compute errors vs reference resolution (N4=1600)
-        e1 = compute_L1_error_discrete(r1, rho1, r4, rho4, r_max=R_star)
-        e2 = compute_L1_error_discrete(r2, rho2, r4, rho4, r_max=R_star)
-        e3 = compute_L1_error_discrete(r3, rho3, r4, rho4, r_max=R_star)
+        # Compute errors vs reference resolution (N3)
+        e1 = compute_L1_error_discrete(r1, rho1, r3, rho3, r_max=R_star)
+        e2 = compute_L1_error_discrete(r2, rho2, r3, rho3, r_max=R_star)
 
-        # Use all three lower resolutions for fitting (vs N4)
-        errors = np.array([e1, e2, e3])
+        # Use the two lower resolutions for fitting (vs N3)
+        errors = np.array([e1, e2])
         log_errors = np.log10(errors)
-        log_N_fit = log_N[:3]
+        log_N_fit = log_N[:2]
 
         # Linear fit to get convergence order
         slope, intercept = np.polyfit(log_N_fit, log_errors, 1)
@@ -720,13 +730,13 @@ Examples:
                    label=f't={actual_t:.0f}, order = {order:.2f}', zorder=5)
 
         # Plot fit line
-        log_N_line = np.linspace(log_N[0] - 0.1, log_N[2] + 0.1, 50)
+        log_N_line = np.linspace(log_N[0] - 0.1, log_N[1] + 0.1, 50)
         log_error_line = slope * log_N_line + intercept
         ax3_left.plot(log_N_line, log_error_line, '-', color=color, alpha=0.5, lw=1.5)
 
     ax3_left.set_xlabel(r'$\log_{10}(N)$', fontsize=12)
     ax3_left.set_ylabel(r'$\log_{10}(\Delta \rho)$', fontsize=12)
-    ax3_left.set_title(rf'(a) Convergence: $\Delta\rho$ vs Resolution (ref: {res4})', fontsize=11)
+    ax3_left.set_title(rf'(a) Convergence: $\Delta\rho$ vs Resolution (ref: {res3})', fontsize=11)
     ax3_left.legend(fontsize=8, loc='upper right')
     ax3_left.grid(True, alpha=0.3)
 
@@ -739,7 +749,6 @@ Examples:
     rho_initial_1 = rho1_list[0]
     rho_initial_2 = rho2_list[0]
     rho_initial_3 = rho3_list[0]
-    rho_initial_4 = rho4_list[0]
     initial_time = common_times[0]
 
     # Get final profiles (last snapshot up to t_max)
@@ -750,7 +759,6 @@ Examples:
     rho_final_1 = rho1_list[-1]
     rho_final_2 = rho2_list[-1]
     rho_final_3 = rho3_list[-1]
-    rho_final_4 = rho4_list[-1]
 
     # Plot initial profiles (dashed)
     ax3_right.semilogy(r1, rho_initial_1, label=f'{res1} (initial)', color=COLORS[0],
@@ -759,14 +767,11 @@ Examples:
                        linewidth=1.5, linestyle='--', alpha=0.7)
     ax3_right.semilogy(r3, rho_initial_3, label=f'{res3} (initial)', color=COLORS[2],
                        linewidth=1.5, linestyle='--', alpha=0.7)
-    ax3_right.semilogy(r4, rho_initial_4, label=f'{res4} (initial)', color=COLORS[3],
-                       linewidth=1.5, linestyle='--', alpha=0.7)
 
     # Plot final profiles (solid)
     ax3_right.semilogy(r1, rho_final_1, label=f'{res1} (final)', color=COLORS[0], linewidth=1.8)
     ax3_right.semilogy(r2, rho_final_2, label=f'{res2} (final)', color=COLORS[1], linewidth=1.8)
     ax3_right.semilogy(r3, rho_final_3, label=f'{res3} (final)', color=COLORS[2], linewidth=1.8)
-    ax3_right.semilogy(r4, rho_final_4, label=f'{res4} (final)', color=COLORS[3], linewidth=1.8)
 
     # Plot analytical TOV solution
     if has_analytical:
@@ -811,7 +816,6 @@ Examples:
     diff_1_L1, diff_1_max, diff_1_central = compute_profile_difference(r1, rho_initial_1, rho_final_1, R_star)
     diff_2_L1, diff_2_max, diff_2_central = compute_profile_difference(r2, rho_initial_2, rho_final_2, R_star)
     diff_3_L1, diff_3_max, diff_3_central = compute_profile_difference(r3, rho_initial_3, rho_final_3, R_star)
-    diff_4_L1, diff_4_max, diff_4_central = compute_profile_difference(r4, rho_initial_4, rho_final_4, R_star)
 
     print(f"\n{'='*70}")
     print(f"PROFILE DIFFERENCES: Initial (t={initial_time:.1f}) vs Final (t={final_time:.1f})")
@@ -826,15 +830,10 @@ Examples:
     print(f"    Max difference (interior): {diff_2_max:.6e}")
     print(f"    Central density change:    {diff_2_central:.6e}")
 
-    print(f"\n  Resolution: {res3}")
+    print(f"\n  Resolution: {res3} (reference)")
     print(f"    L1 difference (interior):  {diff_3_L1:.6e}")
     print(f"    Max difference (interior): {diff_3_max:.6e}")
     print(f"    Central density change:    {diff_3_central:.6e}")
-
-    print(f"\n  Resolution: {res4} (reference)")
-    print(f"    L1 difference (interior):  {diff_4_L1:.6e}")
-    print(f"    Max difference (interior): {diff_4_max:.6e}")
-    print(f"    Central density change:    {diff_4_central:.6e}")
     print(f"\n{'='*70}\n")
 
     # =========================================================
@@ -863,8 +862,6 @@ Examples:
             r2, rho_final_2, r_tov_analytic, rho_tov_analytic, R_star)
         err_3_L1, err_3_max, err_3_central = compute_error_vs_analytical(
             r3, rho_final_3, r_tov_analytic, rho_tov_analytic, R_star)
-        err_4_L1, err_4_max, err_4_central = compute_error_vs_analytical(
-            r4, rho_final_4, r_tov_analytic, rho_tov_analytic, R_star)
 
         print(f"\n  Resolution: {res1}")
         print(f"    L1 error (interior):       {err_1_L1:.6e}")
@@ -876,15 +873,10 @@ Examples:
         print(f"    Max error (interior):      {err_2_max:.6e}")
         print(f"    Central density error:     {err_2_central:.6e}")
 
-        print(f"\n  Resolution: {res3}")
+        print(f"\n  Resolution: {res3} (reference)")
         print(f"    L1 error (interior):       {err_3_L1:.6e}")
         print(f"    Max error (interior):      {err_3_max:.6e}")
         print(f"    Central density error:     {err_3_central:.6e}")
-
-        print(f"\n  Resolution: {res4} (reference)")
-        print(f"    L1 error (interior):       {err_4_L1:.6e}")
-        print(f"    Max error (interior):      {err_4_max:.6e}")
-        print(f"    Central density error:     {err_4_central:.6e}")
         print(f"\n{'='*70}\n")
 
     plt.tight_layout()
@@ -897,9 +889,6 @@ Examples:
     print("="*70)
 
     # Define a fixed physical position for central density measurement
-    # Use a small value that is well within all grids (> largest dr * 3)
-    # For r_max=100, N=1000: dr=0.1, so r[3]=0.3
-    # We choose r_fixed=0.5 to be safely within all resolutions
     r_fixed = 0.007  # Fixed physical position for all resolutions
 
     print(f"  Using fixed physical position: r_fixed = {r_fixed}")
@@ -907,7 +896,6 @@ Examples:
     print(f"    {res1}: r[3] = {r1[3]:.4f}")
     print(f"    {res2}: r[3] = {r2[3]:.4f}")
     print(f"    {res3}: r[3] = {r3[3]:.4f}")
-    print(f"    {res4}: r[3] = {r4[3]:.4f}")
 
     # Function to interpolate density profile to fixed physical position
     def get_rhoc_at_fixed_r(r_grid, rho_profile, r_fixed):
@@ -921,7 +909,6 @@ Examples:
     rhoc_1_native = np.array([get_rhoc_at_fixed_r(r1, rho, r_fixed) for rho in rho1_list_full])
     rhoc_2_native = np.array([get_rhoc_at_fixed_r(r2, rho, r_fixed) for rho in rho2_list_full])
     rhoc_3_native = np.array([get_rhoc_at_fixed_r(r3, rho, r_fixed) for rho in rho3_list_full])
-    rhoc_4_native = np.array([get_rhoc_at_fixed_r(r4, rho, r_fixed) for rho in rho4_list_full])
 
     # Interpolate central density to common times (temporal cubic interpolation)
     def interpolate_rhoc_in_time(times_source, rhoc_source, times_target):
@@ -934,36 +921,29 @@ Examples:
     rhoc_1 = interpolate_rhoc_in_time(t1, rhoc_1_native, common_times)
     rhoc_2 = interpolate_rhoc_in_time(t2, rhoc_2_native, common_times)
     rhoc_3 = interpolate_rhoc_in_time(t3, rhoc_3_native, common_times)
-    rhoc_4 = interpolate_rhoc_in_time(t4, rhoc_4_native, common_times)
 
     print(f"  Central density at r={r_fixed} interpolated for {len(common_times)} time points")
-    print(f"  ρ(r={r_fixed}, t=0): {res1}={rhoc_1[0]:.6e}, {res2}={rhoc_2[0]:.6e}, {res3}={rhoc_3[0]:.6e}, {res4}={rhoc_4[0]:.6e}")
+    print(f"  ρ(r={r_fixed}, t=0): {res1}={rhoc_1[0]:.6e}, {res2}={rhoc_2[0]:.6e}, {res3}={rhoc_3[0]:.6e}")
 
     # Compute central density errors (consecutive pairs)
     E12_rhoc = np.abs(rhoc_1 - rhoc_2)
     E23_rhoc = np.abs(rhoc_2 - rhoc_3)
-    E34_rhoc = np.abs(rhoc_3 - rhoc_4)
 
-    # Paper method: compare against highest resolution (N4)
-    E1_rhoc_paper = np.abs(rhoc_1 - rhoc_4)
-    E2_rhoc_paper = np.abs(rhoc_2 - rhoc_4)
-    E3_rhoc_paper = np.abs(rhoc_3 - rhoc_4)
+    # Paper method: compare against highest resolution (N3)
+    E1_rhoc_paper = np.abs(rhoc_1 - rhoc_3)
+    E2_rhoc_paper = np.abs(rhoc_2 - rhoc_3)
 
     # Compute convergence orders for central density
     with np.errstate(divide='ignore', invalid='ignore'):
         # Consecutive pairs method
         p12_rhoc = np.log(E12_rhoc / E23_rhoc) / np.log(2.0)
-        p23_rhoc = np.log(E23_rhoc / E34_rhoc) / np.log(2.0)
 
         # Paper method
         p12_rhoc_paper = np.log(E1_rhoc_paper / E2_rhoc_paper) / np.log(2.0)
-        p23_rhoc_paper = np.log(E2_rhoc_paper / E3_rhoc_paper) / np.log(2.0)
 
     # Running averages
     p12_rhoc_avg = running_average(p12_rhoc, window=100)
-    p23_rhoc_avg = running_average(p23_rhoc, window=100)
     p12_rhoc_paper_avg = running_average(p12_rhoc_paper, window=100)
-    p23_rhoc_paper_avg = running_average(p23_rhoc_paper, window=100)
 
     # =========================================================
     # Figure 4: Central density evolution and errors (consecutive)
@@ -975,7 +955,6 @@ Examples:
     ax.plot(common_times, rhoc_1, label=res1, color=COLORS[0], linewidth=1.0)
     ax.plot(common_times, rhoc_2, label=res2, color=COLORS[1], linewidth=1.0)
     ax.plot(common_times, rhoc_3, label=res3, color=COLORS[2], linewidth=1.0)
-    ax.plot(common_times, rhoc_4, label=res4, color=COLORS[3], linewidth=1.0)
     ax.set_xlabel(r'$t$ [M$_\odot$]')
     ax.set_ylabel(r'$\rho_c$ (central density)')
     ax.set_title(r'(a) Central Density Evolution')
@@ -988,8 +967,6 @@ Examples:
                 color=COLORS[0], linewidth=1.2)
     ax.semilogy(common_times, smooth(E23_rhoc), label=rf'$|\rho_c^{{{res2}}} - \rho_c^{{{res3}}}|$',
                 color=COLORS[1], linewidth=1.2)
-    ax.semilogy(common_times, smooth(E34_rhoc), label=rf'$|\rho_c^{{{res3}}} - \rho_c^{{{res4}}}|$',
-                color=COLORS[2], linewidth=1.2)
     ax.set_xlabel(r'$t$ [M$_\odot$]')
     ax.set_ylabel(r'$|\Delta\rho_c|$')
     ax.set_title(r'(b) Central Density Errors (consecutive pairs)')
@@ -999,11 +976,8 @@ Examples:
     ax = axes4[1, 0]
     with np.errstate(divide='ignore', invalid='ignore'):
         ratio12_rhoc = E12_rhoc / E23_rhoc
-        ratio23_rhoc = E23_rhoc / E34_rhoc
     ax.plot(common_times, smooth(ratio12_rhoc), label='$E_{12}/E_{23}$',
             color=COLORS[0], linewidth=1.2)
-    ax.plot(common_times, smooth(ratio23_rhoc), label='$E_{23}/E_{34}$',
-            color=COLORS[1], linewidth=1.2)
     ax.axhline(4, ls='--', color='gray', label='Ratio=4 (2nd order)')
     ax.axhline(8, ls=':', color='gray', label='Ratio=8 (3rd order)')
     ax.set_xlabel(r'$t$ [M$_\odot$]')
@@ -1017,9 +991,6 @@ Examples:
     ax.plot(common_times[valid], p12_rhoc[valid], color=COLORS[0], alpha=0.3, lw=0.6)
     ax.plot(common_times[valid], p12_rhoc_avg[valid], color=COLORS[0], lw=2.0,
             label=f'p(N{N1},N{N2})')
-    ax.plot(common_times[valid], p23_rhoc[valid], color=COLORS[1], alpha=0.3, lw=0.6)
-    ax.plot(common_times[valid], p23_rhoc_avg[valid], color=COLORS[1], lw=2.0,
-            label=f'p(N{N2},N{N3})')
     ax.axhline(2, ls='--', color='gray', label='2nd order')
     ax.axhline(3, ls=':', color='gray', label='3rd order')
     ax.axhline(5, ls='-.', color='gray', label='5th order')
@@ -1043,7 +1014,6 @@ Examples:
     ax.plot(common_times, rhoc_1, label=res1, color=COLORS[0], linewidth=1.0)
     ax.plot(common_times, rhoc_2, label=res2, color=COLORS[1], linewidth=1.0)
     ax.plot(common_times, rhoc_3, label=res3, color=COLORS[2], linewidth=1.0)
-    ax.plot(common_times, rhoc_4, label=res4, color=COLORS[3], linewidth=1.0)
     ax.set_xlabel(r'$t$ [M$_\odot$]')
     ax.set_ylabel(r'$\rho_c$ (central density)')
     ax.set_title(r'(a) Central Density Evolution')
@@ -1052,26 +1022,21 @@ Examples:
 
     # Plot 5b: Paper method errors (vs highest resolution)
     ax = axes5[0, 1]
-    ax.semilogy(common_times, smooth(E1_rhoc_paper), label=rf'$|\rho_c^{{{res1}}} - \rho_c^{{{res4}}}|$',
+    ax.semilogy(common_times, smooth(E1_rhoc_paper), label=rf'$|\rho_c^{{{res1}}} - \rho_c^{{{res3}}}|$',
                 color=COLORS[0], linewidth=1.2)
-    ax.semilogy(common_times, smooth(E2_rhoc_paper), label=rf'$|\rho_c^{{{res2}}} - \rho_c^{{{res4}}}|$',
+    ax.semilogy(common_times, smooth(E2_rhoc_paper), label=rf'$|\rho_c^{{{res2}}} - \rho_c^{{{res3}}}|$',
                 color=COLORS[1], linewidth=1.2)
-    ax.semilogy(common_times, smooth(E3_rhoc_paper), label=rf'$|\rho_c^{{{res3}}} - \rho_c^{{{res4}}}|$',
-                color=COLORS[2], linewidth=1.2)
     ax.set_xlabel(r'$t$ [M$_\odot$]')
     ax.set_ylabel(r'$|\Delta\rho_c|$')
-    ax.set_title(rf'(b) Error vs Highest Resolution ({res4})')
+    ax.set_title(rf'(b) Error vs Highest Resolution ({res3})')
     ax.legend(fontsize=8)
 
     # Plot 5c: Error ratios (paper method)
     ax = axes5[1, 0]
     with np.errstate(divide='ignore', invalid='ignore'):
         ratio12_rhoc_paper = E1_rhoc_paper / E2_rhoc_paper
-        ratio23_rhoc_paper = E2_rhoc_paper / E3_rhoc_paper
     ax.plot(common_times, smooth(ratio12_rhoc_paper), label='$E_1/E_2$',
             color=COLORS[0], linewidth=1.2)
-    ax.plot(common_times, smooth(ratio23_rhoc_paper), label='$E_2/E_3$',
-            color=COLORS[1], linewidth=1.2)
     ax.axhline(2, ls='--', color='gray', label='Ratio=2 (1st order)')
     ax.axhline(4, ls=':', color='gray', label='Ratio=4 (2nd order)')
     ax.set_xlabel(r'$t$ [M$_\odot$]')
@@ -1085,9 +1050,6 @@ Examples:
     ax.plot(common_times[valid], p12_rhoc_paper[valid], color=COLORS[0], alpha=0.3, lw=0.6)
     ax.plot(common_times[valid], p12_rhoc_paper_avg[valid], color=COLORS[0], lw=2.0,
             label=f'p(N{N1},N{N2})')
-    ax.plot(common_times[valid], p23_rhoc_paper[valid], color=COLORS[1], alpha=0.3, lw=0.6)
-    ax.plot(common_times[valid], p23_rhoc_paper_avg[valid], color=COLORS[1], lw=2.0,
-            label=f'p(N{N2},N{N3})')
     ax.axhline(1, ls='--', color='gray', label='1st order')
     ax.axhline(2, ls=':', color='gray', label='2nd order')
     ax.axhline(3, ls='-.', color='gray', label='3rd order')
@@ -1098,7 +1060,7 @@ Examples:
     ax.set_title(r'(d) Convergence Order $p(t)$')
     ax.legend(fontsize=8, loc='upper right')
 
-    fig5.suptitle(rf'Central Density - Paper Method: $|\rho_c - \bar{{\rho}}_c|$ where $\bar{{\rho}}_c$ = {res4}', fontsize=12, y=1.02)
+    fig5.suptitle(rf'Central Density - Paper Method: $|\rho_c - \bar{{\rho}}_c|$ where $\bar{{\rho}}_c$ = {res3}', fontsize=12, y=1.02)
     fig5.tight_layout()
 
     # =========================================================
@@ -1117,13 +1079,13 @@ Examples:
         actual_t = common_times[idx_t]
 
         # Get central density at this time
-        rhoc_at_t = np.array([rhoc_1[idx_t], rhoc_2[idx_t], rhoc_3[idx_t]])
-        rhoc_ref = rhoc_4[idx_t]  # Reference (highest resolution)
+        rhoc_at_t = np.array([rhoc_1[idx_t], rhoc_2[idx_t]])
+        rhoc_ref = rhoc_3[idx_t]  # Reference (highest resolution)
 
         # Compute errors vs reference
         errors_rhoc = np.abs(rhoc_at_t - rhoc_ref)
         log_errors_rhoc = np.log10(errors_rhoc + 1e-20)  # Avoid log(0)
-        log_N_fit = log_N[:3]
+        log_N_fit = log_N[:2]
 
         # Linear fit to get convergence order
         # Filter out any -inf values
@@ -1137,13 +1099,13 @@ Examples:
                              label=f't={actual_t:.0f}, order = {order_rhoc:.2f}', zorder=5)
 
             # Plot fit line
-            log_N_line = np.linspace(log_N[0] - 0.1, log_N[2] + 0.1, 50)
+            log_N_line = np.linspace(log_N[0] - 0.1, log_N[1] + 0.1, 50)
             log_error_line = slope_rhoc * log_N_line + intercept_rhoc
             ax6_left.plot(log_N_line, log_error_line, '-', color=color, alpha=0.5, lw=1.5)
 
     ax6_left.set_xlabel(r'$\log_{10}(N)$', fontsize=12)
     ax6_left.set_ylabel(r'$\log_{10}(|\Delta \rho_c|)$', fontsize=12)
-    ax6_left.set_title(rf'(a) Central Density Convergence (ref: {res4})', fontsize=11)
+    ax6_left.set_title(rf'(a) Central Density Convergence (ref: {res3})', fontsize=11)
     ax6_left.legend(fontsize=8, loc='upper right')
     ax6_left.grid(True, alpha=0.3)
 
@@ -1151,7 +1113,6 @@ Examples:
     ax6_right.plot(common_times, rhoc_1, label=res1, color=COLORS[0], linewidth=1.2)
     ax6_right.plot(common_times, rhoc_2, label=res2, color=COLORS[1], linewidth=1.2)
     ax6_right.plot(common_times, rhoc_3, label=res3, color=COLORS[2], linewidth=1.2)
-    ax6_right.plot(common_times, rhoc_4, label=res4, color=COLORS[3], linewidth=1.2)
 
     ax6_right.set_xlabel(r'$t$ [M$_\odot$]', fontsize=12)
     ax6_right.set_ylabel(r'$\rho_c$ (central density)', fontsize=12)
@@ -1172,14 +1133,12 @@ Examples:
     rel_err_1 = np.abs(rhoc_1 - rhoc_1[0]) / rhoc_1[0]
     rel_err_2 = np.abs(rhoc_2 - rhoc_2[0]) / rhoc_2[0]
     rel_err_3 = np.abs(rhoc_3 - rhoc_3[0]) / rhoc_3[0]
-    rel_err_4 = np.abs(rhoc_4 - rhoc_4[0]) / rhoc_4[0]
 
     # Plot 7a: Relative error vs initial
     ax = axes7[0, 0]
     ax.semilogy(common_times, smooth(rel_err_1), label=res1, color=COLORS[0], linewidth=1.2)
     ax.semilogy(common_times, smooth(rel_err_2), label=res2, color=COLORS[1], linewidth=1.2)
     ax.semilogy(common_times, smooth(rel_err_3), label=res3, color=COLORS[2], linewidth=1.2)
-    ax.semilogy(common_times, smooth(rel_err_4), label=res4, color=COLORS[3], linewidth=1.2)
     ax.set_xlabel(r'$t$ [M$_\odot$]')
     ax.set_ylabel(r'$|\rho_c - \rho_c^{0}|/\rho_c^{0}$')
     ax.set_title(r'(a) Relative Error vs Initial $\rho_c$')
@@ -1190,11 +1149,9 @@ Examples:
     delta_rhoc_1 = (rhoc_1 - rhoc_1[0]) / rhoc_1[0]
     delta_rhoc_2 = (rhoc_2 - rhoc_2[0]) / rhoc_2[0]
     delta_rhoc_3 = (rhoc_3 - rhoc_3[0]) / rhoc_3[0]
-    delta_rhoc_4 = (rhoc_4 - rhoc_4[0]) / rhoc_4[0]
     ax.plot(common_times, delta_rhoc_1, label=res1, color=COLORS[0], linewidth=1.0)
     ax.plot(common_times, delta_rhoc_2, label=res2, color=COLORS[1], linewidth=1.0)
     ax.plot(common_times, delta_rhoc_3, label=res3, color=COLORS[2], linewidth=1.0)
-    ax.plot(common_times, delta_rhoc_4, label=res4, color=COLORS[3], linewidth=1.0)
     ax.axhline(0, color='gray', linestyle='--', linewidth=0.8)
     ax.set_xlabel(r'$t$ [M$_\odot$]')
     ax.set_ylabel(r'$(\rho_c - \rho_c^0)/\rho_c^0$')
@@ -1210,42 +1167,94 @@ Examples:
         osc_amp_1 = maximum_filter1d(rhoc_1, window_size) - minimum_filter1d(rhoc_1, window_size)
         osc_amp_2 = maximum_filter1d(rhoc_2, window_size) - minimum_filter1d(rhoc_2, window_size)
         osc_amp_3 = maximum_filter1d(rhoc_3, window_size) - minimum_filter1d(rhoc_3, window_size)
-        osc_amp_4 = maximum_filter1d(rhoc_4, window_size) - minimum_filter1d(rhoc_4, window_size)
         ax.semilogy(common_times, osc_amp_1, label=res1, color=COLORS[0], linewidth=1.0)
         ax.semilogy(common_times, osc_amp_2, label=res2, color=COLORS[1], linewidth=1.0)
         ax.semilogy(common_times, osc_amp_3, label=res3, color=COLORS[2], linewidth=1.0)
-        ax.semilogy(common_times, osc_amp_4, label=res4, color=COLORS[3], linewidth=1.0)
     ax.set_xlabel(r'$t$ [M$_\odot$]')
     ax.set_ylabel(r'$\Delta\rho_c$ (oscillation amplitude)')
     ax.set_title(rf'(c) Oscillation Amplitude (window={window_size})')
     ax.legend(fontsize=8)
 
     # Plot 7d: QNM Power spectrum of central density oscillations (in kHz)
+    # Loads rho_central from timeseries.npz (high cadence), matching plot_qnm_analysis.py exactly
     ax = axes7[1, 1]
 
-    # Compute power spectra using QNM analysis functions
-    freq_khz_1, power_1 = compute_qnm_power_spectrum(common_times, rhoc_1)
-    freq_khz_2, power_2 = compute_qnm_power_spectrum(common_times, rhoc_2)
-    freq_khz_3, power_3 = compute_qnm_power_spectrum(common_times, rhoc_3)
-    freq_khz_4, power_4 = compute_qnm_power_spectrum(common_times, rhoc_4)
+    # Load native high-cadence timeseries data for each resolution
+    print(f"\n  Loading timeseries.npz for QNM analysis (delta_t={QNM_DELTA_T})...")
+    qnm_data = {}
+    for label, folder_path in folders_dict.items():
+        t_qnm, rho_qnm = load_timeseries_for_qnm(folder_path, delta_t=QNM_DELTA_T)
+        qnm_data[label] = (t_qnm, rho_qnm)
+        print(f"    {label}: {len(t_qnm)} points, dt={np.mean(np.diff(t_qnm)):.2f}")
 
-    # Plot power spectra for all 4 resolutions
+    # Compute power spectra using relative change and t_start cutoff
+    # (exactly as in plot_qnm_analysis.py: analyze_and_plot -> compute_power_spectrum)
+    t_qnm_1, rho_qnm_1 = qnm_data[res1]
+    t_qnm_2, rho_qnm_2 = qnm_data[res2]
+    t_qnm_3, rho_qnm_3 = qnm_data[res3]
+
+    freq_khz_1, power_1 = compute_qnm_power_spectrum(t_qnm_1, rho_qnm_1, t_start=QNM_T_START)
+    freq_khz_2, power_2 = compute_qnm_power_spectrum(t_qnm_2, rho_qnm_2, t_start=QNM_T_START)
+    freq_khz_3, power_3 = compute_qnm_power_spectrum(t_qnm_3, rho_qnm_3, t_start=QNM_T_START)
+
+    # Plot power spectra for all 3 resolutions
     ax.semilogy(freq_khz_1, power_1, label=res1, color=COLORS[0], linewidth=1.0, alpha=0.8)
     ax.semilogy(freq_khz_2, power_2, label=res2, color=COLORS[1], linewidth=1.0, alpha=0.8)
-    ax.semilogy(freq_khz_3, power_3, label=res3, color=COLORS[2], linewidth=1.0, alpha=0.8)
-    ax.semilogy(freq_khz_4, power_4, label=res4, color=COLORS[3], linewidth=1.0, alpha=0.8)
+    ax.semilogy(freq_khz_3, power_3, label=res3, color=COLORS[2], linewidth=1.2)
 
-    # Plot theoretical QNM frequencies (first 4 modes: F, H1, H2, H3)
-    for mode, f_theo in FREQUENCIES_COWLING_KHZ.items():
-        ax.axvline(f_theo, color='gray', linestyle='--', linewidth=1, alpha=0.6)
-        ax.text(f_theo, ax.get_ylim()[1] if ax.get_ylim()[1] > 0 else 1e-2,
-                mode, ha='center', va='bottom', fontsize=9, color='gray', alpha=0.8)
+    # Detect peaks on highest resolution spectrum
+    peak_freqs, peak_powers = find_qnm_peaks(freq_khz_3, power_3)
+
+    # Plot detected peaks (blue dots with frequency labels, like plot_qnm_analysis.py)
+    for f, p in zip(peak_freqs, peak_powers):
+        if f < 14:
+            ax.plot(f, p, 'bo', markersize=6, markeredgecolor='darkblue',
+                    markeredgewidth=1.2, markerfacecolor='dodgerblue', zorder=5)
+            ax.annotate(f'{f:.3f}', xy=(f, p), xytext=(0, 8),
+                        textcoords='offset points', ha='center', fontsize=7,
+                        fontweight='bold', color='blue')
+
+    # Plot theoretical QNM frequencies (dynamic mode)
+    for mode, f_theo in FREQUENCIES_KHZ.items():
+        if f_theo < 14:
+            ax.axvline(f_theo, color='gray', linestyle='--', linewidth=1, alpha=0.5)
+            ax.text(f_theo, ax.get_ylim()[1] if ax.get_ylim()[1] > 0 else 1e-2,
+                    mode, ha='center', va='bottom', fontsize=9, color='gray', alpha=0.7)
 
     ax.set_xlabel(r'Frequency [kHz]')
     ax.set_ylabel(r'Power')
-    ax.set_title(r'(d) QNM Power Spectrum (F, H1, H2, H3 modes)')
+    ax.set_title(r'(d) QNM Power Spectrum (dynamic modes)')
     ax.legend(fontsize=8, loc='upper right')
-    ax.set_xlim(0, 10)  # Focus on first 4 modes (F to H3)
+    ax.set_xlim(0, 12)
+    ax.grid(True, linestyle=':', alpha=0.3)
+
+    # Set y-limits based on valid power range (like plot_qnm_analysis.py)
+    valid_freq = (freq_khz_3 > 0.5) & (freq_khz_3 < 14)
+    if np.any(valid_freq):
+        pv = power_3[valid_freq]
+        ax.set_ylim(np.min(pv[pv > 0]) * 0.1, np.max(pv) * 10)
+
+    # Print detected peaks vs theoretical table
+    print(f"\n{'='*70}")
+    print(f"QNM PEAK DETECTION (highest resolution: {res3})")
+    print(f"{'='*70}")
+    print(f"  t_start = {QNM_T_START:.1f} M_sun, delta_t = {QNM_DELTA_T}")
+    print(f"\n  {'Mode':<8} {'Theo [kHz]':<12} {'Obtained [kHz]':<15} {'Error [%]':<12}")
+    print(f"  {'-'*50}")
+    for mode, f_theo in FREQUENCIES_KHZ.items():
+        if len(peak_freqs) == 0:
+            print(f"  {mode:<8} {f_theo:<12.3f} {'N/A':<15} {'N/A':<12}")
+        else:
+            distances = np.abs(peak_freqs - f_theo)
+            closest_idx = np.argmin(distances)
+            closest_freq = peak_freqs[closest_idx]
+            tolerance = 0.15 * f_theo
+            if distances[closest_idx] <= tolerance:
+                yerror = 100.0 * (closest_freq - f_theo) / f_theo
+                print(f"  {mode:<8} {f_theo:<12.3f} {closest_freq:<15.3f} {yerror:<12.2f}")
+            else:
+                print(f"  {mode:<8} {f_theo:<12.3f} {'N/A':<15} {'N/A':<12}")
+    print(f"{'='*70}\n")
 
     fig7.suptitle(r'Central Density: Relative Errors and Oscillation Analysis', fontsize=12, y=1.02)
     fig7.tight_layout()
@@ -1293,18 +1302,14 @@ Examples:
     print(f"Stellar radius: R_star = {R_star:.3f}")
     print(f"Domain extent:  r_max  = {r1.max():.3f}")
 
-    # Helper function to print stats for a given dataset with 4 resolutions
-    def print_convergence_stats(p12_data, p23_data, E12_data, E23_data, E34_data, label):
+    # Helper function to print stats for a given dataset with 3 resolutions
+    def print_convergence_stats(p12_data, E12_data, E23_data, label):
         p12_valid_data = p12_data[valid_mask]
-        p23_valid_data = p23_data[valid_mask]
         E12_valid_data = E12_data[valid_mask]
         E23_valid_data = E23_data[valid_mask]
-        E34_valid_data = E34_data[valid_mask]
 
         finite_mask_12 = np.isfinite(p12_valid_data)
-        finite_mask_23 = np.isfinite(p23_valid_data)
         p12_finite = p12_valid_data[finite_mask_12]
-        p23_finite = p23_valid_data[finite_mask_23]
 
         print(f"\n{'─'*70}")
         print(f"  {label}")
@@ -1313,40 +1318,33 @@ Examples:
         print(f"\n  L1 Error Statistics:")
         print(f"    E({res1}, {res2}): mean = {np.mean(E12_valid_data):.3e}, max = {np.max(E12_valid_data):.3e}")
         print(f"    E({res2}, {res3}): mean = {np.mean(E23_valid_data):.3e}, max = {np.max(E23_valid_data):.3e}")
-        print(f"    E({res3}, {res4}): mean = {np.mean(E34_valid_data):.3e}, max = {np.max(E34_valid_data):.3e}")
         ratio12_23 = np.mean(E12_valid_data) / np.mean(E23_valid_data) if np.mean(E23_valid_data) > 0 else np.nan
-        ratio23_34 = np.mean(E23_valid_data) / np.mean(E34_valid_data) if np.mean(E34_valid_data) > 0 else np.nan
         print(f"    Mean error ratio E12/E23: {ratio12_23:.2f}")
-        print(f"    Mean error ratio E23/E34: {ratio23_34:.2f}")
         print(f"      (expected ~4 for 2nd order, ~8 for 3rd order, ~32 for 5th order)")
 
         print(f"\n  Convergence Order p(t):")
         print(f"    p(N{N1},N{N2}): Mean = {np.mean(p12_finite):.2f}, Median = {np.median(p12_finite):.2f}, Std = {np.std(p12_finite):.2f}")
-        print(f"    p(N{N2},N{N3}): Mean = {np.mean(p23_finite):.2f}, Median = {np.median(p23_finite):.2f}, Std = {np.std(p23_finite):.2f}")
 
         # Convergence by time interval
         intervals = [(50, 250), (250, 500), (500, 750), (750, 1000)]
         print(f"\n  Convergence by Time Interval:")
         for t_start, t_end in intervals:
             mask_interval_12 = (t_valid >= t_start) & (t_valid < t_end) & np.isfinite(p12_valid_data)
-            mask_interval_23 = (t_valid >= t_start) & (t_valid < t_end) & np.isfinite(p23_valid_data)
             if np.sum(mask_interval_12) > 0:
                 p12_interval = p12_valid_data[mask_interval_12]
-                p23_interval = p23_valid_data[mask_interval_23]
-                print(f"    t=[{t_start:4d}, {t_end:4d}]: p12 = {np.mean(p12_interval):.2f}±{np.std(p12_interval):.2f}, " +
-                      f"p23 = {np.mean(p23_interval):.2f}±{np.std(p23_interval):.2f}")
+                print(f"    t=[{t_start:4d}, {t_end:4d}]: p12 = {np.mean(p12_interval):.2f}±{np.std(p12_interval):.2f}")
 
     # Print stats for all methods
-    print_convergence_stats(p12_disc, p23_disc, E12_disc, E23_disc, E34_disc,
+    print_convergence_stats(p12_disc, E12_disc, E23_disc,
                            f"DISCRETE L1 - INTERIOR (r ≤ {R_star:.1f})")
-    print_convergence_stats(p12_paper, p23_paper, E1_paper, E2_paper, E3_paper,
-                           f"PAPER METHOD - vs {res4} (r ≤ {R_star:.1f})")
+    print_convergence_stats(p12_paper, E1_paper, E2_paper,
+                           f"PAPER METHOD - vs {res3} (r ≤ {R_star:.1f})")
 
     # Central density statistics
-    print_convergence_stats(p12_rhoc, p23_rhoc, E12_rhoc, E23_rhoc, E34_rhoc,
+    print_convergence_stats(p12_rhoc, E12_rhoc, E23_rhoc,
                            "CENTRAL DENSITY - CONSECUTIVE PAIRS")
-    print_convergence_stats(p12_rhoc_paper, p23_rhoc_paper, E1_rhoc_paper, E2_rhoc_paper, E3_rhoc_paper,
-                           f"CENTRAL DENSITY - PAPER METHOD vs {res4}")
+    print_convergence_stats(p12_rhoc_paper, E1_rhoc_paper, E2_rhoc_paper,
+                           f"CENTRAL DENSITY - PAPER METHOD vs {res3}")
 
     # Print central density summary
     print(f"\n{'─'*70}")
@@ -1356,17 +1354,14 @@ Examples:
     print(f"    {res1}: ρ_c(0) = {rhoc_1[0]:.6e}")
     print(f"    {res2}: ρ_c(0) = {rhoc_2[0]:.6e}")
     print(f"    {res3}: ρ_c(0) = {rhoc_3[0]:.6e}")
-    print(f"    {res4}: ρ_c(0) = {rhoc_4[0]:.6e}")
     print(f"\n  Final values (t={common_times[-1]:.1f}):")
     print(f"    {res1}: ρ_c(t_f) = {rhoc_1[-1]:.6e}, Δρ_c/ρ_c = {(rhoc_1[-1]-rhoc_1[0])/rhoc_1[0]:.3e}")
     print(f"    {res2}: ρ_c(t_f) = {rhoc_2[-1]:.6e}, Δρ_c/ρ_c = {(rhoc_2[-1]-rhoc_2[0])/rhoc_2[0]:.3e}")
     print(f"    {res3}: ρ_c(t_f) = {rhoc_3[-1]:.6e}, Δρ_c/ρ_c = {(rhoc_3[-1]-rhoc_3[0])/rhoc_3[0]:.3e}")
-    print(f"    {res4}: ρ_c(t_f) = {rhoc_4[-1]:.6e}, Δρ_c/ρ_c = {(rhoc_4[-1]-rhoc_4[0])/rhoc_4[0]:.3e}")
     print(f"\n  Oscillation amplitude (max - min):")
     print(f"    {res1}: {np.max(rhoc_1) - np.min(rhoc_1):.6e}")
     print(f"    {res2}: {np.max(rhoc_2) - np.min(rhoc_2):.6e}")
     print(f"    {res3}: {np.max(rhoc_3) - np.min(rhoc_3):.6e}")
-    print(f"    {res4}: {np.max(rhoc_4) - np.min(rhoc_4):.6e}")
 
     print("\n" + "="*70 + "\n")
 
@@ -1387,33 +1382,29 @@ Examples:
 
     # Profile (L1 norm) convergence orders
     p12_disc_mean, p12_disc_std = compute_mean_order(p12_disc, valid_mask)
-    p23_disc_mean, p23_disc_std = compute_mean_order(p23_disc, valid_mask)
     p12_paper_mean, p12_paper_std = compute_mean_order(p12_paper, valid_mask)
-    p23_paper_mean, p23_paper_std = compute_mean_order(p23_paper, valid_mask)
 
     # Central density convergence orders
     p12_rhoc_mean, p12_rhoc_std = compute_mean_order(p12_rhoc, valid_mask)
-    p23_rhoc_mean, p23_rhoc_std = compute_mean_order(p23_rhoc, valid_mask)
     p12_rhoc_paper_mean, p12_rhoc_paper_std = compute_mean_order(p12_rhoc_paper, valid_mask)
-    p23_rhoc_paper_mean, p23_rhoc_paper_std = compute_mean_order(p23_rhoc_paper, valid_mask)
 
     print(f"""
 ┌─────────────────────────────────────────────────────────────────────┐
 │                    DENSITY PROFILE (L1 norm)                        │
 ├─────────────────────────────────────────────────────────────────────┤
-│  Method                        │  p(N{N1},N{N2})     │  p(N{N2},N{N3})     │
-├────────────────────────────────┼─────────────────┼─────────────────┤
-│  Richardson (consecutive)      │  {p12_disc_mean:5.2f} ± {p12_disc_std:4.2f}   │  {p23_disc_mean:5.2f} ± {p23_disc_std:4.2f}   │
-│  Paper method (vs {res4})     │  {p12_paper_mean:5.2f} ± {p12_paper_std:4.2f}   │  {p23_paper_mean:5.2f} ± {p23_paper_std:4.2f}   │
+│  Method                        │  p(N{N1},N{N2})                    │
+├────────────────────────────────┼─────────────────────────────────────┤
+│  Richardson (consecutive)      │  {p12_disc_mean:5.2f} ± {p12_disc_std:4.2f}                    │
+│  Paper method (vs {res3})     │  {p12_paper_mean:5.2f} ± {p12_paper_std:4.2f}                    │
 └─────────────────────────────────────────────────────────────────────┘
 
 ┌─────────────────────────────────────────────────────────────────────┐
 │                    CENTRAL DENSITY (ρ_c)                            │
 ├─────────────────────────────────────────────────────────────────────┤
-│  Method                        │  p(N{N1},N{N2})     │  p(N{N2},N{N3})     │
-├────────────────────────────────┼─────────────────┼─────────────────┤
-│  Richardson (consecutive)      │  {p12_rhoc_mean:5.2f} ± {p12_rhoc_std:4.2f}   │  {p23_rhoc_mean:5.2f} ± {p23_rhoc_std:4.2f}   │
-│  Paper method (vs {res4})     │  {p12_rhoc_paper_mean:5.2f} ± {p12_rhoc_paper_std:4.2f}   │  {p23_rhoc_paper_mean:5.2f} ± {p23_rhoc_paper_std:4.2f}   │
+│  Method                        │  p(N{N1},N{N2})                    │
+├────────────────────────────────┼─────────────────────────────────────┤
+│  Richardson (consecutive)      │  {p12_rhoc_mean:5.2f} ± {p12_rhoc_std:4.2f}                    │
+│  Paper method (vs {res3})     │  {p12_rhoc_paper_mean:5.2f} ± {p12_rhoc_paper_std:4.2f}                    │
 └─────────────────────────────────────────────────────────────────────┘
 
 Note: Expected order for 2nd order scheme: p ≈ 2

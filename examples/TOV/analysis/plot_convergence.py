@@ -11,18 +11,18 @@ import argparse
 from scipy.interpolate import interp1d
 
 # Resolutions - UPDATE THESE TO CHANGE RESOLUTIONS
-N_very_low = 1000
-N_low = 2000
-N_med = 4000
-N_high = 8000
+N_very_low = 500
+N_low = 1000
+N_med = 2000
+N_high = 4000
 #N_very_high = 800
 
 # Data paths - constructed from resolution values
 FOLDERS = {
-    f'N={N_very_low}': f'/home/davidbamba/repositories/engrenage/examples/TOV/tov_evolution_data_rmax100_TEST_long_domain_16/tov_star_rhoc1p28em03_N{N_very_low}_K100_G2_cow_mp5',
-    f'N={N_low}': f'/home/davidbamba/repositories/engrenage/examples/TOV/tov_evolution_data_rmax100_TEST_long_domain_16/tov_star_rhoc1p28em03_N{N_low}_K100_G2_cow_mp5',
-    f'N={N_med}': f'/home/davidbamba/repositories/engrenage/examples/TOV/tov_evolution_data_rmax100_TEST_long_domain_16/tov_star_rhoc1p28em03_N{N_med}_K100_G2_cow_mp5',
-    f'N={N_high}': f'/home/davidbamba/repositories/engrenage/examples/TOV/tov_evolution_data_rmax100_TEST_long_domain_16/tov_star_rhoc1p28em03_N{N_high}_K100_G2_cow_mp5',
+    f'N={N_very_low}': f'/home/davidbamba/repositories/engrenage/examples/TOV/tov_evolution_data_refact_rmax100.0_jax/tov_star_rhoc1p28em03_N{N_very_low}_K100_G2_dyn_mp5',
+    f'N={N_low}': f'/home/davidbamba/repositories/engrenage/examples/TOV/tov_evolution_data_refact_rmax100.0_jax/tov_star_rhoc1p28em03_N{N_low}_K100_G2_dyn_mp5',
+    f'N={N_med}': f'/home/davidbamba/repositories/engrenage/examples/TOV/tov_evolution_data_refact_rmax100.0_jax/tov_star_rhoc1p28em03_N{N_med}_K100_G2_dyn_mp5',
+    f'N={N_high}': f'/home/davidbamba/repositories/engrenage/examples/TOV/tov_evolution_data_refact_rmax100.0_jax/tov_star_rhoc1p28em03_N{N_high}_K100_G2_dyn_mp5',
 }
 # Resolution labels for convergence order calculation (uses first 3 resolutions)
 low_res = f'N={N_low}'
@@ -38,7 +38,7 @@ COLORS = ['#1f77b4', "#ff7f0e", '#2ca02c', "#d62728",
 # ============================================================
 
 def load_timeseries(folder_path):
-    h5_file = os.path.join(folder_path, 'tov_evolution_cow.h5')
+    h5_file = os.path.join(folder_path, 'tov_evolution_dyn_jax.h5')
     if os.path.exists(h5_file):
         with h5py.File(h5_file, 'r') as f:
             times = f['time'][:]
@@ -65,7 +65,7 @@ def load_snapshots(folder_path):
     Reads snapshots saved by engrenage.
     time is stored as an ATTRIBUTE of each snapshot group.
     """
-    h5_file = os.path.join(folder_path, 'tov_snapshots_cow.h5')
+    h5_file = os.path.join(folder_path, 'tov_snapshots_dyn_jax.h5')
 
     times = []
     rho_list = []
