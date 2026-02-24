@@ -1,24 +1,58 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Hydro-without-Hydro Test
+Hydro-without-Hydro Test with JAX Backend (Dynamic Mode)
 
 Evolves BSSN with static matter sources from TOV solution.
 The matter (hydro) variables are held fixed at the TOV equilibrium values,
 while BSSN variables evolve. This tests that the spacetime remains stable
 when sourced by a static perfect fluid.
 
-Uses the same infrastructure as TOVEvolution.py for consistency.
+Uses JAX backend with dynamic mode (full BSSN + hydro coupling) and
+boundary conditions from TOVEvolution.py.
 """
 
 import os
 import sys
 import numpy as np
-import matplotlib.pyplot as plt
+import time
 from pathlib import Path
-from scipy.interpolate import interp1d
+from functools import partial
 
-# Locate repo root
+os.environ['ENGRENAGE_BACKEND'] = 'jax'
+
+import jax
+jax.config.update("jax_enable_x64", True)
+import jax.numpy as jnp
+
+from source.core.grid import Grid
+from source.core.spacing import LinearSpacing, NUM_GHOSTS
+from source.core.statevector import StateVector
+from source.backgrounds.sphericalbackground import FlatSphericalBackground
+
+from source.bssn.bssnvars import BSSNVars
+from source.bssn.bssnstatevariables import (
+    NUM_BSSN_VARS,
+    BSSN_PARITY, BSSN_ASYMP_POWER, BSSN_ASYMP_OFFSET,
+    idx_phi, idx_hrr, idx_htt, idx_hpp,
+    idx_K, idx_arr, idx_att, idx_app,
+    idx_lambdar, idx_shiftr, idx_br, idx_lapse
+)
+
+from source.matter.hydro.perfect_fluid import PerfectFluid
+from source.matter.hydro.eos import IdealGasEOS
+from source.matter.hydro.reconstruction import create_reconstruction
+from source.matter.hydro.riemann import HLLRiemannSolver
+from source.matter.hydro.atmosphere import AtmosphereParams
+
+from source.bssn.jax.bssngeometry import build_bssn_background, build_derivative_stencils
+from source.bssn.jax.boundaries_jax import fill_bssn_boundaries_jax
+from source.core.rhsevolution_jax import get_rhs_bssn_hydro_jax, NUM_HYDRO_VARS, HYDRO_PARITY
+
+from examples.TOV.tov_solver import load_or_solve_tov_iso
+import examples.TOV.tov_initial_data_interpolated as tov_id
+
+
 def locate_repo_root(start: Path) -> Path:
     for cand in [start, *start.parents]:
         if (cand / 'source').is_dir():
@@ -30,196 +64,79 @@ REPO = locate_repo_root(THIS.parent)
 if str(REPO) not in sys.path:
     sys.path.insert(0, str(REPO))
 
-# Core imports
-from source.core.spacing import LinearSpacing, NUM_GHOSTS
-from source.core.grid import Grid
-from source.core.statevector import StateVector
-from source.core.rhsevolution import get_rhs
-from source.backgrounds.sphericalbackground import FlatSphericalBackground
 
-# BSSN
-from source.bssn.bssnvars import BSSNVars
-from source.bssn.bssnstatevariables import (
-    NUM_BSSN_VARS,
-    idx_phi, idx_hrr, idx_htt, idx_hpp,
-    idx_K, idx_arr, idx_att, idx_app,
-    idx_lambdar, idx_shiftr, idx_br, idx_lapse
-)
-
-# Hydro
-from source.matter.hydro.perfect_fluid import PerfectFluid
-from source.matter.hydro.eos import IdealGasEOS
-from source.matter.hydro.reconstruction import create_reconstruction
-from source.matter.hydro.riemann import HLLRiemannSolver
-from source.matter.hydro.atmosphere import AtmosphereParams
-
-# TOV modules (same as TOVEvolution.py)
-from examples.TOV.tov_solver import load_or_solve_tov_iso
-import examples.TOV.tov_initial_data_interpolated as tov_id
-
-
-class _DummyProgressBar:
-    """Dummy progress bar for RHS calls."""
-    def update(self, n):
-        pass
-
-
-def get_rhs_hwh(t, state_flat, grid, background, hydro, tov_solution, atmosphere):
+def get_rhs_hwh_jax(state, bssn_bg, deriv_stencils, dr_jax,
+                     NUM_GHOSTS, num_vars,
+                     sigma_base, eta,
+                     eos_type, Gamma, K,
+                     rho_floor, p_floor, v_max, W_max,
+                     recon_name, solver_method, max_iter, tol, dx_hydro,
+                     fix_shift):
     """
-    RHS for Hydro-without-Hydro evolution.
+    RHS for Hydro-without-Hydro in JAX dynamic mode.
 
     BSSN variables evolve normally, but hydro variables are reset to TOV
     equilibrium values after each RHS computation.
     """
-    state = state_flat.reshape((grid.NUM_VARS, grid.N))
-
-    # Reset matter to TOV equilibrium before computing RHS
-    state = _reset_matter_to_tov(state, grid, hydro, tov_solution, atmosphere)
-
-    # Compute full RHS
-    dummy_progress = _DummyProgressBar()
-    time_state = [0.0, 1.0]
-    rhs_flat = get_rhs(t, state.flatten(), grid, background, hydro, dummy_progress, time_state)
-    rhs = rhs_flat.reshape((grid.NUM_VARS, grid.N))
-
-    # Zero out hydro RHS (matter stays frozen at TOV)
-    rhs[NUM_BSSN_VARS:, :] = 0.0
-
-    return rhs.flatten()
+    rhs = get_rhs_bssn_hydro_jax(
+        state, bssn_bg, deriv_stencils, dr_jax,
+        NUM_GHOSTS, num_vars,
+        sigma_base, eta,
+        eos_type, Gamma, K,
+        rho_floor, p_floor, v_max, W_max,
+        recon_name, solver_method, max_iter, tol, dx_hydro,
+        "zero_gradient",
+        fix_shift=fix_shift
+    )
+    return rhs
 
 
-def _reset_matter_to_tov(state, grid, hydro, tov_solution, atmosphere):
-    """Reset hydro variables to TOV equilibrium values."""
-    r = grid.r
-
-    # Interpolate TOV solution
-    rho_interp = interp1d(tov_solution.r, tov_solution.rho_baryon,
-                          kind='cubic', bounds_error=False,
-                          fill_value=atmosphere.rho_floor)
-    p_interp = interp1d(tov_solution.r, tov_solution.P,
-                        kind='cubic', bounds_error=False,
-                        fill_value=atmosphere.p_floor)
-
-    rho0 = np.maximum(rho_interp(r), atmosphere.rho_floor)
-    pressure = np.maximum(p_interp(r), atmosphere.p_floor)
-    velocity = np.zeros_like(r)  # Static equilibrium
-
-    # Convert to conservatives (v=0 -> W=1)
-    eps = hydro.eos.eps_from_rho_p(rho0, pressure)
-    h = 1.0 + eps + pressure / np.maximum(rho0, 1e-300)
-    W = 1.0  # Static
-    D = rho0 * W
-    Sr = np.zeros_like(r)  # No momentum
-    tau = rho0 * h * W**2 - pressure - D
-
-    # Update state
-    state[hydro.idx_D, :] = D
-    state[hydro.idx_Sr, :] = Sr
-    state[hydro.idx_tau, :] = tau
-
-    return state
-
-
-def rk4_step_hwh(state_flat, dt, grid, background, hydro, tov_solution, atmosphere):
-    """
-    Single RK4 timestep for Hydro-without-Hydro evolution.
-
-    BSSN evolves, hydro stays frozen at TOV equilibrium.
-    """
-    # Stage 1
-    k1 = get_rhs_hwh(0, state_flat, grid, background, hydro, tov_solution, atmosphere)
-
-    # Stage 2
-    state_2 = state_flat + 0.5 * dt * k1
-    k2 = get_rhs_hwh(0, state_2, grid, background, hydro, tov_solution, atmosphere)
-
-    # Stage 3
-    state_3 = state_flat + 0.5 * dt * k2
-    k3 = get_rhs_hwh(0, state_3, grid, background, hydro, tov_solution, atmosphere)
-
-    # Stage 4
-    state_4 = state_flat + dt * k3
-    k4 = get_rhs_hwh(0, state_4, grid, background, hydro, tov_solution, atmosphere)
-
-    # Combine
-    state_new = state_flat + (dt / 6.0) * (k1 + 2*k2 + 2*k3 + k4)
-
-    # Ensure matter stays at TOV
-    snew = state_new.reshape((grid.NUM_VARS, grid.N))
-    snew = _reset_matter_to_tov(snew, grid, hydro, tov_solution, atmosphere)
-    grid.fill_boundaries(snew)
-
-    return snew.flatten()
-
-
-def run_hwh_test(
+def run_hwh_jax_test(
     K=100.0,
     Gamma=2.0,
     rho_central=1.28e-3,
     r_max=16.0,
-    num_points=100,
+    num_points=300,
     t_final=50.0,
     cfl=0.1,
     progress=True,
-    save_interval=50
+    save_interval=50,
+    RECONSTRUCTOR_NAME="wenoz",
+    SOLVER_METHOD="newton"
 ):
     """
-    Run Hydro-without-Hydro test.
-
-    Parameters
-    ----------
-    K : float
-        Polytropic constant
-    Gamma : float
-        Adiabatic index
-    rho_central : float
-        Central density
-    r_max : float
-        Outer boundary
-    num_points : int
-        Number of grid points
-    t_final : float
-        Final evolution time
-    cfl : float
-        CFL factor
-    progress : bool
-        Print progress
-    save_interval : int
-        Save snapshots every N steps
-
-    Returns
-    -------
-    dict
-        Results including time series and snapshots
+    Run Hydro-without-Hydro test with JAX backend (dynamic mode).
     """
     print("="*70)
-    print("HYDRO-WITHOUT-HYDRO TEST")
+    print("HYDRO-WITHOUT-HYDRO TEST - JAX DYNAMIC MODE")
     print("="*70)
     print(f"  K = {K}, Gamma = {Gamma}")
     print(f"  rho_central = {rho_central:.2e}")
     print(f"  Grid: N = {num_points}, r_max = {r_max}")
     print(f"  Evolution: t_final = {t_final}, CFL = {cfl}")
+    print(f"  Reconstructor: {RECONSTRUCTOR_NAME}")
+    print(f"  Solver: {SOLVER_METHOD}")
     print("="*70)
 
-    # Setup grid and EOS
     spacing = LinearSpacing(num_points, r_max)
     eos = IdealGasEOS(gamma=Gamma)
 
-    # Atmosphere
+    rho_floor_base = 1e-16
+    p_floor_base = K * (rho_floor_base)**Gamma
     atmosphere = AtmosphereParams(
-        rho_floor=1.0e-12,
-        p_floor=K * (1.0e-12)**Gamma,
+        rho_floor=rho_floor_base,
+        p_floor=p_floor_base,
         v_max=0.999,
         W_max=100.0
     )
 
-    # Hydro setup
     hydro = PerfectFluid(
         eos=eos,
         spacetime_mode="dynamic",
         atmosphere=atmosphere,
-        reconstructor=create_reconstruction("wenoz"),
-        riemann_solver=HLLRiemannSolver(atmosphere=atmosphere)
+        reconstructor=create_reconstruction(RECONSTRUCTOR_NAME),
+        riemann_solver=HLLRiemannSolver(atmosphere=atmosphere),
+        solver_method=SOLVER_METHOD
     )
 
     state_vector = StateVector(hydro)
@@ -228,8 +145,8 @@ def run_hwh_test(
     hydro.background = background
 
     print(f"\nGrid created: N = {grid.N}, dr_min = {grid.min_dr:.4f}")
+    print(f"JAX devices: {jax.devices()}")
 
-    # Solve TOV
     print("\nSolving TOV equations...")
     tov_solution = load_or_solve_tov_iso(
         K=K, Gamma=Gamma, rho_central=rho_central,
@@ -239,7 +156,6 @@ def run_hwh_test(
     print(f"  R_iso = {tov_solution.R_iso:.3f}")
     print(f"  C = {tov_solution.C:.4f}")
 
-    # Create initial data
     print("\nCreating initial data...")
     initial_state, prim_tuple = tov_id.create_initial_data_iso(
         tov_solution, grid, background, eos,
@@ -248,66 +164,238 @@ def run_hwh_test(
         interp_order=11
     )
 
-    # Timestep
+    N = grid.N
+    num_vars = grid.NUM_VARS
+
     dt = cfl * grid.min_dr
     num_steps = int(t_final / dt)
     print(f"\nTimestep: dt = {dt:.6f}")
     print(f"Total steps: {num_steps}")
 
-    # Storage for time series
-    center = NUM_GHOSTS
-    times = [0.0]
-    lapse_c = [initial_state[idx_lapse, center]]
-    phi_c = [initial_state[idx_phi, center]]
-    K_c = [initial_state[idx_K, center]]
-    hrr_c = [initial_state[idx_hrr, center]]
+    print("\nBuilding BSSNBackground and DerivativeStencils...")
+    t0_setup = time.perf_counter()
+    state_jax = jnp.array(initial_state)
+    bssn_bg = build_bssn_background(grid, background)
+    deriv_stencils = build_derivative_stencils(grid)
+    dr_jax = jnp.array(grid.dr)
+    dx_hydro = float(grid.derivs.dx)
 
-    # Storage for snapshots
+    eta = 1.0
+    sigma_base = 1.0
+    max_iter = 200
+    tol = 1e-12
+
+    parity_jax = jnp.array(np.concatenate([
+        np.array(BSSN_PARITY, dtype=np.float64),
+        np.array(HYDRO_PARITY, dtype=np.float64),
+    ]))
+    asymp_power_jax = jnp.array(np.concatenate([
+        np.array(BSSN_ASYMP_POWER, dtype=np.float64),
+        np.zeros(NUM_HYDRO_VARS),
+    ]))
+    asymp_offset_jax = jnp.array(np.concatenate([
+        np.array(BSSN_ASYMP_OFFSET, dtype=np.float64),
+        np.zeros(NUM_HYDRO_VARS),
+    ]))
+
+    _rho_floor = float(atmosphere.rho_floor)
+    _p_floor = float(atmosphere.p_floor)
+    _v_max = float(atmosphere.v_max)
+    _gm1 = Gamma - 1.0
+    _eps_atm = K * _rho_floor**_gm1 / _gm1
+    _p_atm = K * _rho_floor**Gamma
+    _h_atm = 1.0 + _eps_atm + _p_atm / _rho_floor
+
+    _tau_atm_phys = _rho_floor * _h_atm - _p_atm - _rho_floor
+    r_ghost = grid.r[-NUM_GHOSTS:]
+    M_star = tov_solution.M_star
+    boundary_ref = np.zeros((num_vars, NUM_GHOSTS))
+    for i, rg in enumerate(r_ghost):
+        factor = 1.0 + M_star / (2.0 * rg)
+        phi_val = np.log(factor)
+        alpha_val = (1.0 - M_star / (2.0 * rg)) / factor
+        e6phi_val = factor**6
+        boundary_ref[idx_phi, i] = phi_val
+        boundary_ref[idx_lapse, i] = alpha_val
+        boundary_ref[NUM_BSSN_VARS, i] = e6phi_val * _rho_floor
+        boundary_ref[NUM_BSSN_VARS + 2, i] = e6phi_val * _tau_atm_phys
+    boundary_ref_jax = jnp.array(boundary_ref)
+
+    print(f"  Setup in {time.perf_counter() - t0_setup:.3f}s")
+
+    @jax.jit
+    def apply_bcs(state):
+        return fill_bssn_boundaries_jax(
+            state, bssn_bg.r, NUM_GHOSTS,
+            parity_jax, asymp_power_jax, asymp_offset_jax,
+            "dirichlet", boundary_ref=boundary_ref_jax
+        )
+
+
+
+    tov_r_jax = jnp.array(tov_solution.r_iso)
+    tov_rho_jax = jnp.array(tov_solution.rho_baryon)
+    tov_p_jax = jnp.array(tov_solution.P)
+    r_jax = jnp.array(grid.r)
+
+    eos_type = 'ideal_gas'
+    max_iter = 200
+    tol = 1e-12
+    dx_hydro = float(grid.derivs.dx)
+    W_max = 10.0
+
+    @jax.jit
+    def rhs_fn(state):
+        return get_rhs_bssn_hydro_jax(
+            state, bssn_bg, deriv_stencils, dr_jax,
+            NUM_GHOSTS, num_vars,
+            sigma_base, eta,
+            eos_type, Gamma, K,
+            _rho_floor, _p_floor, _v_max, W_max,
+            RECONSTRUCTOR_NAME, SOLVER_METHOD, max_iter,
+            tol, dx_hydro,
+            "zero_gradient",
+            fix_shift=False
+        )
+
+    @jax.jit
+    def jit_step_hwh(state, dt_val):
+        """
+        RK4 step for Hydro-without-Hydro.
+
+        Hydro variables are RESET BEFORE computing RHS to maintain
+        fixed TOV equilibrium sources for BSSN evolution.
+        This is the correct behavior: BSSN evolves with static matter sources.
+        """
+        def rhs_with_reset(state_in):
+            state_bssn_only = reset_hydro_to_tov(state_in)
+            rhs = rhs_fn(state_bssn_only)
+            rhs = rhs.at[NUM_BSSN_VARS:].set(0.0)
+            return rhs
+
+        k1 = rhs_with_reset(state)
+
+        state_2 = apply_bcs(state + 0.5 * dt_val * k1)
+        k2 = rhs_with_reset(state_2)
+
+        state_3 = apply_bcs(state + 0.5 * dt_val * k2)
+        k3 = rhs_with_reset(state_3)
+
+        state_4 = apply_bcs(state + dt_val * k3)
+        k4 = rhs_with_reset(state_4)
+
+        state_new = apply_bcs(state + (dt_val / 6.0) * (k1 + 2.0*k2 + 2.0*k3 + k4))
+
+        state_final = reset_hydro_to_tov(state_new)
+
+        return state_final
+
+    @jax.jit
+    def reset_hydro_to_tov(state):
+        """
+        Reset hydro variables to static TOV equilibrium values.
+        
+        Uses FIXED phi from the current state (dynamic geometry),
+        but with TOV fluid variables (rho, p, v=0).
+        This maintains the correct stress-energy tensor for the evolving spacetime.
+        """
+        phi = state[idx_phi]
+        e6phi = jnp.exp(6.0 * phi)
+
+        rho0 = jnp.interp(r_jax, tov_r_jax, tov_rho_jax, left=_rho_floor, right=_rho_floor)
+        pressure = jnp.interp(r_jax, tov_r_jax, tov_p_jax, left=_p_floor, right=_p_floor)
+
+        gm1 = Gamma - 1.0
+        eps = K * rho0**gm1 / gm1
+        h = 1.0 + eps + pressure / jnp.maximum(rho0, 1e-300)
+        W = 1.0
+        D = rho0 * W
+        Sr = jnp.zeros_like(D)
+        tau = rho0 * h * W**2 - pressure - D
+
+        D_atm = e6phi * _rho_floor
+        tau_atm = e6phi * (_rho_floor * h - _p_floor - _rho_floor)
+
+        D = jnp.where(D < D_atm, D_atm, D)
+        tau = jnp.where(tau < tau_atm, tau_atm, tau)
+
+        state = state.at[NUM_BSSN_VARS].set(D)
+        state = state.at[NUM_BSSN_VARS + 1].set(Sr)
+        state = state.at[NUM_BSSN_VARS + 2].set(tau)
+
+        return state
+
+    dt_jax = jnp.float64(dt)
+
+    print("\nJIT compiling step function...")
+    t0_jit = time.perf_counter()
+    state_test = jit_step_hwh(state_jax, dt_jax)
+    state_test.block_until_ready()
+    jit_time = time.perf_counter() - t0_jit
+    print(f"  JIT compilation: {jit_time:.2f}s")
+
+    print("Benchmarking step execution...")
+    t0_bench = time.perf_counter()
+    n_bench = 10
+    for _ in range(n_bench):
+        state_test = jit_step_hwh(state_test, dt_jax)
+    state_test.block_until_ready()
+    bench_time = (time.perf_counter() - t0_bench) / n_bench * 1000
+    print(f"  Single step: {bench_time:.2f} ms")
+
+    center = NUM_GHOSTS
+
+    times = [0.0]
+    lapse_c = [float(initial_state[idx_lapse, center])]
+    phi_c = [float(initial_state[idx_phi, center])]
+    K_c = [float(initial_state[idx_K, center])]
+    hrr_c = [float(initial_state[idx_hrr, center])]
+
     times_detailed = [0.0]
     states_detailed = [initial_state.copy()]
 
-    # Evolution
     print("\n" + "="*70)
-    print("Starting HWH evolution...")
+    print("Starting HWH evolution (JAX dynamic mode)...")
     print("="*70)
 
-    state_flat = initial_state.flatten()
+    state = state_jax
     t = 0.0
 
-    for step in range(num_steps):
-        state_flat = rk4_step_hwh(state_flat, dt, grid, background, hydro,
-                                   tov_solution, atmosphere)
+    PRINT_INTERVAL = 100
+
+    for step in range(1, num_steps + 1):
+        state = jit_step_hwh(state, dt_jax)
         t += dt
 
-        # Extract current state
-        state = state_flat.reshape((grid.NUM_VARS, grid.N))
+        state_np = np.array(state)
 
-        # Save time series every 10 steps
         if (step + 1) % 10 == 0:
             times.append(t)
-            lapse_c.append(state[idx_lapse, center])
-            phi_c.append(state[idx_phi, center])
-            K_c.append(state[idx_K, center])
-            hrr_c.append(state[idx_hrr, center])
+            lapse_c.append(state_np[idx_lapse, center])
+            phi_c.append(state_np[idx_phi, center])
+            K_c.append(state_np[idx_K, center])
+            hrr_c.append(state_np[idx_hrr, center])
 
-        # Save snapshots
         if (step + 1) % save_interval == 0:
             times_detailed.append(t)
-            states_detailed.append(state.copy())
+            states_detailed.append(state_np.copy())
 
-        # Progress
-        if progress and (step + 1) % 100 == 0:
+        if progress and (step + 1) % PRINT_INTERVAL == 0:
             print(f"  step {step+1:5d}  t = {t:.3f}  "
-                  f"alpha_c = {state[idx_lapse, center]:.6f}  "
-                  f"phi_c = {state[idx_phi, center]:+.3e}  "
-                  f"K_c = {state[idx_K, center]:+.3e}")
+                  f"alpha_c = {state_np[idx_lapse, center]:.6f}  "
+                  f"phi_c = {state_np[idx_phi, center]:+.3e}  "
+                  f"K_c = {state_np[idx_K, center]:+.3e}")
 
-    # Final state
-    final_state = state_flat.reshape((grid.NUM_VARS, grid.N))
+        if step % 500 == 0:
+            state.block_until_ready()
+            if bool(jnp.any(jnp.isnan(state[idx_phi]))):
+                print(f"\nERROR: NaN detected at step {step}, t={t:.6e}. Halting evolution.")
+                break
 
-    # Summary
+    final_state = np.array(state)
+
     print("\n" + "="*70)
-    print("HWH EVOLUTION COMPLETE")
+    print("HWH EVOLUTION COMPLETE (JAX)")
     print("="*70)
     print(f"  Final time: t = {t:.3f}")
     print(f"  Steps: {num_steps}")
@@ -323,139 +411,22 @@ def run_hwh_test(
         r=grid.r,
         state=final_state,
         initial_state=initial_state,
-        # Time series at center
         times=np.array(times),
         lapse_center=np.array(lapse_c),
         phi_center=np.array(phi_c),
         K_center=np.array(K_c),
         hrr_center=np.array(hrr_c),
-        # Snapshots
         times_detailed=np.array(times_detailed),
         states_detailed=states_detailed,
-        # TOV data
         tov=tov_solution,
-        # Parameters
         K=K,
         Gamma=Gamma,
         rho_central=rho_central
     )
 
 
-def plot_hwh_results(result, save_plots=True, plot_dir="plots"):
-    """Plot HWH test results."""
-    if save_plots:
-        os.makedirs(plot_dir, exist_ok=True)
-
-    times = result['times']
-    r = result['r']
-    tov = result['tov']
-
-    # Plot 1: Time evolution at center
-    fig, axes = plt.subplots(3, 1, figsize=(10, 10))
-
-    # phi vs time
-    axes[0].plot(times, result['phi_center'], 'b-', lw=2)
-    axes[0].set_ylabel(r'$\phi$(center)')
-    axes[0].set_title('HWH: Evolution at Center', fontsize=14)
-    axes[0].grid(True, alpha=0.3)
-
-    # K vs time (key diagnostic - should stay ~0)
-    axes[1].plot(times, result['K_center'], 'g-', lw=2)
-    axes[1].axhline(0, color='k', ls='--', alpha=0.5, label='K = 0')
-    axes[1].set_ylabel('K(center)')
-    axes[1].grid(True, alpha=0.3)
-    axes[1].legend()
-
-    # lapse vs time
-    axes[2].plot(times, result['lapse_center'], 'r-', lw=2)
-    axes[2].axhline(result['lapse_center'][0], color='r', ls='--', alpha=0.5, label='Initial')
-    axes[2].set_xlabel('t')
-    axes[2].set_ylabel(r'$\alpha$(center)')
-    axes[2].grid(True, alpha=0.3)
-    axes[2].legend()
-
-    plt.tight_layout()
-    if save_plots:
-        plt.savefig(f"{plot_dir}/hwh_time_evolution.png", dpi=150, bbox_inches='tight')
-    plt.show()
-
-    # Plot 2: Spatial profiles at different times
-    fig, axes = plt.subplots(2, 2, figsize=(12, 10))
-
-    states = result['states_detailed']
-    times_det = result['times_detailed']
-    n_snap = min(4, len(states))
-    indices = np.linspace(0, len(states)-1, n_snap, dtype=int)
-    colors = plt.cm.viridis(np.linspace(0, 0.9, n_snap))
-
-    for i, idx in enumerate(indices):
-        state = states[idx]
-        t = times_det[idx]
-
-        axes[0, 0].plot(r, state[idx_lapse, :], color=colors[i], lw=1.5, label=f't={t:.1f}')
-        axes[0, 1].plot(r, state[idx_phi, :], color=colors[i], lw=1.5, label=f't={t:.1f}')
-        axes[1, 0].plot(r, state[idx_K, :], color=colors[i], lw=1.5, label=f't={t:.1f}')
-        axes[1, 1].plot(r, state[idx_hrr, :], color=colors[i], lw=1.5, label=f't={t:.1f}')
-
-    # Add TOV lapse
-    alpha_tov = interp1d(tov.r, tov.alpha, kind='cubic', bounds_error=False,
-                         fill_value=(tov.alpha[0], tov.alpha[-1]))(r)
-    axes[0, 0].plot(r, alpha_tov, 'k--', lw=2, alpha=0.7, label='TOV')
-
-    axes[0, 0].set_xlabel('r'); axes[0, 0].set_ylabel(r'$\alpha$')
-    axes[0, 0].set_title('Lapse'); axes[0, 0].legend(); axes[0, 0].grid(True, alpha=0.3)
-
-    axes[0, 1].set_xlabel('r'); axes[0, 1].set_ylabel(r'$\phi$')
-    axes[0, 1].set_title('Conformal Factor'); axes[0, 1].legend(); axes[0, 1].grid(True, alpha=0.3)
-
-    axes[1, 0].set_xlabel('r'); axes[1, 0].set_ylabel('K')
-    axes[1, 0].set_title('Extrinsic Curvature K'); axes[1, 0].legend(); axes[1, 0].grid(True, alpha=0.3)
-
-    axes[1, 1].set_xlabel('r'); axes[1, 1].set_ylabel(r'$h_{rr}$')
-    axes[1, 1].set_title('Metric Deviation'); axes[1, 1].legend(); axes[1, 1].grid(True, alpha=0.3)
-
-    plt.suptitle('HWH: Spatial Profiles', fontsize=14)
-    plt.tight_layout()
-    if save_plots:
-        plt.savefig(f"{plot_dir}/hwh_spatial_profiles.png", dpi=150, bbox_inches='tight')
-    plt.show()
-
-    # Plot 3: Drift analysis
-    fig, axes = plt.subplots(2, 2, figsize=(12, 8))
-
-    phi_drift = result['phi_center'] - result['phi_center'][0]
-    K_drift = result['K_center'] - result['K_center'][0]
-    lapse_drift = result['lapse_center'] - result['lapse_center'][0]
-    hrr_drift = result['hrr_center'] - result['hrr_center'][0]
-
-    axes[0, 0].plot(times, phi_drift, 'b-', lw=1.5)
-    axes[0, 0].set_xlabel('t'); axes[0, 0].set_ylabel(r'$\Delta\phi$')
-    axes[0, 0].set_title('Conformal Factor Drift'); axes[0, 0].grid(True, alpha=0.3)
-
-    axes[0, 1].plot(times, K_drift, 'g-', lw=1.5)
-    axes[0, 1].set_xlabel('t'); axes[0, 1].set_ylabel(r'$\Delta K$')
-    axes[0, 1].set_title('K Drift (should be ~0)'); axes[0, 1].grid(True, alpha=0.3)
-
-    axes[1, 0].plot(times, lapse_drift, 'r-', lw=1.5)
-    axes[1, 0].set_xlabel('t'); axes[1, 0].set_ylabel(r'$\Delta\alpha$')
-    axes[1, 0].set_title('Lapse Drift'); axes[1, 0].grid(True, alpha=0.3)
-
-    axes[1, 1].plot(times, hrr_drift, 'm-', lw=1.5)
-    axes[1, 1].set_xlabel('t'); axes[1, 1].set_ylabel(r'$\Delta h_{rr}$')
-    axes[1, 1].set_title('Metric Drift'); axes[1, 1].grid(True, alpha=0.3)
-
-    plt.suptitle('HWH: Drift Analysis', fontsize=14)
-    plt.tight_layout()
-    if save_plots:
-        plt.savefig(f"{plot_dir}/hwh_drift_analysis.png", dpi=150, bbox_inches='tight')
-    plt.show()
-
-    return result
-
-
 if __name__ == "__main__":
-    # Run HWH test with same parameters as TOVEvolution reference
-    result = run_hwh_test(
+    result = run_hwh_jax_test(
         K=100.0,
         Gamma=2.0,
         rho_central=0.2,
@@ -464,8 +435,7 @@ if __name__ == "__main__":
         t_final=100.0,
         cfl=0.1,
         save_interval=50,
-        progress=True
+        progress=True,
+        RECONSTRUCTOR_NAME="wenoz",
+        SOLVER_METHOD="newton"
     )
-
-    # Generate plots
-    plot_hwh_results(result, save_plots=True, plot_dir="plots")

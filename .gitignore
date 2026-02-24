@@ -143,3 +143,6 @@ check_h5.py
 *.json
 *.npz
 *.png
+*.mp4
+*.gpg
+*.sh

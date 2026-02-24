@@ -362,19 +362,7 @@ class ValenciaReferenceMetric:
 
         return fD_U, fTau_U, fS_UD
 
-    def _get_fluxes(self, rho0, v_U, pressure, W, h, bssn_vars):
-        """
-        Wrapper method to call _compute_fluxes with class geometry attributes.
-
-        """
-        phi_c = np.asarray(bssn_vars.phi, dtype=float)
-        e6phi_c = np.exp(6.0 * phi_c)
-
-        return self._compute_fluxes(rho0, v_U, pressure, W, h,
-            self.alpha, e6phi_c, self.gamma_LL, self.gamma_UU, self.beta_U
-        )
-
-    def _compute_connection_terms(self, rho0, v_U, pressure, W, h, bssn_vars, background):
+    def _compute_connection_terms(self, rho0, v_U, pressure, W, h, background):
         """
         Compute connection term contributions from reference metric Christoffel symbols.
 
@@ -391,7 +379,10 @@ class ValenciaReferenceMetric:
             conn_tau: (N,) connection contribution to tau equation
         """
         # Compute partial flux vectors (densitized)
-        fD_U, fTau_U, fS_UD = self._get_fluxes(rho0, v_U, pressure, W, h, bssn_vars)
+        fD_U, fTau_U, fS_UD = self._compute_fluxes(
+            rho0, v_U, pressure, W, h,
+            self.alpha, self.e6phi, self.gamma_LL, self.gamma_UU, self.beta_U
+        )
 
         # Reference metric Christoffel symbols Γ̂^i_{jk}
         hat_chris = background.hat_christoffel  # (N, 3, 3, 3)
@@ -460,7 +451,7 @@ class ValenciaReferenceMetric:
             div_D, div_S, div_tau = self._compute_flux_derivative(F_D_face, F_S_face, F_tau_face)
 
             # CONNECTION TERMS FLUX derivative
-            conn_D, conn_S, conn_tau = self._compute_connection_terms(rho0, v_U, pressure, W, h, bssn_vars, background)
+            conn_D, conn_S, conn_tau = self._compute_connection_terms(rho0, v_U, pressure, W, h, background)
 
             # SOURCE TERMS
             with self.timer('source_terms'):

@@ -834,6 +834,20 @@ def evolve_fixed_timestep(state_initial, dt, num_steps, grid, background, hydro,
         rho_c_series.append(float(rho0_next[NUM_GHOSTS]))
         v_c_series.append(float(vr_next[NUM_GHOSTS]))
 
+        # Collapse detection: lapse dropping below threshold (dynamic mode)
+        lapse_c = float(s_next[idx_lapse, NUM_GHOSTS])
+        if lapse_c < 0.05:
+            print(f"\n*** COLLAPSE DETECTED: alpha_c={lapse_c:.4f} < 0.05 at t={t_curr:.4e} ***")
+            state_flat = state_flat_next
+            actual_steps = step + 1
+            actual_time = t_start + actual_steps * dt
+            return state_flat.reshape((grid.NUM_VARS, grid.N)), actual_steps, actual_time, {
+                't': np.array(times_series),
+                'Mb': np.array(Mb_series),
+                'rho_c': np.array(rho_c_series),
+                'v_c': np.array(v_c_series),
+            }
+
         # Detect first signs of instability / non-physical values
         issues = []
         if not np.all(np.isfinite(rho0_next)) or not np.all(np.isfinite(p_next)):

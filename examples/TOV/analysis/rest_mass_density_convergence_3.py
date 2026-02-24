@@ -59,15 +59,19 @@ QNM_DELTA_T = 1.0   # Subsample to uniform dt=1 for FFT
 QNM_T_START = 10.0   # Discard initial transient
 
 # Resolutions - UPDATE THESE TO CHANGE RESOLUTIONS
-N1 = 500
-N2 = 1000
-N3 = 2000
+N1 = 100
+N2 = 200
+N3 = 400
+N4 = 800
+
+# Base data directory
+#DATA_DIR = '/home/davidbamba/repositories/engrenage/examples/TOV/tov_evolution_data_rmax100.0_TEST_long_domain_long_time'
 
 # Data paths - constructed from resolution values
 FOLDERS = {
-    f'N={N1}': f'/home/davidbamba/repositories/engrenage/examples/TOV/tov_evolution_data_refact_rmax100.0_jax/tov_star_rhoc1p28em03_N500_K100_G2_dyn_mp5',
-    f'N={N2}': f'/home/davidbamba/repositories/engrenage/examples/TOV/tov_evolution_data_refact_rmax100.0_jax/tov_star_rhoc1p28em03_N1000_K100_G2_dyn_mp5',
-    f'N={N3}': f'/home/davidbamba/repositories/engrenage/examples/TOV/tov_evolution_data_refact_rmax100.0_jax/tov_star_rhoc1p28em03_N2000_K100_G2_dyn_mp5',
+    f'N={N1}': f'/home/davidbamba/repositories/engrenage/examples/TOV/tov_evolution_data_refact_rmax20.0_jax/tov_star_rhoc1p28em03_N{N1}_K100_G2_dyn_mp5',
+    f'N={N2}': f'/home/davidbamba/repositories/engrenage/examples/TOV/tov_evolution_data_refact_rmax20.0_jax/tov_star_rhoc1p28em03_N{N2}_K100_G2_dyn_mp5',
+    f'N={N3}': f'/home/davidbamba/repositories/engrenage/examples/TOV/tov_evolution_data_refact_rmax20.0_jax/tov_star_rhoc1p28em03_N{N3}_K100_G2_dyn_mp5',
 }
 
 # Resolution labels (keys to FOLDERS dictionary)

@@ -776,6 +776,7 @@ class Cons2PrimSolver:
             self.floor_applicator.apply_atmosphere_fallback(
                 rho0, vr, p, eps, W, h, failed_mask
             )
+            success[failed_mask] = True  # Atmosphere fallback applied: point is handled
 
         # Enforce velocity limits (using FloorApplicator)
         rho0, vr, p = self.floor_applicator.apply_primitive_floors(rho0, vr, p, gamma_rr)

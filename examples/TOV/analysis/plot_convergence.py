@@ -11,18 +11,18 @@ import argparse
 from scipy.interpolate import interp1d
 
 # Resolutions - UPDATE THESE TO CHANGE RESOLUTIONS
-N_very_low = 500
-N_low = 1000
-N_med = 2000
-N_high = 4000
+N_very_low = 100
+N_low = 200
+N_med = 400
+N_high = 800
 #N_very_high = 800
 
 # Data paths - constructed from resolution values
 FOLDERS = {
-    f'N={N_very_low}': f'/home/davidbamba/repositories/engrenage/examples/TOV/tov_evolution_data_refact_rmax100.0_jax/tov_star_rhoc1p28em03_N{N_very_low}_K100_G2_dyn_mp5',
-    f'N={N_low}': f'/home/davidbamba/repositories/engrenage/examples/TOV/tov_evolution_data_refact_rmax100.0_jax/tov_star_rhoc1p28em03_N{N_low}_K100_G2_dyn_mp5',
-    f'N={N_med}': f'/home/davidbamba/repositories/engrenage/examples/TOV/tov_evolution_data_refact_rmax100.0_jax/tov_star_rhoc1p28em03_N{N_med}_K100_G2_dyn_mp5',
-    f'N={N_high}': f'/home/davidbamba/repositories/engrenage/examples/TOV/tov_evolution_data_refact_rmax100.0_jax/tov_star_rhoc1p28em03_N{N_high}_K100_G2_dyn_mp5',
+    f'N={N_very_low}': f'/home/davidbamba/repositories/engrenage/examples/TOV/tov_evolution_data_refact_rmax20.0_jax/tov_star_rhoc1p28em03_N{N_very_low}_K100_G2_dyn_mp5',
+    f'N={N_low}': f'/home/davidbamba/repositories/engrenage/examples/TOV/tov_evolution_data_refact_rmax20.0_jax/tov_star_rhoc1p28em03_N{N_low}_K100_G2_dyn_mp5',
+    f'N={N_med}': f'/home/davidbamba/repositories/engrenage/examples/TOV/tov_evolution_data_refact_rmax20.0_jax/tov_star_rhoc1p28em03_N{N_med}_K100_G2_dyn_mp5',
+    f'N={N_high}': f'/home/davidbamba/repositories/engrenage/examples/TOV/tov_evolution_data_refact_rmax20.0_jax/tov_star_rhoc1p28em03_N{N_high}_K100_G2_dyn_mp5',
 }
 # Resolution labels for convergence order calculation (uses first 3 resolutions)
 low_res = f'N={N_low}'

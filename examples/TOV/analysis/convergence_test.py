@@ -35,15 +35,15 @@ from scipy.signal import savgol_filter
 from scipy.interpolate import interp1d
 
 # Resolutions - UPDATE THESE TO CHANGE RESOLUTIONS
-N_low = 2000
-N_med = 4000
-N_high = 8000
+N_low = 100
+N_med = 200
+N_high = 400
 
 # Data paths - constructed from resolution values
 FOLDERS = {
-    f'N={N_low}': f'/home/davidbamba/repositories/engrenage/examples/TOV/tov_evolution_data_rmax100_TEST_long_domain/tov_star_rhoc1p28em03_N{N_low}_K100_G2_cow_mp5',
-    f'N={N_med}': f'/home/davidbamba/repositories/engrenage/examples/TOV/tov_evolution_data_rmax100_TEST_long_domain/tov_star_rhoc1p28em03_N{N_med}_K100_G2_cow_mp5',
-    f'N={N_high}': f'/home/davidbamba/repositories/engrenage/examples/TOV/tov_evolution_data_rmax100_TEST_long_domain/tov_star_rhoc1p28em03_N{N_high}_K100_G2_cow_mp5',
+    f'N={N_low}': f'/home/davidbamba/repositories/engrenage/examples/TOV/tov_evolution_data_refact_rmax20.0_jax/tov_star_rhoc1p28em03_N{N_low}_K100_G2_dyn_mp5',
+    f'N={N_med}': f'/home/davidbamba/repositories/engrenage/examples/TOV/tov_evolution_data_refact_rmax20.0_jax/tov_star_rhoc1p28em03_N{N_med}_K100_G2_dyn_mp5',
+    f'N={N_high}': f'/home/davidbamba/repositories/engrenage/examples/TOV/tov_evolution_data_refact_rmax20.0_jax/tov_star_rhoc1p28em03_N{N_high}_K100_G2_dyn_mp5',
 }
 
 # Resolution labels (keys to FOLDERS dictionary)
@@ -52,7 +52,7 @@ med_res = f'N={N_med}'
 high_res = f'N={N_high}'
 
 # Grid spacings (dr = 20/N)
-R_MAX = 100.0
+R_MAX = 20.0
 RESOLUTIONS = {
     low_res: {'N': N_low, 'dr': R_MAX / N_low},
     med_res: {'N': N_med, 'dr': R_MAX / N_med},
@@ -76,7 +76,7 @@ def get_color(label, all_labels):
     return color_map[idx % len(color_map)]
 
 
-def load_snapshots(folder_path, suffix="_cow"):
+def load_snapshots(folder_path, suffix="_dyn_jax"):
     """
     Load snapshots with density profiles and times.
 

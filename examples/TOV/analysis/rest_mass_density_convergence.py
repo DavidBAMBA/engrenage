@@ -47,20 +47,20 @@ FREQUENCIES_COWLING_KHZ = {
 
 
 # Resolutions - UPDATE THESE TO CHANGE RESOLUTIONS
-N1 = 1000
-N2 = 2000
-N3 = 4000
-N4 = 8000
+N1 = 500
+N2 = 1000
+N3 = 2000
+N4 = 4000
 
 # Base data directory
 #DATA_DIR = '/home/davidbamba/repositories/engrenage/examples/TOV/tov_evolution_data_rmax100.0_TEST_long_domain_long_time'
 
 # Data paths - constructed from resolution values
 FOLDERS = {
-    f'N={N1}': f'/home/davidbamba/repositories/engrenage/examples/TOV/tov_evolution_data_refact_rmax100.0_jax/tov_star_rhoc1p28em03_N500_K100_G2_dyn_mp5',
-    f'N={N2}': f'/home/davidbamba/repositories/engrenage/examples/TOV/tov_evolution_data_refact_rmax100.0_jax/tov_star_rhoc1p28em03_N1000_K100_G2_dyn_mp5',
-    f'N={N3}': f'/home/davidbamba/repositories/engrenage/examples/TOV/tov_evolution_data_refact_rmax100.0_jax/tov_star_rhoc1p28em03_N2000_K100_G2_dyn_mp5',
-    #f'N={N4}': f'/home/davidbamba/repositories/engrenage/examples/TOV/tov_evolution_data_refact_rmax100.0_jax/tov_star_rhoc1p28em03_N8000_K100_G2_dyn_mp5'
+    f'N={N1}': f'/home/davidbamba/repositories/engrenage/examples/TOV/tov_evolution_data_refact_rmax100.0_jax/tov_star_rhoc1p28em03_N{N1}_K100_G2_dyn_mp5',
+    f'N={N2}': f'/home/davidbamba/repositories/engrenage/examples/TOV/tov_evolution_data_refact_rmax100.0_jax/tov_star_rhoc1p28em03_N{N2}_K100_G2_dyn_mp5',
+    f'N={N3}': f'/home/davidbamba/repositories/engrenage/examples/TOV/tov_evolution_data_refact_rmax100.0_jax/tov_star_rhoc1p28em03_N{N3}_K100_G2_dyn_mp5',
+    f'N={N4}': f'/home/davidbamba/repositories/engrenage/examples/TOV/tov_evolution_data_refact_rmax100.0_jax/tov_star_rhoc1p28em03_N{N4}_K100_G2_dyn_mp5'
 }
 
 # Resolution labels (keys to FOLDERS dictionary)
@@ -80,7 +80,7 @@ def load_metadata(folder_path):
     Returns:
         Dictionary with metadata including stellar radius R_star
     """
-    json_file = os.path.join(folder_path, 'tov_metadata_cow.json')
+    json_file = os.path.join(folder_path, 'tov_metadata_dyn_jax.json')
 
     try:
         with open(json_file, 'r') as f:
@@ -100,7 +100,7 @@ def load_snapshots(folder_path):
         r: radial grid
         rho_list: list of density profiles rho0(r) at each time
     """
-    h5_file = os.path.join(folder_path, 'tov_snapshots_cow.h5')
+    h5_file = os.path.join(folder_path, 'tov_snapshots_dyn_jax.h5')
 
     times = []
     rho_list = []
@@ -313,7 +313,7 @@ Examples:
                         help='Output directory for plots. Default: script_dir/plots')
     parser.add_argument('--t-min', type=float, default=0.0,
                         help='Minimum time to analyze. Default: 0.0')
-    parser.add_argument('--t-max', type=float, default=6000.0,
+    parser.add_argument('--t-max', type=float, default=2000.0,
                         help='Maximum time to plot. Default: 4000.0')
     parser.add_argument('--tov-cache', default=None,
                         help='Path to TOV cache directory. Required if using --data-dirs.')

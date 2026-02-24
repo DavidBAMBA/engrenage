@@ -38,7 +38,7 @@ def get_color(label, all_labels):
 
 def load_final_snapshot(folder):
     """Load the final snapshot from a simulation folder."""
-    snapshot_file = os.path.join(folder, 'tov_snapshots_cow.h5')
+    snapshot_file = os.path.join(folder, 'tov_snapshots_dyn_jax.h5')
 
     if not os.path.exists(snapshot_file):
         print(f"  Warning: {snapshot_file} not found")

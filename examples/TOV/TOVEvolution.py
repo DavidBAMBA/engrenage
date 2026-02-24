@@ -44,6 +44,7 @@ from source.bssn.bssnvars import BSSNVars
 from source.bssn.bssnstatevariables import NUM_BSSN_VARS
 from source.bssn.tensoralgebra import get_bar_gamma_LL, get_bar_A_LL, get_hat_D_bar_gamma_LL
 from source.bssn.constraintsdiagnostic import get_constraints_diagnostic
+from source.bssn.ahfinder import get_horizon_diagnostics
 
 # Full BSSN+Hydro RHS (for dynamic mode)
 from source.core.rhsevolution import get_rhs
@@ -364,12 +365,12 @@ def main():
     # ==================================================================
     # CONFIGURATION
     # ==================================================================
-    r_max = 100.0
-    num_points = int(os.environ.get("NUM_POINTS", 4000))
+    r_max = 50.0
+    num_points = int(os.environ.get("NUM_POINTS", 1000))
     K = 100.0
     Gamma = 2.0
-    rho_central = 1.28e-3
-    t_final = float(os.environ.get("T_FINAL", "4000"))
+    rho_central = 6.0e-3
+    t_final = float(os.environ.get("T_FINAL", "2000"))
     FOLDER_NAME_EVOL = f"tov_evolution_data_refact_rmax{r_max}" + ("_jax" if JAX_RUN else "")
 
     SNAPSHOT_INTERVAL = 500  # Save full domain every N timesteps (None to disable)
@@ -385,7 +386,11 @@ def main():
     RIEMANN_SOLVER = "hll"  # "hll", "hllc", or "llf"
 
     # Evolution mode: "cowling" or "dynamic"
-    EVOLUTION_MODE = os.environ.get("EVOLUTION_MODE", "dynamic")
+    EVOLUTION_MODE = "dynamic"
+
+    # Collapse perturbation (Font et al. 2001): adds inward radial velocity
+    COLLAPSE_PERTURBATION = False
+    COLLAPSE_AMPLITUDE = 0.01  # 1% default
 
     # ==================================================================
     # RESTART CONFIGURATION
@@ -573,6 +578,47 @@ def main():
             interp_order=11
         )
 
+        # ===== COLLAPSE PERTURBATION (Font et al. 2001) =====
+        if COLLAPSE_PERTURBATION:
+            A_pert = COLLAPSE_AMPLITUDE
+            r_star = tov_solution.R_iso
+            r = grid.r
+
+            # Inward velocity profile: v^r = -A * (r/r_star) * sin(pi*r/r_star)
+            # Only inside the star
+            mask = r < r_star
+            delta_vr = np.zeros_like(r)
+            delta_vr[mask] = -A_pert * (r[mask] / r_star) * np.sin(np.pi * r[mask] / r_star)
+
+            # Extract current primitives
+            rho0, vr, p, eps = prim_tuple
+
+            # Apply perturbation to vr
+            vr_pert = vr + delta_vr
+
+            # Recompute conservatives with perturbed vr
+            bssn_tmp = BSSNVars(grid.N)
+            bssn_tmp.set_bssn_vars(initial_state_2d[:NUM_BSSN_VARS, :])
+            bar_gamma_LL_tmp = get_bar_gamma_LL(grid.r, bssn_tmp.h_LL, background)
+            geom_tmp = GeometryState.from_bssn_1d(
+                alpha=bssn_tmp.lapse,
+                beta_r=bssn_tmp.shift_U[:, 0] * background.inverse_scaling_vector[:, 0],
+                phi=bssn_tmp.phi,
+                gamma_rr=np.exp(4.0 * bssn_tmp.phi) * bar_gamma_LL_tmp[:, 0, 0],
+            )
+
+            D_new, Sr_new, tau_new = prim_to_cons(
+                rho0, vr_pert, p, geom_tmp, eos
+            )
+            initial_state_2d[NUM_BSSN_VARS + 0, :] = D_new
+            initial_state_2d[NUM_BSSN_VARS + 1, :] = Sr_new
+            initial_state_2d[NUM_BSSN_VARS + 2, :] = tau_new
+
+            # Update prim_tuple with perturbed vr
+            prim_tuple = (rho0, vr_pert, p, eps)
+            print(f"  Collapse perturbation applied: A={A_pert}, max|delta_vr|={np.max(np.abs(delta_vr)):.3e}")
+        # ===================================================
+
         # Diagnostics: check discrete hydrostatic balance at t=0
         utils.diagnose_t0_residuals(initial_state_2d, grid, background, hydro)
 
@@ -584,6 +630,17 @@ def main():
             # Hamiltonian constraint diagnostic
             tov_id.plot_hamiltonian_constraint_iso(tov_solution, initial_state_2d, grid, background, hydro,
                                                     K, Gamma, rho_central, output_dir=plots_dir, show=False)
+
+    # In restart mode, prim_tuple was never computed (the if-block above was
+    # skipped).  Recompute it from the TOV solution so that reference
+    # primitives are always available for diagnostics / baryon mass, etc.
+    if prim_tuple is None:
+        _, prim_tuple = tov_id.create_initial_data_iso(
+            tov_solution, grid, background, eos,
+            atmosphere=ATMOSPHERE,
+            polytrope_K=K, polytrope_Gamma=Gamma,
+            interp_order=11
+        )
 
     # ==================================================================
     # EVOLUTION
@@ -599,7 +656,7 @@ def main():
             SNAPSHOT_INTERVAL, EVOLUTION_INTERVAL,
             OUTPUT_DIR, PLOT_SUFFIX, plots_dir,
             restart_info, t_start, step_offset,
-            SKIP_PLOTS,
+            SKIP_PLOTS, COLLAPSE_PERTURBATION,
         )
     else:
         _evolve_numba(
@@ -1117,7 +1174,7 @@ def _evolve_jax(initial_state_2d, prim_tuple, tov_solution,
                 SNAPSHOT_INTERVAL, EVOLUTION_INTERVAL,
                 OUTPUT_DIR, PLOT_SUFFIX, plots_dir,
                 restart_info=None, t_start=0.0, step_offset=0,
-                SKIP_PLOTS=False):
+                SKIP_PLOTS=False, COLLAPSE_PERTURBATION=False):
     """JAX-based evolution with JIT-compiled step function.
 
     Supports both Cowling (fixed spacetime) and Dynamic (full BSSN+hydro) modes.
@@ -1236,9 +1293,9 @@ def _evolve_jax(initial_state_2d, prim_tuple, tov_solution,
         dx_hydro = float(grid.derivs.dx)
 
         # BSSN gauge parameters
-        eta = 0.0           # Gamma driver damping (eta=0 for static spacetime, following GRoovy)
+        eta = 1.0           # Gamma driver damping
         sigma_base = 1.0    # KO dissipation base coefficient
-        max_iter = 100
+        max_iter = 200
         tol = 1e-12
 
         # Boundary condition arrays (BSSN + hydro)
@@ -1294,7 +1351,7 @@ def _evolve_jax(initial_state_2d, prim_tuple, tov_solution,
                 RECONSTRUCTOR_NAME, SOLVER_METHOD, max_iter,
                 tol, dx_hydro,
                 "zero_gradient",  # RHS BC: smooth. State BC handles pinning via apply_bcs.
-                fix_shift=True    # TOV: 1+log lapse, shift=0 (no Gamma-driver)
+                fix_shift=False   # Gamma-driver: d_t beta^r = B^r, d_t B^r = 3/4 d_t Lambda^r - eta B^r
             )
 
         @jax.jit
@@ -1348,8 +1405,8 @@ def _evolve_jax(initial_state_2d, prim_tuple, tov_solution,
             'p_floor': _p_floor,
             'v_max': _v_max,
             'W_max': 10.0,
-            'tol': 1e-10,
-            'max_iter': 100,
+            'tol': 1e-12,
+            'max_iter': 200,
         }
 
         # ----- JIT-compiled step function (Cowling) -----
@@ -1519,6 +1576,12 @@ def _evolve_jax(initial_state_2d, prim_tuple, tov_solution,
     else:
         D, Sr, tau = D0, Sr0, tau0
 
+    # AH finder tracking (populated during evolution for dynamic mode)
+    ah_times_list = []
+    ah_radius_list = []
+    bh_mass_list = []
+    AH_CHECK_INTERVAL = PRINT_INTERVAL  # check for AH every print interval
+
     print("===== Evolution diagnostics (per step) =====")
     if IS_DYNAMIC:
         print("Columns: step | t | rho_central | max_drho/rho@r | max_vr@r | alpha_c | K_c | dMb/Mb | c2p_fails")
@@ -1618,6 +1681,11 @@ def _evolve_jax(initial_state_2d, prim_tuple, tov_solution,
                 r_max_v = float(r_interior[idx_max_v])
 
                 c2p_fail = int(np.sum(~success))
+                if c2p_fail > 0:
+                    fail_radii = grid.r[~success]
+                    c2p_info = f"c2p_fail={c2p_fail}@r={np.array2string(fail_radii, precision=2, separator=',')}"
+                else:
+                    c2p_info = "c2p_fail=0"
 
                 if IS_DYNAMIC:
                     lapse_c = float(state_2d[idx_lapse, NUM_GHOSTS])
@@ -1632,7 +1700,25 @@ def _evolve_jax(initial_state_2d, prim_tuple, tov_solution,
                           f"max_drho/rho={max_rel_rho_err:.2e}@r={r_max_rho:.2f}  "
                           f"max_vr={max_abs_v:.1e}@r={r_max_v:.1f}  "
                           f"alpha_c={lapse_c:.6f}  K_c={K_c:.6e}  dMb/Mb={dMb:.2e}  "
-                          f"c2p_fail={c2p_fail}  [{frac*100:.0f}% {elapsed:.0f}s]")
+                          f"{c2p_info}  [{frac*100:.0f}% {elapsed:.0f}s]")
+
+                    # AH finder check: activate once lapse starts collapsing (lapse_c < 0.5)
+                    # or immediately if COLLAPSE_PERTURBATION is set.
+                    # Avoids overhead on stable long evolutions.
+                    ah_trigger = lapse_c < 0.05 or COLLAPSE_PERTURBATION
+                    if ah_trigger and step % AH_CHECK_INTERVAL == 0:
+                        try:
+                            state_flat = state_2d.reshape(-1)
+                            t_now = t + t_start
+                            _, ah_r_now, bh_m_now = get_horizon_diagnostics(
+                                state_flat, np.array([t_now]), grid, background, hydro)
+                            ah_times_list.append(t_now)
+                            ah_radius_list.append(float(ah_r_now[0]))
+                            bh_mass_list.append(float(bh_m_now[0]))
+                            if ah_r_now[0] > 0:
+                                print(f"    -> AH found: r_AH={ah_r_now[0]:.4f}, M_BH={bh_m_now[0]:.4f}")
+                        except Exception as e:
+                            pass  # AH finder can fail near singularity
                 else:
                     Sr_np = np.asarray(state_2d[NUM_BSSN_VARS + 1, interior])
                     idx_max_Sr = np.argmax(np.abs(Sr_np))
@@ -1643,7 +1729,7 @@ def _evolve_jax(initial_state_2d, prim_tuple, tov_solution,
                     print(f"step {step + step_offset:5d}  t={t_actual:.2e}:  rho_c={rho_central:.6e}  "
                           f"max_drho/rho={max_rel_rho_err:.2e}@r={r_max_rho:.2f}  "
                           f"max_vr={max_abs_v:.3e}@r={r_max_v:.2f}  "
-                          f"max_Sr={max_Sr:.2e}@r={r_max_Sr:.2f}  c2p_fail={c2p_fail}")
+                          f"max_Sr={max_Sr:.2e}@r={r_max_Sr:.2f}  {c2p_info}")
 
         # Save checkpoint
         if step in checkpoint_set:
@@ -1765,6 +1851,33 @@ def _evolve_jax(initial_state_2d, prim_tuple, tov_solution,
     Mb_cp1 = compute_baryon_mass(grid, state_cp1, rho0_cp1, vr_cp1, p_cp1, eps_cp1, W_cp1, h_cp1)
     Mb_cp2 = compute_baryon_mass(grid, state_cp2, rho0_cp2, vr_cp2, p_cp2, eps_cp2, W_cp2, h_cp2)
     Mb_cp3 = compute_baryon_mass(grid, state_cp3, rho0_cp3, vr_cp3, p_cp3, eps_cp3, W_cp3, h_cp3)
+
+    # ==================================================================
+    # APPARENT HORIZON DIAGNOSTIC (from evolution loop data)
+    # ==================================================================
+    ah_times_diag = np.array(ah_times_list) if ah_times_list else None
+    ah_radius_diag = np.array(ah_radius_list) if ah_radius_list else None
+    bh_mass_diag = np.array(bh_mass_list) if bh_mass_list else None
+
+    if IS_DYNAMIC and ah_times_diag is not None and len(ah_times_diag) > 0:
+        print(f"\n{'='*70}")
+        print("APPARENT HORIZON DIAGNOSTIC")
+        print(f"{'='*70}")
+
+        ah_mask = ah_radius_diag > 0
+        n_with_ah = int(np.sum(ah_mask))
+        print(f"  Checked {len(ah_times_diag)} snapshots, AH found in {n_with_ah}")
+
+        if n_with_ah > 0:
+            first_ah_idx = np.argmax(ah_mask)
+            print(f"\n  ** AH first detected at t={ah_times_diag[first_ah_idx]:.4e} **")
+            print(f"     AH radius: {ah_radius_diag[first_ah_idx]:.4f}")
+            print(f"     BH mass:   {bh_mass_diag[first_ah_idx]:.4f}")
+            print(f"  Final AH: r={ah_radius_diag[ah_mask][-1]:.4f}, M_BH={bh_mass_diag[ah_mask][-1]:.4f}")
+        else:
+            print(f"\n  No apparent horizon formed during evolution")
+
+        print(f"{'='*70}")
 
     # ==================================================================
     # EVOLUTION DIAGNOSTICS (same format as Numba path)
@@ -1961,6 +2074,40 @@ def _evolve_jax(initial_state_2d, prim_tuple, tov_solution,
                 utils.plot_constraints_evolution(OUTPUT_DIR, suffix=PLOT_SUFFIX)
             except Exception as e:
                 print(f"  plot_constraints_evolution failed: {e}")
+
+        # 6. AH radius and BH mass vs time (if AH was detected)
+        if IS_DYNAMIC and ah_radius_diag is not None and np.any(ah_radius_diag > 0):
+            try:
+                print("  - AH radius and BH mass vs time...")
+                import matplotlib
+                matplotlib.use('Agg')
+                import matplotlib.pyplot as plt
+
+                fig_ah, (ax_ah1, ax_ah2) = plt.subplots(2, 1, figsize=(10, 8), sharex=True)
+
+                mask_ah = ah_radius_diag > 0
+                ax_ah1.plot(ah_times_diag[mask_ah], ah_radius_diag[mask_ah], 'bo-', label='AH radius')
+                ax_ah1.set_ylabel('AH radius (code units)')
+                ax_ah1.legend()
+                ax_ah1.grid(True, alpha=0.3)
+                ax_ah1.set_title('Apparent Horizon Diagnostics')
+
+                ax_ah2.plot(ah_times_diag[mask_ah], bh_mass_diag[mask_ah], 'ro-', label='BH mass')
+                if tov_solution is not None:
+                    ax_ah2.axhline(tov_solution.M_star, color='gray', linestyle='--',
+                                   label=f'M_TOV={tov_solution.M_star:.4f}')
+                ax_ah2.set_xlabel('t (code units)')
+                ax_ah2.set_ylabel('BH mass (code units)')
+                ax_ah2.legend()
+                ax_ah2.grid(True, alpha=0.3)
+
+                plt.tight_layout()
+                ah_plot_path = os.path.join(plots_dir, f'tov_ah_diagnostic{PLOT_SUFFIX}.png')
+                plt.savefig(ah_plot_path, dpi=150)
+                plt.close()
+                print(f"    Saved: {ah_plot_path}")
+            except Exception as e:
+                print(f"  AH plot failed: {e}")
 
     # ==================================================================
     # TIMING SUMMARY

@@ -195,13 +195,14 @@ def plot_hydro_profiles(t_snap, r, rho_list, p_list, output_path=None, title=Non
 
         # Density profile (use log scale)
         rho = rho_list[idx][r_mask]
-        ax_rho.semilogy(r_phys, rho, color=color, linewidth=1.5,
+        ax_rho.plot(r_phys, rho, color=color, linewidth=1.5,
                        label=f'{time_label}: {t_val_ms:.2f} ms', alpha=0.85)
-
+        ax_rho.set_xlim(0.0, 10)
         # Pressure profile (use log scale)
         p = p_list[idx][r_mask]
-        ax_p.semilogy(r_phys, p, color=color, linewidth=1.5,
+        ax_p.plot(r_phys, p, color=color, linewidth=1.5,
                      label=f'{time_label}: {t_val_ms:.2f} ms', alpha=0.85)
+        ax_p.set_xlim(0.0, 10)
 
     # Configure density plot
     ax_rho.set_xlabel(r'$r$ [code units]', fontsize=12)
@@ -233,7 +234,11 @@ def plot_hydro_profiles(t_snap, r, rho_list, p_list, output_path=None, title=Non
 
 def make_bssn_animation(folder_path, output_path=None, fps=10, dpi=100):
     """
-    Create animation showing the evolution of lapse, conformal factor, K, and shiftr.
+    Create animation showing the evolution of lapse, density, K, and conformal factor.
+
+    Layout:
+        (a) Lapse       | (b) Density profile (linear)
+        (c) K           | (d) Conformal factor phi
 
     Args:
         folder_path: Path to data folder containing snapshots
@@ -256,61 +261,72 @@ def make_bssn_animation(folder_path, output_path=None, fps=10, dpi=100):
     print(f"  Time range: {t_snap[0]:.1f} to {t_snap[-1]:.1f} M_sun")
     print(f"  Time range: {t_snap[0]*M_SUN_SECONDS*1e3:.2f} to {t_snap[-1]*M_SUN_SECONDS*1e3:.2f} ms")
 
+    rho_available = rho_list[0] is not None
+    if not rho_available:
+        print("  Warning: Density profiles not available in snapshots")
+
     # Filter to physical domain (r >= 0)
     r_mask = r >= 0
     r_phys = r[r_mask]
+
+    # x-axis limit
+    x_max = 10.0
 
     # Get initial values for reference
     lapse_init = lapse_list[0][r_mask]
     phi_init = phi_list[0][r_mask]
     K_init = K_list[0][r_mask]
-    shiftr_init = shiftr_list[0][r_mask] if shiftr_list[0] is not None else None
+    rho_init = rho_list[0][r_mask] if rho_available else None
 
-    # Determine y-axis limits (with some padding)
-    lapse_min = min([np.min(lapse[r_mask]) for lapse in lapse_list])
-    lapse_max = max([np.max(lapse[r_mask]) for lapse in lapse_list])
+    # Determine y-axis limits (with some padding), restricted to r <= x_max
+    r_plot_mask = r_phys <= x_max
+
+    lapse_min = min([np.min(lapse[r_mask][r_plot_mask]) for lapse in lapse_list])
+    lapse_max = max([np.max(lapse[r_mask][r_plot_mask]) for lapse in lapse_list])
     lapse_margin = 0.1 * (lapse_max - lapse_min)
 
-    phi_min = min([np.min(phi[r_mask]) for phi in phi_list])
-    phi_max = max([np.max(phi[r_mask]) for phi in phi_list])
+    phi_min = min([np.min(phi[r_mask][r_plot_mask]) for phi in phi_list])
+    phi_max = max([np.max(phi[r_mask][r_plot_mask]) for phi in phi_list])
     phi_margin = 0.1 * (phi_max - phi_min) if phi_max > phi_min else 0.1
 
-    K_min = min([np.min(K[r_mask]) for K in K_list])
-    K_max = max([np.max(K[r_mask]) for K in K_list])
+    K_min = min([np.min(K[r_mask][r_plot_mask]) for K in K_list])
+    K_max = max([np.max(K[r_mask][r_plot_mask]) for K in K_list])
     K_margin = 0.1 * (K_max - K_min) if K_max > K_min else 1e-6
 
-    if shiftr_init is not None:
-        shiftr_min = min([np.min(shiftr[r_mask]) for shiftr in shiftr_list if shiftr is not None])
-        shiftr_max = max([np.max(shiftr[r_mask]) for shiftr in shiftr_list if shiftr is not None])
-        shiftr_margin = 0.1 * (shiftr_max - shiftr_min) if shiftr_max > shiftr_min else 1e-6
+    if rho_available:
+        rho_min = min([np.min(rho[r_mask][r_plot_mask]) for rho in rho_list if rho is not None])
+        rho_max = max([np.max(rho[r_mask][r_plot_mask]) for rho in rho_list if rho is not None])
+        rho_margin = 0.1 * (rho_max - rho_min) if rho_max > rho_min else 1e-6
 
-    # Create figure with 2 rows x 2 columns
-    fig, ((ax_lapse, ax_phi), (ax_K, ax_shiftr)) = plt.subplots(2, 2, figsize=(14, 12))
+    # Create figure: (a) Lapse | (b) Density, (c) K | (d) Phi
+    fig, ((ax_lapse, ax_rho), (ax_K, ax_phi)) = plt.subplots(2, 2, figsize=(14, 12))
 
-    # Initialize plots
+    # (a) Lapse
     line_lapse, = ax_lapse.plot([], [], 'b-', linewidth=2, label='Current')
-    line_lapse_init, = ax_lapse.plot(r_phys, lapse_init, 'k--', linewidth=1, alpha=0.5, label='Initial')
+    ax_lapse.plot(r_phys, lapse_init, 'k--', linewidth=1, alpha=0.5, label='Initial')
     ax_lapse.axhline(1.0, color='gray', linestyle=':', linewidth=1, alpha=0.5)
 
-    line_phi, = ax_phi.plot([], [], 'r-', linewidth=2, label='Current')
-    line_phi_init, = ax_phi.plot(r_phys, phi_init, 'k--', linewidth=1, alpha=0.5, label='Initial')
-    ax_phi.axhline(0.0, color='gray', linestyle=':', linewidth=1, alpha=0.5)
+    # (b) Density (linear scale)
+    if rho_available:
+        line_rho, = ax_rho.plot([], [], 'r-', linewidth=2, label='Current')
+        ax_rho.plot(r_phys, rho_init, 'k--', linewidth=1, alpha=0.5, label='Initial')
+    else:
+        line_rho = None
+        ax_rho.text(0.5, 0.5, 'Density not available', ha='center', va='center',
+                    transform=ax_rho.transAxes, fontsize=14)
 
+    # (c) K
     line_K, = ax_K.plot([], [], 'g-', linewidth=2, label='Current')
-    line_K_init, = ax_K.plot(r_phys, K_init, 'k--', linewidth=1, alpha=0.5, label='Initial')
+    ax_K.plot(r_phys, K_init, 'k--', linewidth=1, alpha=0.5, label='Initial')
     ax_K.axhline(0.0, color='gray', linestyle=':', linewidth=1, alpha=0.5)
 
-    if shiftr_init is not None:
-        line_shiftr, = ax_shiftr.plot([], [], 'm-', linewidth=2, label='Current')
-        line_shiftr_init, = ax_shiftr.plot(r_phys, shiftr_init, 'k--', linewidth=1, alpha=0.5, label='Initial')
-        ax_shiftr.axhline(0.0, color='gray', linestyle=':', linewidth=1, alpha=0.5)
-    else:
-        line_shiftr = None
-        ax_shiftr.text(0.5, 0.5, 'shiftr not available', ha='center', va='center',
-                    transform=ax_shiftr.transAxes, fontsize=14)
+    # (d) Phi
+    line_phi, = ax_phi.plot([], [], 'm-', linewidth=2, label='Current')
+    ax_phi.plot(r_phys, phi_init, 'k--', linewidth=1, alpha=0.5, label='Initial')
+    ax_phi.axhline(0.0, color='gray', linestyle=':', linewidth=1, alpha=0.5)
 
     # Configure lapse plot
-    ax_lapse.set_xlim(r_phys[0], r_phys[-1])
+    ax_lapse.set_xlim(0, x_max)
     ax_lapse.set_ylim(lapse_min - lapse_margin, lapse_max + lapse_margin)
     ax_lapse.set_xlabel(r'$r$ [code units]', fontsize=11)
     ax_lapse.set_ylabel(r'Lapse $\alpha$', fontsize=11)
@@ -318,17 +334,18 @@ def make_bssn_animation(folder_path, output_path=None, fps=10, dpi=100):
     ax_lapse.legend(fontsize=9, loc='best')
     ax_lapse.grid(alpha=0.3)
 
-    # Configure phi plot
-    ax_phi.set_xlim(r_phys[0], r_phys[-1])
-    ax_phi.set_ylim(phi_min - phi_margin, phi_max + phi_margin)
-    ax_phi.set_xlabel(r'$r$ [code units]', fontsize=11)
-    ax_phi.set_ylabel(r'Conformal Factor $\phi$', fontsize=11)
-    ax_phi.set_title('(b) Conformal Factor', fontsize=12, fontweight='bold')
-    ax_phi.legend(fontsize=9, loc='best')
-    ax_phi.grid(alpha=0.3)
+    # Configure density plot
+    if rho_available:
+        ax_rho.set_xlim(0, x_max)
+        ax_rho.set_ylim(rho_min - rho_margin, rho_max + rho_margin)
+    ax_rho.set_xlabel(r'$r$ [code units]', fontsize=11)
+    ax_rho.set_ylabel(r'Rest-mass density $\rho_0$', fontsize=11)
+    ax_rho.set_title('(b) Density Profile', fontsize=12, fontweight='bold')
+    ax_rho.legend(fontsize=9, loc='best')
+    ax_rho.grid(alpha=0.3)
 
     # Configure K plot
-    ax_K.set_xlim(r_phys[0], r_phys[-1])
+    ax_K.set_xlim(0, x_max)
     ax_K.set_ylim(K_min - K_margin, K_max + K_margin)
     ax_K.set_xlabel(r'$r$ [code units]', fontsize=11)
     ax_K.set_ylabel(r'Trace of Extrinsic Curvature $K$', fontsize=11)
@@ -336,15 +353,14 @@ def make_bssn_animation(folder_path, output_path=None, fps=10, dpi=100):
     ax_K.legend(fontsize=9, loc='best')
     ax_K.grid(alpha=0.3)
 
-    # Configure shiftr plot
-    if shiftr_init is not None:
-        ax_shiftr.set_xlim(r_phys[0], r_phys[-1])
-        ax_shiftr.set_ylim(shiftr_min - shiftr_margin, shiftr_max + shiftr_margin)
-        ax_shiftr.set_xlabel(r'$r$ [code units]', fontsize=11)
-        ax_shiftr.set_ylabel(r'Radial Shift $\beta^r$', fontsize=11)
-        ax_shiftr.set_title(r'(d) Shift Vector', fontsize=12, fontweight='bold')
-        ax_shiftr.legend(fontsize=9, loc='best')
-        ax_shiftr.grid(alpha=0.3)
+    # Configure phi plot
+    ax_phi.set_xlim(0, x_max)
+    ax_phi.set_ylim(phi_min - phi_margin, phi_max + phi_margin)
+    ax_phi.set_xlabel(r'$r$ [code units]', fontsize=11)
+    ax_phi.set_ylabel(r'Conformal Factor $\phi$', fontsize=11)
+    ax_phi.set_title('(d) Conformal Factor', fontsize=12, fontweight='bold')
+    ax_phi.legend(fontsize=9, loc='best')
+    ax_phi.grid(alpha=0.3)
 
     # Time text
     time_text = fig.text(0.5, 0.96, '', ha='center', fontsize=14, fontweight='bold')
@@ -360,26 +376,26 @@ def make_bssn_animation(folder_path, output_path=None, fps=10, dpi=100):
         lapse = lapse_list[frame][r_mask]
         line_lapse.set_data(r_phys, lapse)
 
-        # Update phi
-        phi = phi_list[frame][r_mask]
-        line_phi.set_data(r_phys, phi)
+        # Update density
+        if line_rho is not None and rho_list[frame] is not None:
+            rho = rho_list[frame][r_mask]
+            line_rho.set_data(r_phys, rho)
 
         # Update K
         K = K_list[frame][r_mask]
         line_K.set_data(r_phys, K)
 
-        # Update shiftr
-        if line_shiftr is not None and shiftr_list[frame] is not None:
-            shiftr = shiftr_list[frame][r_mask]
-            line_shiftr.set_data(r_phys, shiftr)
+        # Update phi
+        phi = phi_list[frame][r_mask]
+        line_phi.set_data(r_phys, phi)
 
         # Update time text
         time_text.set_text(f'Time: {t_val:.1f} M$_\\odot$ ({t_val_ms:.2f} ms) — Frame {frame+1}/{len(t_snap)}')
 
-        if line_shiftr is not None:
-            return line_lapse, line_phi, line_K, line_shiftr, time_text
-        else:
-            return line_lapse, line_phi, line_K, time_text
+        artists = [line_lapse, line_K, line_phi, time_text]
+        if line_rho is not None:
+            artists.insert(1, line_rho)
+        return tuple(artists)
 
     # Create animation
     print(f"\n  Creating animation with {len(t_snap)} frames at {fps} fps...")
@@ -448,8 +464,8 @@ def plot_migration(data, output_path=None, title=None, rho_max_stable=None, fold
     # Create figure with appropriate layout
     if bssn_data_available:
         # 3 rows x 2 columns: Density/BSSN fields/Constraints
-        fig = plt.figure(figsize=(14, 15))
-        gs = gridspec.GridSpec(3, 2, figure=fig, hspace=0.30, wspace=0.30)
+        fig = plt.figure(figsize=(14, 12))
+        gs = gridspec.GridSpec(3, 2, figure=fig, hspace=0.12, wspace=0.25)
 
         # Layout:
         # Row 0: Density, Lapse
@@ -607,9 +623,9 @@ def plot_migration(data, output_path=None, title=None, rho_max_stable=None, fold
             ax_Mom.grid(alpha=0.3)
 
     if title:
-        fig.suptitle(title, fontsize=15, fontweight='bold', y=0.98)
+        fig.suptitle(title, fontsize=15, fontweight='bold', y=1.0)
 
-    plt.tight_layout()
+    plt.tight_layout(rect=[0, 0, 1, 0.97])
 
     if output_path:
         plt.savefig(output_path, dpi=150, bbox_inches='tight')

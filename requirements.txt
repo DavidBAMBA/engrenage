@@ -1,7 +1,29 @@
-jupyterlab
-notebook
-matplotlib
-numpy
-scipy
-tqdm
-sympy
+# Core scientific stack
+numpy>=2.0
+scipy>=1.13
+matplotlib>=3.9
+sympy>=1.13
+tqdm>=4.66
+h5py>=3.11
+
+# JIT compilation backends
+numba>=0.60        # CPU JIT (Numba backend)
+
+# JAX — CPU-only (default, no CUDA needed)
+jax>=0.8.2
+jaxlib>=0.8.2
+
+# JAX — GPU (CUDA 12.x)
+# Replace the two lines above with:
+#   pip install "jax[cuda12]"
+# This installs jaxlib + all nvidia-*-cu12 wheel packages automatically.
+#
+# WSL2 note: after installing jax[cuda12] you may need to add the nvjitlink
+# library to LD_LIBRARY_PATH so that libcusparse can resolve its symbols:
+#   export LD_LIBRARY_PATH="$(python -c 'import nvidia.nvjitlink, pathlib; \
+#     print(pathlib.Path(nvidia.nvjitlink.__path__[0])/"lib")'):$LD_LIBRARY_PATH"
+# To make it permanent, put this in your conda env activate.d script
+# (see conda activate.d/cuda_ld_path.sh in the repo).
+
+# Development / testing
+pytest>=8.0
