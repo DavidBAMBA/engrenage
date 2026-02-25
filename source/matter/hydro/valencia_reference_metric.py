@@ -23,6 +23,11 @@ from source.matter.hydro.geometry import (
     compute_g4DD,
     compute_g4UU
 )
+from source.matter.hydro.interpolation_utils import (
+    lagrange_interpolate_to_faces_4th_order,
+    lagrange_interpolate_vector_to_faces,
+    lagrange_interpolate_tensor_to_faces
+)
 from source.matter.hydro.valencia_kernels import (
     compute_T4UU_kernel,
     compute_T4UD_kernel,
@@ -157,15 +162,15 @@ class ValenciaReferenceMetric:
         self.e6phi = e6phi
         self.bar_gamma_LL = bar_gamma_LL
 
-        # Pre-compute face-interpolated geometry (avoid recomputation in _compute_interface_fluxes)
-        self.alpha_face = 0.5 * (self.alpha[:-1] + self.alpha[1:])
-        self.e6phi_face = 0.5 * (e6phi[:-1] + e6phi[1:])
-        self.beta_U_face = 0.5 * (self.beta_U[:-1] + self.beta_U[1:])
-        self.gamma_LL_face = 0.5 * (self.gamma_LL[:-1] + self.gamma_LL[1:])
+        # Pre-compute face-interpolated geometry using 4th-order Lagrange interpolation
+        self.alpha_face = lagrange_interpolate_to_faces_4th_order(self.alpha)
+        self.e6phi_face = lagrange_interpolate_to_faces_4th_order(e6phi)
+        self.beta_U_face = lagrange_interpolate_vector_to_faces(self.beta_U)
+        self.gamma_LL_face = lagrange_interpolate_tensor_to_faces(self.gamma_LL)
 
         # √ĝ for reference metric
         self.sqrt_g_hat_cell = np.sqrt(np.abs(background.det_hat_gamma) + 1e-30)
-        self.sqrt_g_hat_face = 0.5 * (self.sqrt_g_hat_cell[:-1] + self.sqrt_g_hat_cell[1:])
+        self.sqrt_g_hat_face = lagrange_interpolate_to_faces_4th_order(self.sqrt_g_hat_cell)
 
         # Create GeometryState container with 1D components (for cons2prim, riemann, etc.)
         self._geom = GeometryState(
@@ -529,16 +534,16 @@ class ValenciaReferenceMetric:
         rhoL, vL, pL = rhoL[1:-1], vL[1:-1], pL[1:-1]
         rhoR, vR, pR = rhoR[1:-1], vR[1:-1], pR[1:-1]
 
-        # Interpolate geometry to faces from class attributes
-        alpha_f = 0.5 * (self.alpha[:-1] + self.alpha[1:])
+        # Interpolate geometry to faces using 4th-order Lagrange interpolation
+        alpha_f = lagrange_interpolate_to_faces_4th_order(self.alpha)
         # Exact e^{6phi} at faces from BSSN phi
         phi_arr = np.asarray(bssn_vars.phi, dtype=float)
-        phi_face = 0.5 * (phi_arr[:-1] + phi_arr[1:])
+        phi_face = lagrange_interpolate_to_faces_4th_order(phi_arr)
         e6phi_f = np.exp(6.0 * phi_face)
 
         # Interpolate shift and metric to faces
-        beta_U_f = 0.5 * (self.beta_U[:-1] + self.beta_U[1:])  # (N-1, 3)
-        gamma_LL_f = 0.5 * (self.gamma_LL[:-1] + self.gamma_LL[1:])  # (N-1, 3, 3)
+        beta_U_f = lagrange_interpolate_vector_to_faces(self.beta_U)  # (N-1, 3)
+        gamma_LL_f = lagrange_interpolate_tensor_to_faces(self.gamma_LL)  # (N-1, 3, 3)
 
         # For 1D Riemann solver, extract first spatial components
         beta_r_f = beta_U_f[:, 0]  # β^r

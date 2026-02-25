@@ -18,12 +18,12 @@ N_med = 4000
 N_high = 8000
 # Data paths - constructed from resolution values
 FOLDERS = {
-    f'N={N_very_low}': f'/home/davidbamba/repositories/engrenage/examples/TOV/tov_evolution_data_refact_rmax100.0_jax/tov_star_rhoc1p28em03_N500_K100_G2_dyn_mp5',
-    f'N={N_low}':      f'/home/davidbamba/repositories/engrenage/examples/TOV/tov_evolution_data_refact_rmax100.0_jax/tov_star_rhoc1p28em03_N1000_K100_G2_dyn_mp5',
-    f'N={N_med}':      f'/home/davidbamba/repositories/engrenage/examples/TOV/tov_evolution_data_refact_rmax100.0_jax/tov_star_rhoc1p28em03_N2000_K100_G2_dyn_mp5',
-      #f'N={N_low}': f'/home/davidbamba/repositories/engrenage/examples/TOV/tov_evolution_data_rmax100.0_jax_reconstructor/tov_star_rhoc1p28em03_N2000_K100_G2_cow_wz',
-    #f'N={N_med}': f'/home/davidbamba/repositories/engrenage/examples/TOV/tov_evolution_data_rmax100.0_jax_reconstructor/tov_star_rhoc1p28em03_N4000_K100_G2_cow_wz',
-    #f'N={N_high}': f'/home/davidbamba/repositories/engrenage/examples/TOV/tov_evolution_data_rmax100.0_jax_reconstructor/tov_star_rhoc1p28em03_N8000_K100_G2_cow_wz',
+    f'N={N_very_low}': f'/home/davidbamba/repositories/engrenage/examples/TOV/data/tov_evolution_data_refact_rmax100.0_jax/tov_star_rhoc1p28em03_N500_K100_G2_dyn_mp5',
+    f'N={N_low}':      f'/home/davidbamba/repositories/engrenage/examples/TOV/data/tov_evolution_data_refact_rmax100.0_jax/tov_star_rhoc1p28em03_N1000_K100_G2_dyn_mp5',
+    f'N={N_med}':      f'/home/davidbamba/repositories/engrenage/examples/TOV/data/tov_evolution_data_refact_rmax100.0_jax/tov_star_rhoc1p28em03_N2000_K100_G2_dyn_mp5',
+      #f'N={N_low}': f'/home/davidbamba/repositories/engrenage/examples/TOV/data/tov_evolution_data_rmax100.0_jax_reconstructor/tov_star_rhoc1p28em03_N2000_K100_G2_cow_wz',
+    #f'N={N_med}': f'/home/davidbamba/repositories/engrenage/examples/TOV/data/tov_evolution_data_rmax100.0_jax_reconstructor/tov_star_rhoc1p28em03_N4000_K100_G2_cow_wz',
+    #f'N={N_high}': f'/home/davidbamba/repositories/engrenage/examples/TOV/data/tov_evolution_data_rmax100.0_jax_reconstructor/tov_star_rhoc1p28em03_N8000_K100_G2_cow_wz',
 }
 COLORS = ['#1f77b4', "#ff7f0e", '#2ca02c', "#d62728",
           "#9467bd", "#8c564b", "#e377c2", "#17becf"]

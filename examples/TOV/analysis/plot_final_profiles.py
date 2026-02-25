@@ -13,10 +13,10 @@ import argparse
 
 # Data folders for each resolution
 FOLDERS = {
-    'N=100': '/home/davidbamba/repositories/engrenage/examples/TOV/tov_evolution_data_rmax20_TEST_kas_ideal_long_domain_lasttest/tov_star_rhoc1p28em03_N100_K100_G2_cow_mp5',
-    'N=200': '/home/davidbamba/repositories/engrenage/examples/TOV/tov_evolution_data_rmax20_TEST_kas_ideal_long_domain_lasttest/tov_star_rhoc1p28em03_N200_K100_G2_cow_mp5',
-    'N=400': '/home/davidbamba/repositories/engrenage/examples/TOV/tov_evolution_data_rmax20_TEST_kas_ideal_long_domain_lasttest/tov_star_rhoc1p28em03_N400_K100_G2_cow_mp5',
-    'N=800': '/home/davidbamba/repositories/engrenage/examples/TOV/tov_evolution_data_rmax20_TEST_kas_ideal_long_domain_lasttest/tov_star_rhoc1p28em03_N800_K100_G2_cow_mp5',
+    'N=100': '/home/davidbamba/repositories/engrenage/examples/TOV/data/tov_evolution_data_rmax20_TEST_kas_ideal_long_domain_lasttest/tov_star_rhoc1p28em03_N100_K100_G2_cow_mp5',
+    'N=200': '/home/davidbamba/repositories/engrenage/examples/TOV/data/tov_evolution_data_rmax20_TEST_kas_ideal_long_domain_lasttest/tov_star_rhoc1p28em03_N200_K100_G2_cow_mp5',
+    'N=400': '/home/davidbamba/repositories/engrenage/examples/TOV/data/tov_evolution_data_rmax20_TEST_kas_ideal_long_domain_lasttest/tov_star_rhoc1p28em03_N400_K100_G2_cow_mp5',
+    'N=800': '/home/davidbamba/repositories/engrenage/examples/TOV/data/tov_evolution_data_rmax20_TEST_kas_ideal_long_domain_lasttest/tov_star_rhoc1p28em03_N800_K100_G2_cow_mp5',
 }
 
 # Colors for each resolution (will be populated dynamically if needed)

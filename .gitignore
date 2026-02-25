@@ -146,3 +146,4 @@ check_h5.py
 *.mp4
 *.gpg
 *.sh
+*.npy

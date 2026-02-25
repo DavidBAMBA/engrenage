@@ -65,13 +65,13 @@ N3 = 400
 N4 = 800
 
 # Base data directory
-#DATA_DIR = '/home/davidbamba/repositories/engrenage/examples/TOV/tov_evolution_data_rmax100.0_TEST_long_domain_long_time'
+#DATA_DIR = '/home/davidbamba/repositories/engrenage/examples/TOV/data/tov_evolution_data_rmax100.0_TEST_long_domain_long_time'
 
 # Data paths - constructed from resolution values
 FOLDERS = {
-    f'N={N1}': f'/home/davidbamba/repositories/engrenage/examples/TOV/tov_evolution_data_refact_rmax20.0_jax/tov_star_rhoc1p28em03_N{N1}_K100_G2_dyn_mp5',
-    f'N={N2}': f'/home/davidbamba/repositories/engrenage/examples/TOV/tov_evolution_data_refact_rmax20.0_jax/tov_star_rhoc1p28em03_N{N2}_K100_G2_dyn_mp5',
-    f'N={N3}': f'/home/davidbamba/repositories/engrenage/examples/TOV/tov_evolution_data_refact_rmax20.0_jax/tov_star_rhoc1p28em03_N{N3}_K100_G2_dyn_mp5',
+    f'N={N1}': f'/home/davidbamba/repositories/engrenage/examples/TOV/data/tov_evolution_data_refact_rmax20.0_jax/tov_star_rhoc1p28em03_N{N1}_K100_G2_dyn_mp5',
+    f'N={N2}': f'/home/davidbamba/repositories/engrenage/examples/TOV/data/tov_evolution_data_refact_rmax20.0_jax/tov_star_rhoc1p28em03_N{N2}_K100_G2_dyn_mp5',
+    f'N={N3}': f'/home/davidbamba/repositories/engrenage/examples/TOV/data/tov_evolution_data_refact_rmax20.0_jax/tov_star_rhoc1p28em03_N{N3}_K100_G2_dyn_mp5',
 }
 
 # Resolution labels (keys to FOLDERS dictionary)
@@ -422,7 +422,7 @@ Examples:
         # Extract res labels from FOLDERS keys
         sorted_items = sorted(folders_dict.items(), key=lambda x: extract_resolution_from_dirname(x[0]) or 0)
         res1, res2, res3 = sorted_items[0][0], sorted_items[1][0], sorted_items[2][0]
-        tov_cache_dir = "/home/davidbamba/repositories/engrenage/examples/TOV/tov_iso_cache/TOVSOL_ISO_K=100.0_G=2.0_rho=1.280000e-03"
+        tov_cache_dir = "/home/davidbamba/repositories/engrenage/examples/TOV/data/tov_iso_cache/TOVSOL_ISO_K=100.0_G=2.0_rho=1.280000e-03"
 
         # Extract resolution numbers for use in plots and print statements
         N1 = extract_resolution_from_dirname(res1) or 100

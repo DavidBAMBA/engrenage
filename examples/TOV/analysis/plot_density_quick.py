@@ -19,7 +19,7 @@ from glob import glob
 
 # Directorio del script
 script_dir = os.path.dirname(os.path.abspath(__file__))
-data_dir = '/home/davidbamba/repositories/engrenage/examples/TOV/tov_evolution_data_rmax20_TEST_kas_ideal_long_domain_lasttest'
+data_dir = '/home/davidbamba/repositories/engrenage/examples/TOV/data/tov_evolution_data_rmax20_TEST_kas_ideal_long_domain_lasttest'
 plots_dir = os.path.join(script_dir, 'plots')
 
 # Crear directorio de plots si no existe

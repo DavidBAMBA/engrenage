@@ -31,9 +31,9 @@ TOV_CACHE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)),
 
 # Data paths - constructed from resolution values
 FOLDERS = {
-    f'N={N_low}': f'/home/davidbamba/repositories/engrenage/examples/TOV/tov_evolution_data_refact_rmax100.0_jax/tov_star_rhoc1p28em03_N1000_K100_G2_dyn_mp5',
-    f'N={N_med}': f'/home/davidbamba/repositories/engrenage/examples/TOV/tov_evolution_data_refact_rmax100.0_jax/tov_star_rhoc1p28em03_N2000_K100_G2_dyn_mp5',
-     f'N={N_high}': f'/home/davidbamba/repositories/engrenage/examples/TOV/tov_evolution_data_refact_rmax100.0_jax/tov_star_rhoc1p28em03_N4000_K100_G2_dyn_mp5',
+    f'N={N_low}': f'/home/davidbamba/repositories/engrenage/examples/TOV/data/tov_evolution_data_refact_rmax100.0_jax/tov_star_rhoc1p28em03_N1000_K100_G2_dyn_mp5',
+    f'N={N_med}': f'/home/davidbamba/repositories/engrenage/examples/TOV/data/tov_evolution_data_refact_rmax100.0_jax/tov_star_rhoc1p28em03_N2000_K100_G2_dyn_mp5',
+     f'N={N_high}': f'/home/davidbamba/repositories/engrenage/examples/TOV/data/tov_evolution_data_refact_rmax100.0_jax/tov_star_rhoc1p28em03_N4000_K100_G2_dyn_mp5',
 }
 # Resolution labels (keys to FOLDERS dictionary)
 low_res = f'N={N_low}'

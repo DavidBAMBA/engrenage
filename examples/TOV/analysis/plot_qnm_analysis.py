@@ -30,8 +30,8 @@ T_START = 10.0
 # FOLDERS TO ANALYZE - Specify the exact folders you want to analyze
 # =============================================================================
 FOLDERS_TO_ANALYZE = [
-'/home/davidbamba/repositories/engrenage/examples/TOV/tov_evolution_data_refact_rmax20.0_jax/tov_star_rhoc1p28em03_N100_K100_G2_dyn_mp5']
-
+    '/home/davidbamba/repositories/engrenage/examples/TOV/data/tov_evolution_data_refact_rmax50.0_jax/tov_star_rhoc1p28em03_N500_K100_G2_dyn_mp5',
+]
 # Theoretical frequencies (Font et al. 2002)
 FREQUENCIES_COWLING_KHZ = {
     'F':  2.696, 'H1': 4.534, 'H2': 6.346, 'H3': 8.161,

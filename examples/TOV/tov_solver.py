@@ -70,7 +70,7 @@ class PolytropicEOS:
 # Cache Configuration
 # =============================================================================
 
-TOV_ISO_CACHE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "tov_iso_cache")
+TOV_ISO_CACHE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "tov_iso_cache")
 
 
 def get_tov_iso_cache_path(K, Gamma, rho_central, cache_dir=None):
