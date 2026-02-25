@@ -16,8 +16,22 @@ import os
 import sys
 import numpy as np
 import time
+import matplotlib.pyplot as plt
 from pathlib import Path
 from functools import partial
+from scipy.interpolate import interp1d
+
+
+def locate_repo_root(start: Path) -> Path:
+    for cand in [start, *start.parents]:
+        if (cand / 'source').is_dir():
+            return cand
+    return start
+
+THIS = Path(__file__).resolve()
+REPO = locate_repo_root(THIS)
+if str(REPO) not in sys.path:
+    sys.path.insert(0, str(REPO))
 
 os.environ['ENGRENAGE_BACKEND'] = 'jax'
 
@@ -51,18 +65,6 @@ from source.core.rhsevolution_jax import get_rhs_bssn_hydro_jax, NUM_HYDRO_VARS,
 
 from examples.TOV.tov_solver import load_or_solve_tov_iso
 import examples.TOV.tov_initial_data_interpolated as tov_id
-
-
-def locate_repo_root(start: Path) -> Path:
-    for cand in [start, *start.parents]:
-        if (cand / 'source').is_dir():
-            return cand
-    return start
-
-THIS = Path(__file__).resolve()
-REPO = locate_repo_root(THIS.parent)
-if str(REPO) not in sys.path:
-    sys.path.insert(0, str(REPO))
 
 
 def get_rhs_hwh_jax(state, bssn_bg, deriv_stencils, dr_jax,
@@ -121,7 +123,7 @@ def run_hwh_jax_test(
     spacing = LinearSpacing(num_points, r_max)
     eos = IdealGasEOS(gamma=Gamma)
 
-    rho_floor_base = 1e-16
+    rho_floor_base = 1e-13
     p_floor_base = K * (rho_floor_base)**Gamma
     atmosphere = AtmosphereParams(
         rho_floor=rho_floor_base,
@@ -309,12 +311,14 @@ def run_hwh_jax_test(
         eps = K * rho0**gm1 / gm1
         h = 1.0 + eps + pressure / jnp.maximum(rho0, 1e-300)
         W = 1.0
-        D = rho0 * W
+        # Densitized conservatives: D̃ = e^{6φ}·D_phys, τ̃ = e^{6φ}·τ_phys
+        D = e6phi * rho0 * W
         Sr = jnp.zeros_like(D)
-        tau = rho0 * h * W**2 - pressure - D
+        tau = e6phi * (rho0 * h * W**2 - pressure - rho0 * W)
 
+        # Atmosphere floors (also densitized — consistent comparison)
         D_atm = e6phi * _rho_floor
-        tau_atm = e6phi * (_rho_floor * h - _p_floor - _rho_floor)
+        tau_atm = e6phi * _tau_atm_phys
 
         D = jnp.where(D < D_atm, D_atm, D)
         tau = jnp.where(tau < tau_atm, tau_atm, tau)
@@ -425,17 +429,163 @@ def run_hwh_jax_test(
     )
 
 
+def plot_hwh_results(result, save_plots=True, plot_dir="plots"):
+    """Plot HWH test results."""
+    if save_plots:
+        os.makedirs(plot_dir, exist_ok=True)
+
+    M_SUN_S = 4.926e-6          # seconds per M_sun (geometric units)
+    to_ms = M_SUN_S * 1e3       # code time → milliseconds
+
+    times = result['times'] * to_ms
+    times_detailed = result['times_detailed'] * to_ms
+    states_detailed = result['states_detailed']
+    r = result['r']
+    tov = result['tov']
+
+    # ===== Plot 0: phi and K with inset zoom (paper figure style) =====
+    t_zoom = times[-1] * 0.10   # first 10% of evolution [ms]
+    mask = times <= t_zoom
+
+    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(10, 8))
+
+    ax1.plot(times, result['phi_center'], 'k-', linewidth=1)
+    ax1.set_ylabel(r'$\phi$', fontsize=12)
+    ax1.grid(True, alpha=0.3)
+    axins1 = ax1.inset_axes([0.62, 0.60, 0.34, 0.33])
+    axins1.plot(times[mask], result['phi_center'][mask], 'k-', linewidth=1)
+    axins1.set_xlim(0, t_zoom)
+    axins1.grid(True, alpha=0.3)
+    axins1.tick_params(labelsize=8)
+
+    ax2.plot(times, result['K_center'], 'k-', linewidth=1)
+    ax2.axhline(0, color='k', ls='--', alpha=0.4, linewidth=0.8)
+    ax2.set_ylabel('K', fontsize=12)
+    ax2.set_xlabel('t [ms]', fontsize=12)
+    ax2.grid(True, alpha=0.3)
+    axins2 = ax2.inset_axes([0.55, 0.50, 0.42, 0.45])
+    axins2.plot(times[mask], result['K_center'][mask], 'k-', linewidth=1)
+    axins2.axhline(0, color='k', ls='--', alpha=0.4, linewidth=0.8)
+    axins2.set_xlim(0, t_zoom)
+    axins2.grid(True, alpha=0.3)
+    axins2.tick_params(labelsize=8)
+
+    fig.suptitle('HWH: Central values with transient zoom', fontsize=13)
+    fig.tight_layout()
+    if save_plots:
+        fig.savefig(f"{plot_dir}/hwh_phi_K_inset.png", dpi=300, bbox_inches='tight')
+    plt.show()
+
+    # ===== Plot 1: Time evolution at center (paper style) =====
+    fig, (ax1, ax2, ax3) = plt.subplots(3, 1, figsize=(10, 12))
+
+    ax1.plot(times, result['phi_center'], 'b-', linewidth=2, label=r'$\phi$(center)')
+    ax1.set_ylabel(r'$\phi$', fontsize=12)
+    ax1.set_title('Hydro-without-Hydro: Evolution at Center (like Fig. 1 of paper)', fontsize=14)
+    ax1.grid(True, alpha=0.3)
+    ax1.legend()
+
+    ax2.plot(times, result['K_center'], 'g-', linewidth=2, label='K(center)')
+    ax2.axhline(0, color='k', ls='--', alpha=0.5, label='K = 0 (equilibrium)')
+    ax2.set_ylabel('K (Trace of extrinsic curvature)', fontsize=12)
+    ax2.grid(True, alpha=0.3)
+    ax2.legend()
+
+    ax3.plot(times, result['lapse_center'], 'r-', linewidth=2, label=r'$\alpha$(center)')
+    ax3.axhline(result['lapse_center'][0], color='r', ls='--', alpha=0.5, label=r'Initial $\alpha$')
+    ax3.set_xlabel('t [ms]', fontsize=12)
+    ax3.set_ylabel(r'Lapse $\alpha$', fontsize=12)
+    ax3.grid(True, alpha=0.3)
+    ax3.legend()
+
+    fig.tight_layout()
+    if save_plots:
+        fig.savefig(f"{plot_dir}/hwh_time_evolution_paper_style.png", dpi=300, bbox_inches='tight')
+    plt.show()
+
+    # ===== Plot 2: Spatial snapshots =====
+    fig, ((ax1, ax2), (ax3, ax4)) = plt.subplots(2, 2, figsize=(12, 10))
+
+    n_snap = min(4, len(states_detailed))
+    indices = np.linspace(0, len(states_detailed) - 1, n_snap, dtype=int)
+    colors = ['blue', 'red', 'green', 'orange']
+
+    for i, idx in enumerate(indices):
+        state = states_detailed[idx]
+        t_snap = times_detailed[idx]
+        label = f't = {t_snap:.2f} ms'
+
+        ax1.plot(r, state[idx_lapse, :], color=colors[i], linewidth=2, label=label)
+        ax2.plot(r, state[idx_phi,   :], color=colors[i], linewidth=2, label=label)
+        ax3.plot(r, state[idx_K,     :], color=colors[i], linewidth=2, label=label)
+        ax4.plot(r, state[idx_hrr,   :], color=colors[i], linewidth=2, label=label)
+
+    alpha_tov = interp1d(tov.r_iso, tov.alpha, kind='cubic', bounds_error=False,
+                         fill_value=(tov.alpha[0], tov.alpha[-1]))(r)
+    ax1.plot(r, alpha_tov, 'k--', linewidth=2, alpha=0.7, label='TOV initial')
+
+    ax1.set_xlabel('r'); ax1.set_ylabel(r'Lapse $\alpha$'); ax1.set_title('Lapse Evolution')
+    ax1.legend(); ax1.grid(True, alpha=0.3)
+
+    ax2.set_xlabel('r'); ax2.set_ylabel(r'$\phi$'); ax2.set_title('Conformal Factor Evolution')
+    ax2.legend(); ax2.grid(True, alpha=0.3)
+
+    ax3.set_xlabel('r'); ax3.set_ylabel('K'); ax3.set_title('Extrinsic Curvature Trace')
+    ax3.legend(); ax3.grid(True, alpha=0.3)
+
+    ax4.set_xlabel('r'); ax4.set_ylabel(r'$h_{rr}$'); ax4.set_title(r'Conformal Metric $h_{rr}$')
+    ax4.legend(); ax4.grid(True, alpha=0.3)
+
+    fig.tight_layout()
+    if save_plots:
+        fig.savefig(f"{plot_dir}/hwh_evolution_snapshots.png", dpi=300, bbox_inches='tight')
+    plt.show()
+
+    # ===== Plot 3: Drift / Error analysis =====
+    fig, ((ax1, ax2), (ax3, ax4)) = plt.subplots(2, 2, figsize=(12, 10))
+
+    phi_drift   = result['phi_center']   - result['phi_center'][0]
+    K_drift     = result['K_center']     - result['K_center'][0]
+    lapse_drift = result['lapse_center'] - result['lapse_center'][0]
+
+    ax1.plot(times, phi_drift, 'b-', linewidth=2)
+    ax1.set_xlabel('t [ms]'); ax1.set_ylabel(r'$\Delta\phi$'); ax1.set_title('Conformal Factor Drift')
+    ax1.ticklabel_format(style='scientific', axis='y', scilimits=(0, 0)); ax1.grid(True, alpha=0.3)
+
+    ax2.plot(times, K_drift, 'g-', linewidth=2)
+    ax2.set_xlabel('t [ms]'); ax2.set_ylabel(r'$\Delta K$'); ax2.set_title('Extrinsic Curvature Drift')
+    ax2.ticklabel_format(style='scientific', axis='y', scilimits=(0, 0)); ax2.grid(True, alpha=0.3)
+
+    ax3.plot(times, lapse_drift, 'r-', linewidth=2)
+    ax3.set_xlabel('t [ms]'); ax3.set_ylabel(r'$\Delta\alpha$'); ax3.set_title('Lapse Drift')
+    ax3.ticklabel_format(style='scientific', axis='y', scilimits=(0, 0)); ax3.grid(True, alpha=0.3)
+
+    l2_norms = [np.sqrt(np.mean(s[idx_phi, :] ** 2)) for s in states_detailed]
+    ax4.plot(times_detailed, l2_norms, 'm-', linewidth=2)
+    ax4.set_xlabel('t [ms]'); ax4.set_ylabel(r'$\|\phi\|_2$'); ax4.set_title(r'L2 Norm of $\phi$')
+    ax4.grid(True, alpha=0.3)
+
+    fig.tight_layout()
+    if save_plots:
+        fig.savefig(f"{plot_dir}/hwh_error_analysis.png", dpi=300, bbox_inches='tight')
+    plt.show()
+
+    return result
+
+
 if __name__ == "__main__":
     result = run_hwh_jax_test(
         K=100.0,
         Gamma=2.0,
-        rho_central=0.2,
-        r_max=8.0,
-        num_points=300,
-        t_final=100.0,
+        rho_central=1.28e-3,
+        r_max=50.0,
+        num_points=500,
+        t_final=1000.0,
         cfl=0.1,
-        save_interval=50,
+        save_interval=100,
         progress=True,
-        RECONSTRUCTOR_NAME="wenoz",
+        RECONSTRUCTOR_NAME="mp5",
         SOLVER_METHOD="newton"
     )
+
+    plot_hwh_results(result, save_plots=True, plot_dir="plots")

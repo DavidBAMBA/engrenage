@@ -369,7 +369,7 @@ def main():
     num_points = int(os.environ.get("NUM_POINTS", 1000))
     K = 100.0
     Gamma = 2.0
-    rho_central = 6.0e-3
+    rho_central = 8.0e-3
     t_final = float(os.environ.get("T_FINAL", "2000"))
     FOLDER_NAME_EVOL = f"tov_evolution_data_refact_rmax{r_max}" + ("_jax" if JAX_RUN else "")
 
