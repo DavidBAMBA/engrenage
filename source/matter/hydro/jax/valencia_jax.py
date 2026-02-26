@@ -53,6 +53,11 @@ from source.matter.hydro.jax.eos_jax import (
 from source.bssn.jax.tensoralgebra_jax import (
     EMTensor, get_bar_gamma_LL,
 )
+from source.matter.hydro.jax.interpolation_jax import (
+    lagrange_interpolate_to_faces_4th_order,
+    lagrange_interpolate_vector_to_faces,
+    lagrange_interpolate_tensor_to_faces,
+)
 
 
 # =============================================================================
@@ -70,12 +75,17 @@ class HydroGeometry(NamedTuple):
     """
     alpha: jnp.ndarray       # (N,) lapse
     beta_r: jnp.ndarray      # (N,) radial shift component
-    gamma_rr: jnp.ndarray    # (N,) radial metric component
-    e6phi: jnp.ndarray       # (N,) conformal factor e^{6phi}
-    e4phi: jnp.ndarray       # (N,) conformal factor e^{4phi}
-    beta_U: jnp.ndarray      # (N,3) full shift vector (physical)
-    gamma_LL: jnp.ndarray    # (N,3,3) full physical covariant metric
-    gamma_UU: jnp.ndarray    # (N,3,3) full physical contravariant metric
+    gamma_rr: jnp.ndarray   # (N,) radial metric component
+    e6phi: jnp.ndarray      # (N,) conformal factor e^{6phi}
+    e4phi: jnp.ndarray      # (N,) conformal factor e^{4phi}
+    beta_U: jnp.ndarray     # (N,3) full shift vector (physical)
+    gamma_LL: jnp.ndarray   # (N,3,3) full physical covariant metric
+    gamma_UU: jnp.ndarray   # (N,3,3) full physical contravariant metric
+    alpha_f: jnp.ndarray    # (N-1,) lapse at cell faces
+    beta_U_f: jnp.ndarray   # (N-1,3) shift vector at cell faces
+    gamma_LL_f: jnp.ndarray # (N-1,3,3) metric at cell faces
+    e6phi_f: jnp.ndarray   # (N-1,) e^{6phi} at cell faces
+    sqrt_g_hat_f: jnp.ndarray  # (N-1,) sqrt(g_hat) at cell faces
 
 
 # =============================================================================
@@ -103,15 +113,21 @@ def extract_geometry(phi, h_LL, lapse, shift_U, background):
     e4phi = jnp.exp(4.0 * phi)
     e6phi = jnp.exp(6.0 * phi)
 
-    # Physical shift: beta^i = shift_U * inverse_scaling_vector
     beta_U = background.inverse_scaling_vector * shift_U
     beta_r = beta_U[:, 0]
 
-    # Conformal and physical metric
     bar_gamma_LL = get_bar_gamma_LL(r, h_LL, background)
     gamma_LL = e4phi[:, None, None] * bar_gamma_LL
     gamma_UU = jnp.linalg.inv(gamma_LL)
     gamma_rr = gamma_LL[:, 0, 0]
+
+    sqrt_g_hat_cell = jnp.sqrt(jnp.abs(background.det_hat_gamma) + 1e-30)
+
+    alpha_f = lagrange_interpolate_to_faces_4th_order(lapse)
+    e6phi_f = lagrange_interpolate_to_faces_4th_order(e6phi)
+    beta_U_f = lagrange_interpolate_vector_to_faces(beta_U)
+    gamma_LL_f = lagrange_interpolate_tensor_to_faces(gamma_LL)
+    sqrt_g_hat_f = lagrange_interpolate_to_faces_4th_order(sqrt_g_hat_cell)
 
     return HydroGeometry(
         alpha=lapse,
@@ -122,6 +138,11 @@ def extract_geometry(phi, h_LL, lapse, shift_U, background):
         beta_U=beta_U,
         gamma_LL=gamma_LL,
         gamma_UU=gamma_UU,
+        alpha_f=alpha_f,
+        beta_U_f=beta_U_f,
+        gamma_LL_f=gamma_LL_f,
+        e6phi_f=e6phi_f,
+        sqrt_g_hat_f=sqrt_g_hat_f,
     )
 
 
@@ -433,11 +454,10 @@ def compute_interface_fluxes(rho0, vr, pressure, geom, dx,
     Returns:
         F_D, F_Sr, F_tau: (N-1,) numerical fluxes at interfaces
     """
-    # Face-interpolated geometry
-    alpha_f = 0.5 * (geom.alpha[:-1] + geom.alpha[1:])
-    beta_r_f = 0.5 * (geom.beta_r[:-1] + geom.beta_r[1:])
-    gamma_rr_f = 0.5 * (geom.gamma_rr[:-1] + geom.gamma_rr[1:])
-    e6phi_f = 0.5 * (geom.e6phi[:-1] + geom.e6phi[1:])
+    alpha_f = geom.alpha_f
+    beta_r_f = geom.beta_U_f[:, 0]
+    gamma_rr_f = geom.gamma_LL_f[:, 0, 0]
+    e6phi_f = geom.e6phi_f
 
     # Reconstruct primitives at interfaces
     rhoL, rhoR, vrL, vrR, pL, pR = reconstruct_primitives(

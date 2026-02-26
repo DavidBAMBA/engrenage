@@ -11,8 +11,8 @@ class TOVConfig:
     """Configuration class for TOV star evolution."""
 
     def __init__(self,
-                 r_max=50.0,
-                 num_points=500,
+                 r_max=100.0,
+                 num_points=1000,
                  K=100.0,
                  Gamma=2.0,
                  rho_central=1.28e-3,

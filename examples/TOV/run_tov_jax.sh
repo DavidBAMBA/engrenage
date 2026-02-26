@@ -29,11 +29,11 @@ SCRIPT="$SCRIPT_DIR/TOVEvolution.py"
 
 # --- Configuration ---
 JAX_RUN="${JAX_RUN:-1}"
-T_FINAL="${T_FINAL:-200}"
+T_FINAL="${T_FINAL:-2000}"
 ENABLE_RESTART="${ENABLE_RESTART:-1}"
 ENABLE_DATA_SAVING="${ENABLE_DATA_SAVING:-1}"
 SKIP_PLOTS="${SKIP_PLOTS:-0}"
-RESOLUTIONS="${RESOLUTIONS:-200 400 800}"
+RESOLUTIONS="${RESOLUTIONS:-1000 1500 2000 2500 4000}"
 
 echo "============================================================"
 echo "  TOV Evolution sweep"
